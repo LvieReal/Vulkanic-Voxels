@@ -58,6 +58,61 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 	}
 	std::memset(m_mappedTable, 0xFF, static_cast<std::size_t>(tableBytes));
 
+	if (!createPalette(device, physicalDevice, outError)) {
+		cleanup(device);
+		return false;
+	}
+
+	return true;
+}
+
+bool VoxelResources::createPalette(VkDevice device,
+																		VkPhysicalDevice physicalDevice,
+																		std::string& outError) {
+	// Layout mirrors the shader's VoxelPalette block: three vec4 arrays of
+	// kPaletteCapacity entries (top, side, bottom), entry order = VoxelType
+	// enum order. Placeholder flat-color palette; the texturing pass will
+	// replace it with a bindless texture array of real per-type albedo
+	// textures.
+	constexpr std::size_t kFloatsPerVec4 = 4;
+	constexpr std::size_t kFaces = 3;
+	std::vector<float> palette(kFaces * kPaletteCapacity * kFloatsPerVec4, 0.0f);
+
+	const auto writeFace = [&](std::size_t face, const float* source) {
+		for (std::uint32_t type = 0; type < vv::voxel::kVoxelTypeCount &&
+																	type < kPaletteCapacity;
+				 ++type) {
+			const std::size_t dst =
+					(face * kPaletteCapacity + type) * kFloatsPerVec4;
+			for (std::size_t c = 0; c < 3; ++c) {
+				palette[dst + c] = source[type * 3 + c];
+			}
+			palette[dst + 3] = 1.0f;
+		}
+	};
+	writeFace(0, &vv::voxel::kVoxelTypeInfo[0].top[0]);
+	writeFace(1, &vv::voxel::kVoxelTypeInfo[0].side[0]);
+	writeFace(2, &vv::voxel::kVoxelTypeInfo[0].bottom[0]);
+
+	const VkDeviceSize paletteBytes = static_cast<VkDeviceSize>(palette.size()) *
+																		sizeof(float);
+	if (!utils::createBuffer(device, physicalDevice, paletteBytes,
+													 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+													 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+													 m_paletteBuffer, m_paletteMemory,
+													 outError)) {
+		return false;
+	}
+
+	void* mapped = nullptr;
+	VkResult r = vkMapMemory(device, m_paletteMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+	if (r != VK_SUCCESS || mapped == nullptr) {
+		outError = "Failed to map the voxel palette memory.";
+		return false;
+	}
+	std::memcpy(mapped, palette.data(), palette.size() * sizeof(float));
+	vkUnmapMemory(device, m_paletteMemory);
 	return true;
 }
 
@@ -198,6 +253,14 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_mappedTable != nullptr && m_chunkTableMemory != VK_NULL_HANDLE) {
 		vkUnmapMemory(device, m_chunkTableMemory);
 		m_mappedTable = nullptr;
+	}
+	if (m_paletteBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_paletteBuffer, nullptr);
+		m_paletteBuffer = VK_NULL_HANDLE;
+	}
+	if (m_paletteMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_paletteMemory, nullptr);
+		m_paletteMemory = VK_NULL_HANDLE;
 	}
 	if (m_chunkTableBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_chunkTableBuffer, nullptr);

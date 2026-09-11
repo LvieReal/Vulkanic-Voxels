@@ -130,6 +130,24 @@ void VulkanWidget::tick() {
 		return;
 	}
 
+	// Fatal GPU error: surface it once and stop rendering.
+	if (m_renderer->deviceLost()) {
+		if (!m_deviceLostReported) {
+			m_deviceLostReported = true;
+			unlockMouse();
+			setGamePaused(true);
+			QMessageBox::critical(
+					this, "Vulkan device lost",
+					QString("The GPU or driver reported a fatal error and rendering "
+									"was stopped:\n\n%1\n\nIf this mentions a timeout, the "
+									"compute workload was too heavy for the GPU; lowering "
+									"the render radius or trace steps in VoxelConfig "
+									"helps.")
+							.arg(QString::fromStdString(m_renderer->lastError())));
+		}
+		return;
+	}
+
 	const float dt = std::min(0.050f, m_gameTimer.tickSeconds());
 
 	glm::vec3 moveLocal(0.0f);

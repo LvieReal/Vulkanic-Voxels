@@ -47,6 +47,11 @@ class VulkanRenderer final {
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
 
+  // After a device loss / fatal Vulkan error, drawFrame() becomes a no-op and
+  // the reason is available here for the UI to surface.
+  bool deviceLost() const { return m_deviceLost; }
+  const std::string& lastError() const { return m_lastError; }
+
   // New: allow external configuration of lighting (separated concern).
   void setLighting(const vv::render::LightingConfig& lighting) {
     m_lighting = lighting;
@@ -159,6 +164,18 @@ class VulkanRenderer final {
   std::vector<uint32_t> m_freeSlots;
   vv::voxel::ChunkCoord m_regionCenter{};
   float m_fogDensity = 0.01f;
+
+  // Upper bound on terrain height (voxels); rays above it can never hit.
+  std::int32_t m_maxTerrainVoxelY = 0;
+
+  // Fatal-error state (device loss etc.).
+  bool m_deviceLost = false;
+  std::string m_lastError;
+
+  // Optional VK_EXT_debug_utils messenger for validation-layer messages.
+  VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
+
+  void setDeviceLost(const std::string& message);
 
   // Scene uniform (camera + lighting) separated into SceneUniform utility.
   vv::render::SceneUniform m_sceneUniform;

@@ -5,10 +5,11 @@
 namespace vv::voxel {
 
 // Voxel material types. The GPU storage is exactly this enum (one byte per
-// voxel, packed 4-per-uint32 in the chunk atlas); the compute shader maps
-// types to colors through its palette tables (kTopColor/kSideColor/
-// kBottomColor in resources/shaders/pixels_rgba.comp), which mirror
-// kVoxelTypeInfo below — keep them in sync when adding types.
+// voxel, packed 4-per-uint32 in the chunk atlas). The compute shader maps
+// types to colors through the voxel palette buffer (binding 4), which the
+// renderer fills from kVoxelTypeInfo below, so colors stay data-driven.
+// Placeholder: a bindless texture array with real per-type albedo textures
+// is planned for the texturing pass.
 enum class VoxelType : std::uint8_t {
 	Air = 0,
 	Grass = 1,
@@ -21,8 +22,8 @@ enum class VoxelType : std::uint8_t {
 
 constexpr std::uint32_t kVoxelTypeCount = 7;
 
-// Base albedo per type and face (linear RGB). Reference for CPU-side uses
-// (minimap, previews, tests); the shader carries its own copy.
+// Base albedo per type and face (linear RGB), uploaded to the shader's voxel
+// palette buffer at renderer init.
 struct VoxelTypeInfo {
 	float top[3];
 	float side[3];

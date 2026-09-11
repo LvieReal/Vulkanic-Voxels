@@ -77,16 +77,25 @@ void testTerrainHeightBounds() {
 	const vv::terrain::TerrainGenerator gen(testTerrainConfig());
 	const auto& cfg = gen.config();
 	const double bound = std::abs(cfg.amplitude) * 1.2 + 1e-9;
+	const double maxHeight = double(gen.maxHeightVoxels());
 	bool inBounds = true;
-	for (int i = 0; i < 5000; ++i) {
-		const double x = i * 1.7 - 4000.0;
-		const double z = i * -2.3 + 3000.0;
+	bool underSkySkipBound = true;
+	for (int i = 0; i < 50000; ++i) {
+		const double x = i * 1.7 - 40000.0;
+		const double z = i * -2.3 + 30000.0;
 		const double h = gen.heightAt(x, z);
 		if (h < cfg.baseHeight - bound || h > cfg.baseHeight + bound) {
 			inBounds = false;
 		}
+		// The renderer's sky-skip early-out depends on this: no height may
+		// exceed maxHeightVoxels().
+		if (h > maxHeight) {
+			underSkySkipBound = false;
+		}
 	}
 	check(inBounds, "terrain: height must stay within base +- 1.2*amplitude");
+	check(underSkySkipBound,
+				"terrain: maxHeightVoxels() must bound every height");
 }
 
 void testTerrainLayering() {

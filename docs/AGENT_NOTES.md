@@ -78,12 +78,37 @@ window is not yet visible (this is what removed the old
   and rewrites the table. `updateWorld(cameraPos)` is called every frame and
   no-ops unless the camera chunk changed.
 - Shader `pixels_rgba.comp`: DDA over the region AABB; per-step chunk lookup
-  (floor-div coords → table slot → packed word fetch); per-face type palette;
-  exponential distance fog to sky. **Palette sync**: `kVoxelTypeInfo` in
-  `src/voxel/VoxelTypes.hpp` must match `kTopColor/kSideColor/kBottomColor`
-  in the shader; push constants must match `vv::render::PushConstants`.
+  (floor-div coords → table slot → packed word fetch); exponential distance
+  fog to sky; sky-skip early-out (rays whose region segment stays above
+  `maxHeightVoxels()` can never hit — `push.grid.w` carries the bound, and the
+  DDA breaks once ascending above it). Colors come from the **voxel palette
+  buffer** (binding 4, filled from `kVoxelTypeInfo` at renderer init) — no
+  colors are hardcoded in the shader; a bindless texture array is the planned
+  replacement. Push constants must match `vv::render::PushConstants`.
 - Default view: render radius 6 chunks (13×13, ~22 MB atlas), fog density
-  derived from the radius in `computeFogDensity()`.
+  derived from the radius in `computeFogDensity()`, maxTraceSteps 512.
+
+### GPU error handling (as of pass 2.1)
+
+After a user-reported driver crash ("renderer freezes, no error messages"):
+- All `vkAcquireNextImageKHR` / `vkQueueSubmit` / `vkQueuePresentKHR` /
+  record failures now set a device-lost state with a message; the widget
+  shows one message box and stops rendering (`VulkanRenderer::deviceLost()`).
+- Optional `VK_EXT_debug_utils` messenger routes validation messages to
+  stderr; the Khronos validation layer is enabled only when the
+  `VV_VALIDATION` env var is set and the layer is installed.
+- Fixed a real bug found during the investigation: with an exactly
+  region-sized atlas, hysteresis eviction lags demand, so the first chunk
+  crossing after startup always failed (silently) and the region never
+  re-centered. `rebuildChunkRegion` now (a) collects *all* slotless region
+  chunks (CPU-cached chunks that lost their slot only need a re-upload), and
+  (b) falls back to releasing slots outside the region when free slots run
+  short — always makes progress, teleports included.
+- TDR mitigation: maxTraceSteps 1024 → 512, sky-skip early-out (pass-1's
+  random chunk hit within ~2 steps; air traversal of 400+ cells was the new
+  worst case). If device loss persists on weaker GPUs, next steps: reduce
+  `renderRadiusChunks`, then the heightmap-guided skipping planned for the
+  optimization pass.
 
 ## Roadmap status
 
@@ -105,6 +130,16 @@ window is not yet visible (this is what removed the old
 - [x] Infinite worlds via chunking (X/Z only, full-height chunks, GPU chunk
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
+
+**Pass 2.1 — done (crash investigation after user report):**
+- [x] Region slot-exhaustion bug fixed (first border crossing always failed
+      silently; see "GPU error handling" above)
+- [x] Vulkan errors surfaced (device-lost state + UI message box); previously
+      every GPU error was swallowed — matched the "no error messages" report
+- [x] TDR mitigation: maxTraceSteps 512, sky-skip early-out
+- [x] Debug messenger (stderr) + opt-in validation layer via VV_VALIDATION=1
+- [x] Palette moved out of the shader into a data buffer (binding 4); note
+      added that a bindless texture array is planned
 
 **Pass 3 — planned, START ONLY AFTER USER VERIFIES PASS 2:**
 - Optimizations: SIMD noise, bitwise ops, faster traversal for large worlds

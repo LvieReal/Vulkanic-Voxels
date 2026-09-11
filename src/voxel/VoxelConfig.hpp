@@ -20,8 +20,11 @@ struct VoxelConfig final {
 
 	std::uint32_t terrainSeed = 1337;
 
-	// Hard cap on DDA steps per pixel in the compute shader.
-	std::uint32_t maxTraceSteps = 1024;
+	// Hard cap on DDA steps per pixel in the compute shader. Keeps worst-case
+	// dispatch cost bounded (long air traversal is the expensive case); the
+	// distance fog is nearly opaque well before this many steps, so the cap
+	// is visually lossless.
+	std::uint32_t maxTraceSteps = 512;
 
 	std::uint32_t gridWidth() const { return 2 * renderRadiusChunks + 1; }
 	std::uint32_t gridHeight() const { return 2 * renderRadiusChunks + 1; }

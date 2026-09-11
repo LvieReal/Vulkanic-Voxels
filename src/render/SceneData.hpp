@@ -13,7 +13,7 @@ struct PushConstants final {
 	glm::uvec4 chunkSize{}; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
 	glm::vec4 voxelSize{};  // xyz=voxel size in world units
 	glm::ivec4 region{};    // x,z = region origin (min corner) in chunk coords
-	glm::uvec4 grid{};      // x=gridWidth, y=gridHeight, z=slot stride (words), w=unused
+	glm::uvec4 grid{};      // x=gridWidth, y=gridHeight, z=slot stride (words), w=max terrain voxel y (sky-skip)
 };
 
 // Uniform buffer updated each frame with camera and lighting.

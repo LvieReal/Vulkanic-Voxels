@@ -41,39 +41,17 @@ layout(set = 0, binding = 3) readonly buffer ChunkTable {
     uint slots[];
 } chunkTable;
 
-const uint kEmptySlot = 0xFFFFFFFFu;
+// Voxel palette: per-type, per-face base colors, uploaded from
+// vv::voxel::kVoxelTypeInfo (entry order = VoxelType enum order). This flat
+// palette is a placeholder - the plan is to replace it with a bindless
+// texture array so each voxel type gets real albedo textures.
+layout(set = 0, binding = 4) readonly buffer VoxelPalette {
+    vec4 top[8];
+    vec4 side[8];
+    vec4 bottom[8];
+} palette;
 
-// Voxel type palette. KEEP IN SYNC with kVoxelTypeInfo in
-// src/voxel/VoxelTypes.hpp (order: Air, Grass, Dirt, Stone, Sand, Snow,
-// Bedrock).
-const int kTypeCount = 7;
-const vec3 kTopColor[kTypeCount] = vec3[kTypeCount](
-    vec3(0.00, 0.00, 0.00),
-    vec3(0.26, 0.55, 0.14),
-    vec3(0.43, 0.31, 0.18),
-    vec3(0.56, 0.56, 0.58),
-    vec3(0.87, 0.81, 0.60),
-    vec3(0.93, 0.95, 0.98),
-    vec3(0.18, 0.17, 0.19)
-);
-const vec3 kSideColor[kTypeCount] = vec3[kTypeCount](
-    vec3(0.00, 0.00, 0.00),
-    vec3(0.40, 0.31, 0.15),
-    vec3(0.40, 0.29, 0.17),
-    vec3(0.52, 0.52, 0.55),
-    vec3(0.83, 0.77, 0.57),
-    vec3(0.88, 0.90, 0.95),
-    vec3(0.18, 0.17, 0.19)
-);
-const vec3 kBottomColor[kTypeCount] = vec3[kTypeCount](
-    vec3(0.00, 0.00, 0.00),
-    vec3(0.43, 0.31, 0.18),
-    vec3(0.36, 0.25, 0.15),
-    vec3(0.47, 0.47, 0.50),
-    vec3(0.79, 0.73, 0.54),
-    vec3(0.84, 0.86, 0.92),
-    vec3(0.18, 0.17, 0.19)
-);
+const uint kEmptySlot = 0xFFFFFFFFu;
 
 // Division rounding towards negative infinity (GLSL '/' truncates).
 int floorDiv(int a, int b)
@@ -160,13 +138,14 @@ vec3 skyColor(vec3 rd)
 
 vec3 voxelColor(uint type, vec3 normal)
 {
+    uint t = min(type, 7u);
     if (normal.y > 0.5) {
-        return kTopColor[type];
+        return palette.top[t].rgb;
     }
     if (normal.y < -0.5) {
-        return kBottomColor[type];
+        return palette.bottom[t].rgb;
     }
-    return kSideColor[type];
+    return palette.side[t].rgb;
 }
 
 void main()
@@ -224,6 +203,15 @@ void main()
 
     ivec3 cell = ivec3(floor(start));
     float tEnd = tExit - max(tEnter, 0.0);
+
+    // Sky-skip: terrain never rises above pc.grid.w, so a ray whose whole
+    // region segment stays above that line can only see sky. y is linear in
+    // the ray parameter, so its minimum over the segment is at an endpoint.
+    const float maxTerrainY = float(pc.grid.w);
+    if (min(start.y, (ro + rd * tExit).y) > maxTerrainY) {
+        outPixels.outData[idx] = packColor(skyColor(rdWorld));
+        return;
+    }
 
     const float EPS = 1e-6;
 
@@ -286,6 +274,11 @@ void main()
             } else {
                 normal = enterNormal;
             }
+            break;
+        }
+
+        // Ascending above the highest possible terrain: nothing left to hit.
+        if (rd.y > 0.0 && float(cell.y) >= maxTerrainY) {
             break;
         }
 

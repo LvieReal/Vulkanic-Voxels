@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <set>
@@ -18,7 +20,28 @@ namespace vv::vulkan {
 namespace {
 using namespace vv::render;
 using namespace vv::vulkan::utils;
-} // namespace
+
+// Optional VK_EXT_debug_utils callback: routes validation-layer / driver
+// messages to stderr. Harmless (and silent) when no layers are active.
+VKAPI_ATTR VkBool32 VKAPI_CALL debugUtilsCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+    const VkDebugUtilsMessengerCallbackDataEXT* data, void* /*userData*/) {
+  if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+    std::fprintf(stderr, "[vulkan] %s\n", data->pMessage);
+  }
+  return VK_FALSE;
+}
+
+bool extensionSupported(const char* name,
+                        const std::vector<VkExtensionProperties>& available) {
+  return std::any_of(available.begin(), available.end(),
+                     [name](const VkExtensionProperties& props) {
+                       return std::strcmp(props.extensionName, name) == 0;
+                     });
+}
+
+}  // namespace
 
 VulkanRenderer::~VulkanRenderer() {
   cleanup();
@@ -68,6 +91,9 @@ void VulkanRenderer::drawFrame() {
   if (!m_initialized) {
     return;
   }
+  if (m_deviceLost) {
+    return;
+  }
 
   vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE,
                   UINT64_MAX);
@@ -87,6 +113,8 @@ void VulkanRenderer::drawFrame() {
     return;
   }
   if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
+    setDeviceLost("vkAcquireNextImageKHR failed (" +
+                  utils::vkResultToString(acquire) + ").");
     return;
   }
 
@@ -96,6 +124,7 @@ void VulkanRenderer::drawFrame() {
   std::string recordError;
   if (!recordCommandBuffer(m_commandBuffers[m_currentFrame], imageIndex,
                            recordError)) {
+    setDeviceLost("Failed to record the frame command buffer: " + recordError);
     return;
   }
 
@@ -112,6 +141,7 @@ void VulkanRenderer::drawFrame() {
 
   if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo,
                     m_inFlightFences[m_currentFrame]) != VK_SUCCESS) {
+    setDeviceLost("vkQueueSubmit failed.");
     return;
   }
 
@@ -130,15 +160,39 @@ void VulkanRenderer::drawFrame() {
     std::string error;
     (void)recreateSwapchain(m_swapchainExtent.width, m_swapchainExtent.height,
                             error);
+  } else if (present != VK_SUCCESS) {
+    setDeviceLost("vkQueuePresentKHR failed (" +
+                  utils::vkResultToString(present) + ").");
+    return;
   }
 
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
   ++m_frameCounter;
 }
 
+void VulkanRenderer::setDeviceLost(const std::string& message) {
+  if (m_deviceLost) {
+    return;
+  }
+  m_deviceLost = true;
+  m_lastError = message;
+  std::fprintf(stderr, "[vulkan] fatal: %s\n", message.c_str());
+}
+
 void VulkanRenderer::cleanup() {
   if (m_device) {
     vkDeviceWaitIdle(m_device);
+  }
+
+  if (m_debugMessenger) {
+    auto* destroyMessenger =
+        reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(m_instance,
+                                  "vkDestroyDebugUtilsMessengerEXT"));
+    if (destroyMessenger != nullptr) {
+      destroyMessenger(m_instance, m_debugMessenger, nullptr);
+    }
+    m_debugMessenger = VK_NULL_HANDLE;
   }
 
   cleanupSwapchain();
@@ -235,7 +289,8 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
   if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
     // Region stays where it was; the next frame retries. Not fatal: rendering
     // continues with the previous (fully consistent) region state.
-    (void)error;
+    std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                 error.c_str());
   }
 }
 
@@ -282,7 +337,7 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
   // Platform-delegated: the WSI extensions matching the native window kind
   // (VK_KHR_win32_surface / VK_KHR_xcb_surface / VK_KHR_wayland_surface /
   // VK_MVK_macos_surface), always preceded by VK_KHR_surface.
-  const std::vector<const char*> extensions =
+  std::vector<const char*> extensions =
       vv::platform::requiredVulkanInstanceExtensions(info.nativeWindow);
 
   // Only request extensions the loader actually supports, and fail with a
@@ -307,9 +362,42 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
     }
   }
 
+  // Optional diagnostics: a debug messenger (validation-layer messages on
+  // stderr when layers are present). The Khronos validation layer is only
+  // enabled when the VV_VALIDATION environment variable is set, since it
+  // carries a noticeable performance cost.
+  std::vector<const char*> layers;
+  if (extensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, available)) {
+    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+  }
+  if (std::getenv("VV_VALIDATION") != nullptr) {
+    uint32_t layerCount = 0;
+    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+    std::vector<VkLayerProperties> availableLayers(layerCount);
+    if (layerCount > 0) {
+      vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+    }
+    const bool hasValidation = std::any_of(
+        availableLayers.begin(), availableLayers.end(),
+        [](const VkLayerProperties& props) {
+          return std::strcmp(props.layerName,
+                             "VK_LAYER_KHRONOS_validation") == 0;
+        });
+    if (hasValidation) {
+      static const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
+      layers.push_back(kValidationLayer);
+    } else {
+      std::fprintf(stderr,
+                   "[vulkan] VV_VALIDATION is set but the Khronos validation "
+                   "layer is not installed; continuing without it.\n");
+    }
+  }
+
   VkInstanceCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   createInfo.pApplicationInfo = &appInfo;
+  createInfo.enabledLayerCount = static_cast<uint32_t>(layers.size());
+  createInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
   createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
   createInfo.ppEnabledExtensionNames = extensions.data();
 
@@ -319,6 +407,29 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
                utils::vkResultToString(r) +
                "). Vulkan might be missing or unsupported on this system.";
     return false;
+  }
+
+  // Install the debug messenger when the extension made it into the instance.
+  if (std::find(extensions.begin(), extensions.end(),
+                VK_EXT_DEBUG_UTILS_EXTENSION_NAME) != extensions.end()) {
+    auto* createMessenger =
+        reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
+    if (createMessenger != nullptr) {
+      VkDebugUtilsMessengerCreateInfoEXT messengerInfo{};
+      messengerInfo.sType =
+          VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+      messengerInfo.messageSeverity =
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+      messengerInfo.messageType =
+          VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+      messengerInfo.pfnUserCallback = debugUtilsCallback;
+      (void)createMessenger(m_instance, &messengerInfo, nullptr,
+                            &m_debugMessenger);
+    }
   }
   return true;
 }
@@ -554,13 +665,20 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   chunkTableBinding.descriptorCount = 1;
   chunkTableBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  VkDescriptorSetLayoutBinding paletteBinding{};
+  paletteBinding.binding = 4;
+  paletteBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  paletteBinding.descriptorCount = 1;
+  paletteBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutBinding bindings[] = {voxelBufferBinding,
                                              outputBufferBinding, sceneBinding,
-                                             chunkTableBinding};
+                                             chunkTableBinding,
+                                             paletteBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 4;
+  info.bindingCount = 5;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -630,6 +748,11 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
                                         int32_t centerChunkZ,
                                         std::string& outError) {
   const uint32_t radius = m_voxelConfig.renderRadiusChunks;
+  const int32_t r = static_cast<int32_t>(radius);
+  const uint32_t gridW = m_voxelConfig.gridWidth();
+  const uint32_t gridH = m_voxelConfig.gridHeight();
+  const int32_t originX = centerChunkX - r;
+  const int32_t originZ = centerChunkZ - r;
 
   std::vector<const vv::voxel::Chunk*> newChunks;
   std::vector<vv::voxel::ChunkCoord> evicted;
@@ -643,19 +766,54 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     }
   }
 
-  if (newChunks.size() > m_freeSlots.size()) {
+  // Every region cell needs an atlas slot: newly generated chunks AND chunks
+  // that stayed CPU-cached but lost their slot earlier (they only need a
+  // re-upload, not a regeneration).
+  std::vector<std::pair<vv::voxel::ChunkCoord, const vv::voxel::Chunk*>>
+      needUpload;
+  for (int32_t gz = 0; gz < static_cast<int32_t>(gridH); ++gz) {
+    for (int32_t gx = 0; gx < static_cast<int32_t>(gridW); ++gx) {
+      const vv::voxel::ChunkCoord coord{originX + gx, originZ + gz};
+      if (m_slotOf.find(coord) != m_slotOf.end()) {
+        continue;
+      }
+      const vv::voxel::Chunk* chunk = m_world->findChunk(coord);
+      if (chunk != nullptr) {
+        needUpload.emplace_back(coord, chunk);
+      }
+    }
+  }
+
+  // Capacity fallback: with an exactly region-sized atlas, hysteresis
+  // eviction lags one step behind demand, so the first crossing after any
+  // stall would otherwise fail. Release slots of chunks outside the new
+  // region (they stay CPU-cached and only need a re-upload later).
+  if (needUpload.size() > m_freeSlots.size()) {
+    for (auto it = m_slotOf.begin();
+         it != m_slotOf.end() && needUpload.size() > m_freeSlots.size();) {
+      if (std::abs(it->first.x - centerChunkX) > r ||
+          std::abs(it->first.z - centerChunkZ) > r) {
+        m_freeSlots.push_back(it->second);
+        it = m_slotOf.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  if (needUpload.size() > m_freeSlots.size()) {
     outError = "Chunk atlas exhausted (need " +
-               std::to_string(newChunks.size()) + " slots, have " +
+               std::to_string(needUpload.size()) + " slots, have " +
                std::to_string(m_freeSlots.size()) + " free).";
     return false;
   }
 
   std::vector<vv::vulkan::VoxelResources::ChunkUpload> uploads;
-  uploads.reserve(newChunks.size());
-  for (const vv::voxel::Chunk* chunk : newChunks) {
+  uploads.reserve(needUpload.size());
+  for (const auto& [coord, chunk] : needUpload) {
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
-    m_slotOf[vv::voxel::ChunkCoord{chunk->chunkX(), chunk->chunkZ()}] = slot;
+    m_slotOf[coord] = slot;
     uploads.push_back({slot, chunk});
   }
 
@@ -675,11 +833,6 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   m_regionCenter = vv::voxel::ChunkCoord{centerChunkX, centerChunkZ};
 
   // Rewrite the whole chunk table for the new region grid.
-  const int32_t originX = centerChunkX - static_cast<int32_t>(radius);
-  const int32_t originZ = centerChunkZ - static_cast<int32_t>(radius);
-  const uint32_t gridW = m_voxelConfig.gridWidth();
-  const uint32_t gridH = m_voxelConfig.gridHeight();
-
   std::vector<uint32_t> table(static_cast<size_t>(gridW) * gridH,
                               vv::vulkan::VoxelResources::kEmptySlot);
   for (const auto& [coord, slot] : m_slotOf) {
@@ -783,9 +936,9 @@ void VulkanRenderer::cleanupStorageResources() {
 }
 
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
-  VkDescriptorPoolSize poolSizes[3] = {};
+  VkDescriptorPoolSize poolSizes[2] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 3;  // voxel atlas, output, chunk table
+  poolSizes[0].descriptorCount = 4;  // voxel atlas, output, chunk table, palette
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
 
@@ -836,7 +989,12 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   chunkTableInfo.offset = 0;
   chunkTableInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[4] = {};
+  VkDescriptorBufferInfo paletteInfo{};
+  paletteInfo.buffer = m_voxelResources.paletteBuffer();
+  paletteInfo.offset = 0;
+  paletteInfo.range = VK_WHOLE_SIZE;
+
+  VkWriteDescriptorSet writes[5] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -865,7 +1023,14 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[3].pBufferInfo = &chunkTableInfo;
 
-  vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+  writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[4].dstSet = m_descriptorSet;
+  writes[4].dstBinding = 4;
+  writes[4].descriptorCount = 1;
+  writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[4].pBufferInfo = &paletteInfo;
+
+  vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
   return true;
 }
 
@@ -1057,7 +1222,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   push.region = glm::ivec4(originX, 0, originZ, 0);
   push.grid = glm::uvec4(m_voxelConfig.gridWidth(), m_voxelConfig.gridHeight(),
                          static_cast<uint32_t>(m_voxelResources.slotWordStride()),
-                         0u);
+                         static_cast<uint32_t>(m_maxTerrainVoxelY));
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(push), &push);
 

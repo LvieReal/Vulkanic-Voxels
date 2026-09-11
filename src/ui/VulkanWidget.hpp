@@ -49,6 +49,7 @@ class VulkanWidget final : public QWidget {
 	QPoint globalCenterPos() const;
 
 	bool m_initialized = false;
+	bool m_deviceLostReported = false;
 	std::unique_ptr<vv::vulkan::VulkanRenderer> m_renderer;
 	uint32_t m_pendingWidth = 0;
 	uint32_t m_pendingHeight = 0;
