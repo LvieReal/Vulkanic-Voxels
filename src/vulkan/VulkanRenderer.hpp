@@ -47,6 +47,11 @@ class VulkanRenderer final {
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
 
+  // One-line live state for the window title / stderr: fog cut distance,
+  // fog density, step budget, region grid and slot usage. Used to debug
+  // rendering reports remotely (a stale binary shows stale numbers).
+  std::string debugStats() const;
+
   // After a device loss / fatal Vulkan error, drawFrame() becomes a no-op and
   // the reason is available here for the UI to surface.
   bool deviceLost() const { return m_deviceLost; }
@@ -77,7 +82,12 @@ class VulkanRenderer final {
   // data into free atlas slots and rewrites the chunk table.
   bool rebuildChunkRegion(int32_t centerChunkX, int32_t centerChunkZ,
                           std::string& outError);
-  float computeFogDensity() const;
+  // Distance from the camera to the nearest SIDE face of the loaded chunk
+  // region (world units). This is the fog cut distance: the shader makes the
+  // fog 99.8% opaque exactly here and terminates rays beyond, so the box
+  // boundary of the region is never visible (every ray's region exit happens
+  // at >= this distance along its direction).
+  float fogCutDistance() const;
   void cleanupVoxelResources();
 
   bool createSceneResources(std::string& outError);
@@ -163,7 +173,14 @@ class VulkanRenderer final {
       m_slotOf;
   std::vector<uint32_t> m_freeSlots;
   vv::voxel::ChunkCoord m_regionCenter{};
+  // 1 / fogCutDistance(); recomputed every frame in drawFrame().
   float m_fogDensity = 0.01f;
+
+  // Debug visualizations (see AGENT_NOTES): VV_DEBUG_TERM colors each pixel
+  // by ray-termination cause, VV_DEBUG_SSAA traces 4 jittered rays per pixel
+  // (diagnoses aliasing/moire). Both default off.
+  bool m_debugTerminators = false;
+  bool m_debugSuperSample = false;
 
   // Upper bound on terrain height (voxels); rays above it can never hit.
   std::int32_t m_maxTerrainVoxelY = 0;

@@ -21,10 +21,11 @@ namespace {
 using namespace vv::render;
 using namespace vv::vulkan::utils;
 
-// Fog tail attenuation: fog density is chosen so the fog is 99.8% opaque
-// (-ln(0.002)) at the full region width, and the shader cuts rays at exactly
-// this distance. KEEP IN SYNC with fogCut in pixels_rgba.comp.
-constexpr float kFogTail = 6.215f;
+// Fog tail attenuation used ONLY inside the shader's fog curve
+// (fog = 1 - exp(-kFogTail * (d/cut)^4)); the C++ side never needs the value,
+// it only supplies fogDensity = 1 / fogCutDistance(). See fogCutDistance().
+// The exponent-4 curve keeps mid-distance terrain clear while forcing 99.8%
+// opacity exactly at the cut, which hides the region boundary.
 
 // Optional VK_EXT_debug_utils callback: routes validation-layer / driver
 // messages to stderr. Harmless (and silent) when no layers are active.
@@ -60,6 +61,19 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     outError =
         "Invalid native window handle (platform backend not resolved).";
     return false;
+  }
+
+  // Debug visualizations (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
+  // colors each pixel by ray-termination cause; VV_DEBUG_SSAA traces four
+  // jittered rays per pixel (aliasing differential; ~4x compute cost).
+  m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
+  m_debugSuperSample = std::getenv("VV_DEBUG_SSAA") != nullptr;
+  if (m_debugTerminators) {
+    std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
+                         "termination cause; see AGENT_NOTES)\n");
+  }
+  if (m_debugSuperSample) {
+    std::fprintf(stderr, "[vulkan] VV_DEBUG_SSAA: on (4 rays/pixel)\n");
   }
 
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
@@ -103,8 +117,16 @@ void VulkanRenderer::drawFrame() {
   vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE,
                   UINT64_MAX);
 
+  // Fog density follows the camera: the cut distance is the current distance
+  // to the nearest region side face (see fogCutDistance()). The shader cuts
+  // rays at 1/fogDensity and is 99.8% opaque there.
+  m_fogDensity = 1.0f / fogCutDistance();
+
   // Delegated to SceneUniform utility: updates camera + lighting UBO.
-  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting);
+  m_sceneUniform.update(
+      m_camera, m_timeSeconds, m_lighting,
+      glm::vec2(m_debugTerminators ? 1.0f : 0.0f,
+                m_debugSuperSample ? 1.0f : 0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -311,18 +333,51 @@ glm::vec3 VulkanRenderer::spawnPosition() const {
   return glm::vec3(x, height + 12.0f, z);
 }
 
-float VulkanRenderer::computeFogDensity() const {
+std::string VulkanRenderer::debugStats() const {
   const auto& cfg = m_voxelConfig;
-  // Fog is the primary "how far can a ray see" control and must be ~fully
-  // opaque at the region edge: the shader terminates rays where the fog
-  // reaches kFogTail attenuation, so anything beyond is indistinguishable
-  // from sky regardless of whether the ray was budget- or region-cut (this
-  // coupling is what removes the visible crop/noise shell around the
-  // camera). 99.8% opacity at the full region width.
-  const float regionWidth =
-      static_cast<float>(cfg.gridWidth()) * static_cast<float>(cfg.chunkSizeX) *
-      cfg.voxelSize.x;
-  return regionWidth > 1.0f ? kFogTail / regionWidth : 0.1f;
+  const float cut = 1.0f / std::max(m_fogDensity, 1e-9f);
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "fogCut=%.0fu fog=%.5f steps=%u region=%ux%u@(%d,%d) "
+                "slots=%zu/%llu",
+                cut, m_fogDensity, cfg.maxTraceSteps, cfg.gridWidth(),
+                cfg.gridHeight(), m_regionCenter.x, m_regionCenter.z,
+                m_slotOf.size(),
+                static_cast<unsigned long long>(cfg.slotCount()));
+  return std::string(buf);
+}
+
+float VulkanRenderer::fogCutDistance() const {
+  // The loaded region is a box around the camera's chunk; the camera can be
+  // anywhere inside that (center) chunk, so its distance to the nearest side
+  // face lies in [radius * chunkExtent, (radius + 1) * chunkExtent]. Cutting
+  // rays (and reaching 99.8% fog) exactly at the NEAREST side-face distance
+  // is what makes the box invisible: any ray's region exit happens at >= the
+  // perpendicular distance to the face it crosses, which is >= this value,
+  // i.e. always in fully-opaque fog. (Top face: no terrain exists above
+  // worldHeight, so sky there is correct. Bottom face: y=0 is solid bedrock
+  // everywhere, so no ray can exit through it.)
+  const auto& cfg = m_voxelConfig;
+  const int32_t originX =
+      m_regionCenter.x - static_cast<int32_t>(cfg.renderRadiusChunks);
+  const int32_t originZ =
+      m_regionCenter.z - static_cast<int32_t>(cfg.renderRadiusChunks);
+  const float chunkWorldX =
+      static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
+  const float chunkWorldZ =
+      static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
+  const float x0 = static_cast<float>(originX) * chunkWorldX;
+  const float x1 = x0 + static_cast<float>(cfg.gridWidth()) * chunkWorldX;
+  const float z0 = static_cast<float>(originZ) * chunkWorldZ;
+  const float z1 = z0 + static_cast<float>(cfg.gridHeight()) * chunkWorldZ;
+
+  const glm::vec3 pos = m_camera.position();
+  const float dx = std::min(pos.x - x0, x1 - pos.x);
+  const float dz = std::min(pos.z - z0, z1 - pos.z);
+  // Floor of one chunk extent guards the (transient) case of the camera
+  // being outside the region after a failed region rebuild.
+  const float floorDist = std::min(chunkWorldX, chunkWorldZ);
+  return std::clamp(std::min(dx, dz), floorDist, 1e9f);
 }
 
 bool VulkanRenderer::createInstance(const InitInfo& info,
@@ -753,15 +808,16 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   }
 
   // Safety net above the fog cut: the budget must never bind before the fog
-  // does. Worst case a ray crosses ~sqrt(3) cells per unit of distance, so
-  // 1.75x the region width (in voxels) covers every in-region ray.
+  // does. Worst case a ray crosses ~sqrt(3) cells per unit of distance; the
+  // fog cut is at most the region diagonal, so 1.75x the region width (in
+  // voxels) covers every in-region ray with margin.
   const std::uint32_t regionWidthVoxels =
       m_voxelConfig.gridWidth() * m_voxelConfig.chunkSizeX;
   m_voxelConfig.maxTraceSteps =
       std::clamp<std::uint32_t>(m_voxelConfig.maxTraceSteps,
                                 (regionWidthVoxels * 7u) / 4u, 4096u);
 
-  m_fogDensity = computeFogDensity();
+  m_fogDensity = 1.0f / fogCutDistance();
   return true;
 }
 

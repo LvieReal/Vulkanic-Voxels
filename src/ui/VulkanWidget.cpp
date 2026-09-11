@@ -9,7 +9,9 @@
 #include <QTimer>
 #include <QWindow>
 #include <algorithm>
+#include <cstdio>
 
+#include "core/Version.h"
 #include "platform/QtNativeWindowResolver.hpp"
 #include "vulkan/VulkanRenderer.hpp"
 
@@ -123,6 +125,22 @@ void VulkanWidget::ensureInitialized() {
 	m_gameTimer.reset();
 
 	m_initialized = true;
+
+	// Ground truth for remote debugging: name the exact binary and the live
+	// render state (also mirrored into the window title, refreshed 1 Hz).
+	std::fprintf(stderr, "[vv] build=%s | %s\n", vv::core::kBuildId,
+				 m_renderer->debugStats().c_str());
+	m_lastStatsSeconds = m_gameTimer.totalSeconds();
+	refreshDebugTitle();
+}
+
+void VulkanWidget::refreshDebugTitle() {
+	if (!m_renderer) {
+		return;
+	}
+	window()->setWindowTitle(QString::asprintf(
+			"Vulkanic Voxels - build %s | %s | %.0f fps", vv::core::kBuildId,
+			m_renderer->debugStats().c_str(), m_titleFps));
 }
 
 void VulkanWidget::tick() {
@@ -187,6 +205,17 @@ void VulkanWidget::tick() {
 		return;
 	}
 	m_renderer->drawFrame();
+
+	// 1 Hz debug title refresh (build id + live state + fps).
+	++m_statFrames;
+	const double now = m_gameTimer.totalSeconds();
+	if (now - m_lastStatsSeconds >= 1.0) {
+		m_titleFps = static_cast<double>(m_statFrames) /
+					 std::max(1e-9, now - m_lastStatsSeconds);
+		m_lastStatsSeconds = now;
+		m_statFrames = 0;
+		refreshDebugTitle();
+	}
 }
 
 void VulkanWidget::keyPressEvent(QKeyEvent* event) {

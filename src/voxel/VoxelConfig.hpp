@@ -21,11 +21,11 @@ struct VoxelConfig final {
 	std::uint32_t terrainSeed = 1337;
 
 	// Safety net on DDA iterations per pixel. The primary ray terminator is
-	// the fog distance cut (see computeFogDensity / the shader's fogCut): the
-	// renderer raises this to at least ~1.75x the region width so the budget
-	// never cuts a ray before the fog does. A step budget alone would crop
-	// the world in a noisy shell (steps count cell crossings, which varies
-	// with ray direction).
+	// the fog distance cut (see VulkanRenderer::fogCutDistance and the
+	// shader's fogCut): the renderer raises this to at least ~1.75x the
+	// region width so the budget never cuts a ray before the fog does. A
+	// step budget alone would crop the world in a noisy shell (steps count
+	// cell crossings, which varies with ray direction).
 	std::uint32_t maxTraceSteps = 1024;
 
 	std::uint32_t gridWidth() const { return 2 * renderRadiusChunks + 1; }

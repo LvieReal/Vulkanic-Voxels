@@ -40,6 +40,7 @@ class VulkanWidget final : public QWidget {
  private:
 	void ensureInitialized();
 	void tick();
+	void refreshDebugTitle();
 
 	void lockMouse();
 	void unlockMouse();
@@ -65,6 +66,12 @@ class VulkanWidget final : public QWidget {
 	vv::core::Camera m_camera;
 	vv::core::GameTimer m_gameTimer;
 	vv::voxel::VoxelConfig m_voxelConfig;
+
+	// Debug title refresh (1 Hz): shows the exact build id plus live render
+	// state, so rendering reports from remote machines are unambiguous.
+	double m_lastStatsSeconds = 0.0;
+	int m_statFrames = 0;
+	double m_titleFps = 0.0;
 
 	bool m_keyW = false;
 	bool m_keyA = false;

@@ -128,7 +128,7 @@ distance-fog banding (concentric rings around the view) remained visible.
   functions covered by the headless test suite, not raw pointer arithmetic
   inside Vulkan setup code.
 
-### Pass 2.3: "pattern on top of voxels" + distance cropping
+### Pass 2.3: "pattern on top of voxels" + distance cropping (superseded by 2.4)
 
 After the palette fix the user still saw a noisy pattern over the terrain
 and terrain cropping that shrank when close/low and grew when high/far
@@ -162,6 +162,74 @@ Fix (fog is now the primary ray terminator):
   work; fog and budget scale with it automatically).
 - `kFogTail` is duplicated in shader and C++ with a KEEP-IN-SYNC note
   (push constants could carry it, but one constant is not worth it yet).
+
+### Pass 2.4: the actual root cause - fog cut vs. region box geometry
+
+The 2.3 fix (fog cut at the full region WIDTH) did not remove the artifact:
+the user retested and saw the same noisy rings + cropping. Re-auditing the
+geometry found the real bug, which had survived all previous rounds:
+
+- The loaded region is a BOX around the camera's chunk. The camera is only
+  ~[radius, radius+1] chunk extents (192-224 world units at radius 6) from
+  the NEAREST side faces - about HALF the region width the fog was tuned to.
+- Rays toward a near face exited the region at ~200 units, far inside the
+  416-unit fog cut, and the miss path returns UNFOGGED sky. Terrain just
+  inside the boundary was only ~94-96% fogged. So the region boundary was
+  plainly visible as: a square, direction-asymmetric "crop" (near faces end
+  at ~200u, corner directions at ~300-416u - matches "the higher/farther I
+  am, the more I see it", including the ground-plane cut on Y), plus a
+  per-direction discontinuity between 0% and ~5% terrain visibility at the
+  boundary = the residual noise/rings. 2.3 only shrank the mismatch
+  (17.5% -> ~5%); it did not remove the boundary itself.
+- Fix: the fog cut is now the PER-FRAME distance from the camera to the
+  nearest region SIDE face (`VulkanRenderer::fogCutDistance()`), pushed as
+  `fogDensity = 1 / cutDistance`. Any ray's region exit lies at >= the
+  perpendicular distance to the face it crosses, i.e. >= cutDistance, so
+  EVERY termination (hit, budget, region exit, fog cut) now happens where
+  the fog is >= 99.8% opaque - the boundary is invisible by construction,
+  from every direction. (Top face: no terrain above worldHeight, sky there
+  is correct. Bottom face: y=0 is solid bedrock, nothing exits through it.)
+- Fog curve changed from `1 - exp(-density*d)` to
+  `1 - exp(-kFogTail * (d/cut)^4)` (kFogTail = 6.215 = -ln 0.002 lives ONLY
+  in the shader now). The exponent-4 ramp keeps mid-distance terrain much
+  clearer (~32% fog at half the cut vs ~95% for the linear curve at the old
+  density) while still hitting 99.8% exactly at the cut. This also directly
+  addresses "losing depth on Y": ground below a high camera is far less
+  fogged than before.
+- The C++/shader sync contract simplified: `fogDensity = 1/cutDistance`,
+  shader cuts at `1/fogDensity` and assumes 99.8% opacity there. No shared
+  constant anymore.
+
+Also eliminated during the audit (do not re-investigate):
+
+- Sky-skip ceiling is a TRUE bound: fbm is amplitude-normalized to [-1,1],
+  hilliness mask is in [0.35, 1.2], so heightAt <= 44 + 1.2*26 = 75.2 <
+  maxHeightVoxels() = 80.
+- Shader staleness: CMake compiles .comp -> .spv with a proper DEPENDS and
+  POST_BUILD copy_if_different into the exe dir; the 2.2 palette fix (CPU
+  data only) visibly changing the image proves the current shader was
+  active on the user's machine.
+- Single fog writer verified (only drawFrame writes push.camera.y).
+
+Remote-debugging instrumentation added (uploads/screenshots do not reach
+the sandbox, so the user's machine must report itself):
+
+- Window title (1 Hz) + one stderr line at startup:
+  `build <git-hash[-dirty]> | fogCut=<u> fog=<density> steps=<n>
+  region=WxH@(cx,cz) slots=used/total | <fps>`. Generated header
+  `core/Version.h.in` -> `${CMAKE_BINARY_DIR}/generated/core/Version.h`.
+  First thing to check on any report: does the hash match the expected
+  commit? A stale binary otherwise perfectly mimics a rendering bug.
+- `VV_DEBUG_TERM=1`: miss pixels false-colored by termination cause -
+  red=budget exhausted, green=region exit, blue=fog cut, magenta=sky-skip,
+  yellow=ascended above terrain, near-black=no region intersection. Terrain
+  hits render normally. Reading the colors of any remaining artifact
+  identifies the mechanism immediately.
+- `VV_DEBUG_SSAA=1`: 4 jittered rays per pixel (rotated grid). If the
+  "noisy pattern" disappears under SSAA it is sub-pixel aliasing/moire
+  (expected for 1 ray/pixel over a voxel grid at distance), not a logic
+  bug - the proper fix then is TAA/jitter, not more terminator tuning.
+  Costs ~4x compute; lower renderRadiusChunks if the GPU objects.
 
 ## Roadmap status
 

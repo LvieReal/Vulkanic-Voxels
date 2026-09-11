@@ -6,7 +6,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 // src/render/SceneData.hpp.
 layout(push_constant) uniform Push {
     uvec4 screen;   // x=width, y=height, z=bgra, w=frame
-    vec4 camera;    // x=tanHalfFov, y=fogDensity
+    vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance)
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
     ivec4 region;   // x,z = region origin (min corner) in chunk coords
@@ -32,7 +32,7 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 lightColor;
     vec4 skyLow;
     vec4 skyHigh;
-    vec4 misc; // x = timeSeconds
+    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = VV_DEBUG_SSAA
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -52,6 +52,49 @@ layout(set = 0, binding = 4) readonly buffer VoxelPalette {
 } palette;
 
 const uint kEmptySlot = 0xFFFFFFFFu;
+
+// Fog contract (must match VulkanRenderer::fogCutDistance):
+//   pc.camera.y = 1 / cutDistance, where cutDistance is the distance from
+//   the camera to the NEAREST SIDE FACE of the loaded chunk region.
+//   fog(d) = 1 - exp(-kFogTail * (d / cutDistance)^kFogExp)
+//      -> 99.8% opaque exactly at d = cutDistance; rays are cut there.
+//   Because any ray's region exit lies at >= the perpendicular distance to
+//   the face it crosses (>= cutDistance), budget-, region- and fog-cut
+//   terminations all happen where the fog is >= 99.8% opaque - the region
+//   boundary is invisible from every direction. (Cutting at the full region
+//   WIDTH instead leaves the near faces at ~half that distance UNfogged:
+//   that was the "noisy rings + cropping" bug.)
+const float kFogTail = 6.215;  // -ln(0.002)
+const float kFogExp = 4.0;     // steep ramp: clear mid-distance, wall at cut
+
+// Ray-termination causes (VV_DEBUG_TERM=1 false-colors miss pixels).
+const int TERM_HIT = 0;
+const int TERM_BUDGET = 1;      // red:   step budget exhausted (should never win)
+const int TERM_REGION_EXIT = 2; // green: left the loaded region
+const int TERM_FOG_CUT = 3;     // blue:  fog distance cut (the normal end)
+const int TERM_SKY_SKIP = 4;    // magenta: whole segment above all terrain
+const int TERM_ASCEND = 5;      // yellow: rising above all terrain mid-trace
+const int TERM_NO_REGION = 6;   // dark:  ray misses the region entirely
+
+vec3 termColor(int cause)
+{
+    if (cause == TERM_BUDGET) {
+        return vec3(1.0, 0.0, 0.0);
+    }
+    if (cause == TERM_REGION_EXIT) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    if (cause == TERM_FOG_CUT) {
+        return vec3(0.1, 0.4, 1.0);
+    }
+    if (cause == TERM_SKY_SKIP) {
+        return vec3(1.0, 0.0, 1.0);
+    }
+    if (cause == TERM_ASCEND) {
+        return vec3(1.0, 1.0, 0.0);
+    }
+    return vec3(0.1, 0.1, 0.15);
+}
 
 // Division rounding towards negative infinity (GLSL '/' truncates).
 int floorDiv(int a, int b)
@@ -116,20 +159,6 @@ bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out f
     return tmax >= max(tmin, 0.0);
 }
 
-uint packColor(vec3 rgb01)
-{
-    vec3 c = clamp(rgb01, 0.0, 1.0);
-    uint r = uint(c.r * 255.0 + 0.5);
-    uint g = uint(c.g * 255.0 + 0.5);
-    uint b = uint(c.b * 255.0 + 0.5);
-    uint a = 255u;
-
-    if (pc.screen.z != 0u) {
-        return (a << 24) | (r << 16) | (g << 8) | (b << 0);
-    }
-    return (a << 24) | (b << 16) | (g << 8) | (r << 0);
-}
-
 vec3 skyColor(vec3 rd)
 {
     float t = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
@@ -148,31 +177,26 @@ vec3 voxelColor(uint type, vec3 normal)
     return palette.side[t].rgb;
 }
 
-void main()
+float fogAmount(float dist)
 {
-    uvec2 p = gl_GlobalInvocationID.xy;
-    uvec2 size = pc.screen.xy;
-    if (p.x >= size.x || p.y >= size.y) {
-        return;
-    }
+    float x = dist * pc.camera.y;  // dist / cutDistance
+    return 1.0 - exp(-kFogTail * pow(x, kFogExp));
+}
 
-    uint idx = p.y * size.x + p.x;
-
-    // Aspect handling: vertical FOV; the horizontal axis is scaled by the
-    // aspect ratio.
-    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(size);
-    uv = uv * 2.0 - 1.0;
-    uv.y = -uv.y;
-    float aspect = float(size.x) / float(size.y);
-    uv.x *= aspect;
-
+// Traces one ray through the sub-pixel sample position uv (final NDC-style
+// coordinates, already aspect-scaled and y-flipped) and returns the shaded
+// color. When debugTerm is set, miss pixels are false-colored by their
+// termination cause instead of showing sky.
+vec3 traceRay(vec2 uv, bool debugTerm)
+{
     vec3 camPos = scene.camPos.xyz;
     vec3 forward = normalize(scene.camForward.xyz);
     vec3 right = normalize(scene.camRight.xyz);
     vec3 up = normalize(scene.camUp.xyz);
 
     float tanHalfFov = pc.camera.x;
-    vec3 rdWorld = normalize(forward + right * (uv.x * tanHalfFov) + up * (uv.y * tanHalfFov));
+    vec3 rdWorld = normalize(forward + right * (uv.x * tanHalfFov) +
+                             up * (uv.y * tanHalfFov));
     vec3 roWorld = camPos;
 
     vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
@@ -193,8 +217,7 @@ void main()
     float tExit = 0.0;
     vec3 enterNormal = vec3(0.0);
     if (!intersectAABB(ro, rd, bmin, bmax, tEnter, tExit, enterNormal)) {
-        outPixels.outData[idx] = packColor(skyColor(rdWorld));
-        return;
+        return debugTerm ? termColor(TERM_NO_REGION) : skyColor(rdWorld);
     }
 
     vec3 start = ro + rd * max(tEnter, 0.0);
@@ -203,21 +226,12 @@ void main()
 
     ivec3 cell = ivec3(floor(start));
     const float tEntryOffset = max(tEnter, 0.0);
-    float tEnd = tExit - tEntryOffset;
-
-    // Fog cut - the primary ray terminator. The fog reaches 99.8% opacity at
-    // kFogTail / fogDensity, where fully fogged terrain is indistinguishable
-    // from sky, so cutting rays there is invisible regardless of whether they
-    // would have hit terrain, left the region, or exhausted the step budget
-    // (a step budget alone crops the world in a noisy shell, because steps
-    // count cell crossings, which varies with ray direction).
-    // KEEP kFogTail in sync with VulkanRenderer::kFogTail.
-    const float kFogTail = 6.215;
-    const float fogCutT = kFogTail / max(pc.camera.y, 1e-5);
-    tEnd = min(tEnd, fogCutT - tEntryOffset);
+    const float tEndRegion = tExit - tEntryOffset;
+    // Primary ray terminator: the fog cut (99.8% opaque at 1 / fogDensity).
+    const float tEndFog = (1.0 / max(pc.camera.y, 1e-6)) - tEntryOffset;
+    float tEnd = min(tEndRegion, tEndFog);
     if (tEnd <= 0.0) {
-        outPixels.outData[idx] = packColor(skyColor(rdWorld));
-        return;
+        return debugTerm ? termColor(TERM_FOG_CUT) : skyColor(rdWorld);
     }
 
     // Sky-skip: terrain never rises above pc.grid.w, so a ray whose whole
@@ -225,8 +239,7 @@ void main()
     // the ray parameter, so its minimum over the segment is at an endpoint.
     const float maxTerrainY = float(pc.grid.w);
     if (min(start.y, (ro + rd * tExit).y) > maxTerrainY) {
-        outPixels.outData[idx] = packColor(skyColor(rdWorld));
-        return;
+        return debugTerm ? termColor(TERM_SKY_SKIP) : skyColor(rdWorld);
     }
 
     const float EPS = 1e-6;
@@ -273,6 +286,9 @@ void main()
     // current cell, relative to the region entry point; the distance from the
     // camera is tEntryOffset + t.
     float t = 0.0;
+    // Why the ray ended, for the VV_DEBUG_TERM view. Defaults to the budget
+    // (loop exhausted); every break overwrites it.
+    int termCause = TERM_BUDGET;
 
     int lastAxis = -1;
     for (int i = 0; i < int(pc.chunkSize.w); ++i) {
@@ -280,6 +296,7 @@ void main()
         if (type != 0u) {
             hit = true;
             hitType = type;
+            termCause = TERM_HIT;
             if (lastAxis == 0) {
                 normal = vec3(-float(stepX), 0.0, 0.0);
             } else if (lastAxis == 1) {
@@ -294,6 +311,7 @@ void main()
 
         // Ascending above the highest possible terrain: nothing left to hit.
         if (rd.y > 0.0 && float(cell.y) >= maxTerrainY) {
+            termCause = TERM_ASCEND;
             break;
         }
 
@@ -316,26 +334,79 @@ void main()
         }
 
         if (nextT > tEnd) {
+            termCause = (tEndFog < tEndRegion) ? TERM_FOG_CUT : TERM_REGION_EXIT;
             break;
         }
         t = nextT;
     }
 
-    vec3 color = vec3(0.0);
     if (hit) {
         vec3 lightDir = normalize(scene.lightDir.xyz);
         float ndl = max(dot(normalize(normal), lightDir), 0.0);
         vec3 base = voxelColor(hitType, normal);
         vec3 lit = base * (0.15 + 0.85 * ndl);
-        color = lit * scene.lightColor.xyz;
+        vec3 color = lit * scene.lightColor.xyz;
 
         // Distance fog towards the sky in this direction; hides the region
         // edge and gives the world aerial perspective.
-        float dist = tEntryOffset + t;
-        float fog = 1.0 - exp(-dist * pc.camera.y);
-        color = mix(color, skyColor(rdWorld), clamp(fog, 0.0, 1.0));
+        float fog = clamp(fogAmount(tEntryOffset + t), 0.0, 1.0);
+        return mix(color, skyColor(rdWorld), fog);
+    }
+    return debugTerm ? termColor(termCause) : skyColor(rdWorld);
+}
+
+uint packColor(vec3 rgb01)
+{
+    vec3 c = clamp(rgb01, 0.0, 1.0);
+    uint r = uint(c.r * 255.0 + 0.5);
+    uint g = uint(c.g * 255.0 + 0.5);
+    uint b = uint(c.b * 255.0 + 0.5);
+    uint a = 255u;
+
+    if (pc.screen.z != 0u) {
+        return (a << 24) | (r << 16) | (g << 8) | (b << 0);
+    }
+    return (a << 24) | (b << 16) | (g << 8) | (r << 0);
+}
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    uvec2 size = pc.screen.xy;
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+
+    uint idx = p.y * size.x + p.x;
+
+    const bool debugTerm = scene.misc.y > 0.5;
+    const bool superSample = scene.misc.z > 0.5;
+
+    // Aspect handling: vertical FOV; the horizontal axis is scaled by the
+    // aspect ratio. uv spans [-1, 1] with y flipped (screen y grows down).
+    // To NDC for one sub-pixel sample: ((pixel + 0.5 + offset) / size) * 2-1.
+    vec2 uvStep = 2.0 / vec2(size);  // NDC units per pixel
+
+    vec3 color = vec3(0.0);
+    if (superSample) {
+        // VV_DEBUG_SSAA: 4 jittered samples per pixel (rotated grid). A
+        // diagnostic for aliasing/moire: if the "noisy pattern" disappears
+        // here, it is sub-pixel aliasing, not a logic bug.
+        const vec2 offsets[4] = vec2[4](
+            vec2(-0.25, -0.25), vec2(0.25, -0.25),
+            vec2(-0.25, 0.25), vec2(0.25, 0.25));
+        for (int s = 0; s < 4; ++s) {
+            vec2 uv = (vec2(p) + vec2(0.5) + offsets[s]) * uvStep - 1.0;
+            uv.y = -uv.y;
+            uv.x *= float(size.x) / float(size.y);
+            color += traceRay(uv, debugTerm);
+        }
+        color *= 0.25;
     } else {
-        color = skyColor(rdWorld);
+        vec2 uv = (vec2(p) + vec2(0.5)) * uvStep - 1.0;
+        uv.y = -uv.y;
+        uv.x *= float(size.x) / float(size.y);
+        color = traceRay(uv, debugTerm);
     }
 
     outPixels.outData[idx] = packColor(color);

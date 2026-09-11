@@ -9,6 +9,7 @@ function(vv_add_game_target target_name)
     target_include_directories(${target_name} PRIVATE
         "${CMAKE_SOURCE_DIR}"
         "${CMAKE_SOURCE_DIR}/src"
+        "${CMAKE_BINARY_DIR}/generated"
     )
 
     target_compile_options(${target_name} PRIVATE
