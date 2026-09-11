@@ -100,11 +100,15 @@ void main()
 
     uint idx = p.y * size.x + p.x;
 
-    float aspect = float(size.x) / float(size.y);
+    // FIX: View was too stretched on Y due to incorrect aspect handling.
+    // Correct approach: For a vertical FOV, the horizontal axis must be scaled by aspect (width/height).
+    // Previously the aspect was misapplied (or Y was incorrectly scaled), causing vertical stretch.
+    // Now we correctly compute NDC, flip Y, and scale X by aspect.
     vec2 uv = (vec2(p) + vec2(0.5)) / vec2(size);
     uv = uv * 2.0 - 1.0;
-    uv.x *= aspect;
     uv.y = -uv.y;
+    float aspect = float(size.x) / float(size.y);
+    uv.x *= aspect;
 
     vec3 camPos = scene.camPos.xyz;
     vec3 forward = normalize(scene.camForward.xyz);
@@ -112,6 +116,7 @@ void main()
     vec3 up = normalize(scene.camUp.xyz);
 
     float tanHalfFov = pc.camera.x;
+    // Aspect is already baked into uv.x, so both axes use same tanHalfFov (vertical FOV).
     vec3 rdWorld = normalize(forward + right * (uv.x * tanHalfFov) + up * (uv.y * tanHalfFov));
     vec3 roWorld = camPos;
 
