@@ -32,8 +32,6 @@ class VoxelResources final {
 	};
 
 	static constexpr std::uint32_t kEmptySlot = 0xFFFFFFFFu;
-	// Palette capacity in entries per face (>= kVoxelTypeCount).
-	static constexpr std::uint32_t kPaletteCapacity = 8;
 
 	VoxelResources() = default;
 	~VoxelResources();

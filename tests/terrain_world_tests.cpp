@@ -13,7 +13,6 @@
 #include "voxel/Chunk.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
-
 namespace {
 
 int g_failures = 0;
@@ -169,6 +168,55 @@ void testWorldRegion() {
 				"world: evicted chunk gone");
 }
 
+void testVoxelPalette() {
+	// The palette is what the compute shader reads for voxel colors; a layout
+	// mismatch turns the world into colored noise (this test was added after
+	// exactly that bug shipped).
+	const std::vector<float> palette = vv::voxel::buildVoxelPalette();
+
+	check(palette.size() == 3u * vv::voxel::kPaletteCapacity * 4u,
+				"palette: total size (3 faces x capacity x vec4)");
+
+	const auto entry = [&palette](std::uint32_t face, std::uint32_t type,
+																std::uint32_t component) {
+		return palette[(static_cast<std::size_t>(face) * vv::voxel::kPaletteCapacity +
+										type) * 4u + component];
+	};
+
+	bool correct = true;
+	for (std::uint32_t type = 0; type < vv::voxel::kVoxelTypeCount; ++type) {
+		const auto& info = vv::voxel::kVoxelTypeInfo[type];
+		for (std::uint32_t c = 0; c < 3; ++c) {
+			if (entry(0, type, c) != info.top[c] ||
+					entry(1, type, c) != info.side[c] ||
+					entry(2, type, c) != info.bottom[c]) {
+				correct = false;
+			}
+		}
+		if (entry(0, type, 3) != 1.0f || entry(1, type, 3) != 1.0f ||
+				entry(2, type, 3) != 1.0f) {
+			correct = false;
+		}
+	}
+	check(correct, "palette: per-type top/side/bottom entries and alpha");
+
+	bool unusedZeroed = true;
+	for (std::uint32_t type = vv::voxel::kVoxelTypeCount;
+			 type < vv::voxel::kPaletteCapacity; ++type) {
+		for (std::uint32_t face = 0; face < 3; ++face) {
+			const std::size_t base =
+					(static_cast<std::size_t>(face) * vv::voxel::kPaletteCapacity +
+					 type) * 4u;
+			for (std::uint32_t i = 0; i < 4; ++i) {
+				if (palette[base + i] != 0.0f) {
+					unusedZeroed = false;
+				}
+			}
+		}
+	}
+	check(unusedZeroed, "palette: unused capacity entries are zero");
+}
+
 void testWorldWalk() {
 	// Simulate the game's access pattern: a camera flying around, region
 	// rebuilt on every chunk-border crossing. The cache must stay bounded.
@@ -250,6 +298,7 @@ void testChunkMatchesGenerator() {
 }  // namespace
 
 int main() {
+	testVoxelPalette();
 	testNoiseDeterministic();
 	testNoiseRangeAndContinuity();
 	testTerrainHeightBounds();

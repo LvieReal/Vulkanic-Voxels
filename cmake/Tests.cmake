@@ -7,6 +7,7 @@ function(vv_add_tests)
         src/terrain/Noise.cpp
         src/terrain/TerrainGenerator.cpp
         src/voxel/Chunk.cpp
+        src/voxel/VoxelTypes.cpp
         src/voxel/World.cpp
     )
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 namespace vv::voxel {
 
@@ -22,6 +23,10 @@ enum class VoxelType : std::uint8_t {
 
 constexpr std::uint32_t kVoxelTypeCount = 7;
 
+// Capacity of the GPU voxel palette, in entries per face. Must match the
+// array sizes in the shader's VoxelPalette block (top/side/bottom[8]).
+constexpr std::uint32_t kPaletteCapacity = 8;
+
 // Base albedo per type and face (linear RGB), uploaded to the shader's voxel
 // palette buffer at renderer init.
 struct VoxelTypeInfo {
@@ -39,5 +44,13 @@ constexpr VoxelTypeInfo kVoxelTypeInfo[kVoxelTypeCount] = {
 		{{0.93f, 0.95f, 0.98f}, {0.88f, 0.90f, 0.95f}, {0.84f, 0.86f, 0.92f}},  // Snow
 		{{0.18f, 0.17f, 0.19f}, {0.18f, 0.17f, 0.19f}, {0.18f, 0.17f, 0.19f}},  // Bedrock
 };
+
+// Builds the flat voxel palette consumed by the compute shader's VoxelPalette
+// SSBO: three consecutive vec4 arrays (top, side, bottom), kPaletteCapacity
+// entries each, entry order = VoxelType enum order; RGB = base albedo from
+// kVoxelTypeInfo, A = 1. Unused entries are zeroed.
+// Returns 3 * kPaletteCapacity * 4 floats (384 bytes at the default capacity).
+// Pure function on constexpr data - unit tested in tests/terrain_world_tests.cpp.
+std::vector<float> buildVoxelPalette();
 
 }  // namespace vv::voxel

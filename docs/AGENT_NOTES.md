@@ -110,6 +110,24 @@ After a user-reported driver crash ("renderer freezes, no error messages"):
   `renderRadiusChunks`, then the heightmap-guided skipping planned for the
   optimization pass.
 
+### Pass 2.2: the "noisy rings" regression
+
+After 2.1 the user reported the world rendering as "noisy rings" instead of
+voxels (screenshots did not sync into the sandbox — uploads may not reach
+the filesystem; debug from code when that happens). Root cause: the new
+palette fill used `source[type * 3 + c]`, but `VoxelTypeInfo` is
+9 floats per type (`{top, side, bottom}`), so every material got a
+scrambled brown/green color — voxel structure became invisible and only the
+distance-fog banding (concentric rings around the view) remained visible.
+
+- Fix: palette building extracted into the pure, unit-tested
+  `vv::voxel::buildVoxelPalette()` (`src/voxel/VoxelTypes.{hpp,cpp}`);
+  `VoxelResources::createPalette` just uploads its output. The test would
+  have caught the original bug.
+- Lesson: GPU-facing data-layout code should be built by small pure
+  functions covered by the headless test suite, not raw pointer arithmetic
+  inside Vulkan setup code.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**

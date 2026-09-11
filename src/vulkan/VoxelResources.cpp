@@ -69,30 +69,11 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 bool VoxelResources::createPalette(VkDevice device,
 																		VkPhysicalDevice physicalDevice,
 																		std::string& outError) {
-	// Layout mirrors the shader's VoxelPalette block: three vec4 arrays of
-	// kPaletteCapacity entries (top, side, bottom), entry order = VoxelType
-	// enum order. Placeholder flat-color palette; the texturing pass will
-	// replace it with a bindless texture array of real per-type albedo
-	// textures.
-	constexpr std::size_t kFloatsPerVec4 = 4;
-	constexpr std::size_t kFaces = 3;
-	std::vector<float> palette(kFaces * kPaletteCapacity * kFloatsPerVec4, 0.0f);
-
-	const auto writeFace = [&](std::size_t face, const float* source) {
-		for (std::uint32_t type = 0; type < vv::voxel::kVoxelTypeCount &&
-																	type < kPaletteCapacity;
-				 ++type) {
-			const std::size_t dst =
-					(face * kPaletteCapacity + type) * kFloatsPerVec4;
-			for (std::size_t c = 0; c < 3; ++c) {
-				palette[dst + c] = source[type * 3 + c];
-			}
-			palette[dst + 3] = 1.0f;
-		}
-	};
-	writeFace(0, &vv::voxel::kVoxelTypeInfo[0].top[0]);
-	writeFace(1, &vv::voxel::kVoxelTypeInfo[0].side[0]);
-	writeFace(2, &vv::voxel::kVoxelTypeInfo[0].bottom[0]);
+	// Flat per-type, per-face color palette (see vv::voxel::buildVoxelPalette;
+	// layout mirrors the shader's VoxelPalette SSBO). Placeholder until the
+	// texturing pass; the plan is a bindless texture array with real per-type
+	// albedo textures.
+	const std::vector<float> palette = vv::voxel::buildVoxelPalette();
 
 	const VkDeviceSize paletteBytes = static_cast<VkDeviceSize>(palette.size()) *
 																		sizeof(float);
