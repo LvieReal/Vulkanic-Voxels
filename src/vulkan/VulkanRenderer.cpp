@@ -8,6 +8,7 @@
 
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
+#include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
 #include "vulkan/VulkanUtils.hpp"
 
@@ -26,12 +27,13 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
   if (m_initialized) {
     return true;
   }
-  if (!info.hwnd) {
-    outError = "Invalid HWND.";
+  if (!info.nativeWindow.isValid()) {
+    outError =
+        "Invalid native window handle (platform backend not resolved).";
     return false;
   }
 
-  if (!createInstance(outError) || !createSurface(info, outError) ||
+  if (!createInstance(info, outError) || !createSurface(info, outError) ||
       !pickPhysicalDevice(outError) || !createDevice(outError) ||
       !createDescriptorSetLayout(outError) || !createCommandPool(outError) ||
       !createVoxelWorldAndUpload(outError) || !createSceneResources(outError)) {
@@ -207,7 +209,8 @@ void VulkanRenderer::setWorldConfig(const glm::uvec3& chunkSizeVoxels,
       glm::max(voxelSize, glm::vec3(1e-3f, 1e-3f, 1e-3f));
 }
 
-bool VulkanRenderer::createInstance(std::string& outError) {
+bool VulkanRenderer::createInstance(const InitInfo& info,
+                                   std::string& outError) {
   uint32_t loaderVersion = VK_API_VERSION_1_0;
   auto* fpEnumerateInstanceVersion =
       reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
@@ -227,10 +230,33 @@ bool VulkanRenderer::createInstance(std::string& outError) {
   appInfo.engineVersion = VK_MAKE_VERSION(0, 1, 0);
   appInfo.apiVersion = requestedApiVersion;
 
-  std::vector<const char*> extensions = {
-      VK_KHR_SURFACE_EXTENSION_NAME,
-      VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-  };
+  // Platform-delegated: the WSI extensions matching the native window kind
+  // (VK_KHR_win32_surface / VK_KHR_xcb_surface / VK_KHR_wayland_surface /
+  // VK_MVK_macos_surface), always preceded by VK_KHR_surface.
+  const std::vector<const char*> extensions =
+      vv::platform::requiredVulkanInstanceExtensions(info.nativeWindow);
+
+  // Only request extensions the loader actually supports, and fail with a
+  // clear message when a required WSI extension is missing.
+  uint32_t availableCount = 0;
+  vkEnumerateInstanceExtensionProperties(nullptr, &availableCount, nullptr);
+  std::vector<VkExtensionProperties> available(availableCount);
+  if (availableCount > 0) {
+    vkEnumerateInstanceExtensionProperties(nullptr, &availableCount,
+                                           available.data());
+  }
+  for (const char* extension : extensions) {
+    const bool supported = std::any_of(
+        available.begin(), available.end(), [extension](const auto& props) {
+          return std::strcmp(props.extensionName, extension) == 0;
+        });
+    if (!supported) {
+      outError = std::string("Required Vulkan instance extension '") +
+                 extension +
+                 "' is not supported by the Vulkan loader on this system.";
+      return false;
+    }
+  }
 
   VkInstanceCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -250,19 +276,10 @@ bool VulkanRenderer::createInstance(std::string& outError) {
 
 bool VulkanRenderer::createSurface(const InitInfo& info,
                                    std::string& outError) {
-  VkWin32SurfaceCreateInfoKHR createInfo{};
-  createInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-  createInfo.hinstance = info.hinstance;
-  createInfo.hwnd = info.hwnd;
-
-  VkResult r =
-      vkCreateWin32SurfaceKHR(m_instance, &createInfo, nullptr, &m_surface);
-  if (r != VK_SUCCESS) {
-    outError =
-        "Failed to create Win32 Vulkan surface (" + utils::vkResultToString(r) + ").";
-    return false;
-  }
-  return true;
+  // Platform-delegated: Win32 / XCB / Wayland / MoltenVK surface creation is
+  // selected from the native window kind (see platform/VulkanSurfaceFactory).
+  return vv::platform::createVulkanSurface(m_instance, info.nativeWindow,
+                                           &m_surface, outError);
 }
 
 bool VulkanRenderer::pickPhysicalDevice(std::string& outError) {

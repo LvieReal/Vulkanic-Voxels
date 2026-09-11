@@ -5,7 +5,7 @@
 namespace vv::ui {
 
 AppWindow::AppWindow(QWidget* parent) : QMainWindow(parent) {
-	setWindowTitle("Window");
+	setWindowTitle("Vulkanic Voxels");
 
 	m_vulkanWidget = new VulkanWidget(this);
 	setCentralWidget(m_vulkanWidget);

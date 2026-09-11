@@ -1,6 +1,7 @@
 #include "voxel/Chunk.hpp"
 
 #include <cassert>
+#include <cstddef>
 
 namespace vv::voxel {
 

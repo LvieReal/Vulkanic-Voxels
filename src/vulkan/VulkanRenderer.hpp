@@ -1,13 +1,13 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
-#include <windows.h>
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "core/Camera.hpp"
+#include "platform/NativeWindow.hpp"
 #include "render/LightingConfig.hpp"
 #include "render/SceneUniform.hpp"
 #include "voxel/VoxelConfig.hpp"
@@ -18,8 +18,9 @@ namespace vv::vulkan {
 class VulkanRenderer final {
  public:
   struct InitInfo {
-    HINSTANCE hinstance = nullptr;
-    HWND hwnd = nullptr;
+    // Platform-agnostic description of the native window to render into.
+    // See vv::platform::NativeWindow and QtNativeWindowResolver.
+    vv::platform::NativeWindow nativeWindow;
     uint32_t width = 0;
     uint32_t height = 0;
   };
@@ -47,7 +48,7 @@ class VulkanRenderer final {
  private:
   void cleanup();
 
-  bool createInstance(std::string& outError);
+  bool createInstance(const InitInfo& info, std::string& outError);
   bool createSurface(const InitInfo& info, std::string& outError);
   bool pickPhysicalDevice(std::string& outError);
   bool createDevice(std::string& outError);

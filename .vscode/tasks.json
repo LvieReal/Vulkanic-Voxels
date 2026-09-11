@@ -14,6 +14,24 @@
                 "MinGW Makefiles",
                 "-DCMAKE_BUILD_TYPE=Debug"
             ],
+            "linux": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/debug",
+                    "-DCMAKE_BUILD_TYPE=Debug"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/debug",
+                    "-DCMAKE_BUILD_TYPE=Debug"
+                ]
+            },
             "group": "build",
             "problemMatcher": []
         },
@@ -30,6 +48,24 @@
                 "MinGW Makefiles",
                 "-DCMAKE_BUILD_TYPE=Release"
             ],
+            "linux": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/release",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/release",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
             "group": "build",
             "problemMatcher": []
         },
@@ -44,6 +80,20 @@
                 "--config",
                 "Debug"
             ],
+            "linux": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/debug",
+                    "--parallel"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/debug",
+                    "--parallel"
+                ]
+            },
             "dependsOn": "cmake-configure-debug",
             "group": {
                 "kind": "build",
@@ -64,6 +114,20 @@
                 "--config",
                 "Release"
             ],
+            "linux": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/release",
+                    "--parallel"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/release",
+                    "--parallel"
+                ]
+            },
             "dependsOn": "cmake-configure-release",
             "group": "build",
             "problemMatcher": [
@@ -81,10 +145,7 @@
                 "package_folder"
             ],
             "dependsOn": "cmake-build-debug",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
+            "group": "build",
             "problemMatcher": [
                 "$gcc"
             ]
@@ -100,10 +161,7 @@
                 "package_folder"
             ],
             "dependsOn": "cmake-build-release",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
+            "group": "build",
             "problemMatcher": [
                 "$gcc"
             ]

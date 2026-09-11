@@ -1,6 +1,16 @@
 #include "core/RuntimePaths.hpp"
 
+#if defined(_WIN32)
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#include <string>
 
 namespace vv::core {
 
@@ -16,4 +26,6 @@ std::filesystem::path executableDir() {
 	return std::filesystem::path(buffer).parent_path();
 }
 
-} // namespace vv::core
+}  // namespace vv::core
+
+#endif  // defined(_WIN32)
