@@ -1,0 +1,112 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cmake-configure-debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build/debug",
+                "-G",
+                "MinGW Makefiles",
+                "-DCMAKE_BUILD_TYPE=Debug"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "cmake-configure-release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build/release",
+                "-G",
+                "MinGW Makefiles",
+                "-DCMAKE_BUILD_TYPE=Release"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "cmake-build-debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build/debug",
+                "--parallel ${env:NUMBER_OF_PROCESSORS}",
+                "--config",
+                "Debug"
+            ],
+            "dependsOn": "cmake-configure-debug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "cmake-build-release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build/release",
+                "--parallel ${env:NUMBER_OF_PROCESSORS}",
+                "--config",
+                "Release"
+            ],
+            "dependsOn": "cmake-configure-release",
+            "group": "build",
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "cmake-package-debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build/debug",
+                "--target",
+                "package_folder"
+            ],
+            "dependsOn": "cmake-build-debug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "cmake-package-release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build/release",
+                "--target",
+                "package_folder"
+            ],
+            "dependsOn": "cmake-build-release",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        }
+    ]
+}

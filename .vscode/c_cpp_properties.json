@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/src/**",
+                "${MINGW64_PATH}/include/**",
+                "${VK_SDK_PATH}/Include/**"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE",
+                "VK_USE_PLATFORM_WIN32_KHR",
+                "WIN32_LEAN_AND_MEAN",
+                "NOMINMAX"
+            ],
+            "windowsSdkVersion": "10.0.26100.0",
+            "intelliSenseMode": "windows-gcc-x64",
+            "compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
+            "cStandard": "c23",
+            "cppStandard": "c++23"
+        }
+    ],
+    "version": 4
+}
