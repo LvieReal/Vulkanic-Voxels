@@ -20,11 +20,13 @@ struct VoxelConfig final {
 
 	std::uint32_t terrainSeed = 1337;
 
-	// Hard cap on DDA steps per pixel in the compute shader. Keeps worst-case
-	// dispatch cost bounded (long air traversal is the expensive case); the
-	// distance fog is nearly opaque well before this many steps, so the cap
-	// is visually lossless.
-	std::uint32_t maxTraceSteps = 512;
+	// Safety net on DDA iterations per pixel. The primary ray terminator is
+	// the fog distance cut (see computeFogDensity / the shader's fogCut): the
+	// renderer raises this to at least ~1.75x the region width so the budget
+	// never cuts a ray before the fog does. A step budget alone would crop
+	// the world in a noisy shell (steps count cell crossings, which varies
+	// with ray direction).
+	std::uint32_t maxTraceSteps = 1024;
 
 	std::uint32_t gridWidth() const { return 2 * renderRadiusChunks + 1; }
 	std::uint32_t gridHeight() const { return 2 * renderRadiusChunks + 1; }

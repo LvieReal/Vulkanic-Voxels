@@ -202,7 +202,23 @@ void main()
     start += rd * 1e-4;
 
     ivec3 cell = ivec3(floor(start));
-    float tEnd = tExit - max(tEnter, 0.0);
+    const float tEntryOffset = max(tEnter, 0.0);
+    float tEnd = tExit - tEntryOffset;
+
+    // Fog cut - the primary ray terminator. The fog reaches 99.8% opacity at
+    // kFogTail / fogDensity, where fully fogged terrain is indistinguishable
+    // from sky, so cutting rays there is invisible regardless of whether they
+    // would have hit terrain, left the region, or exhausted the step budget
+    // (a step budget alone crops the world in a noisy shell, because steps
+    // count cell crossings, which varies with ray direction).
+    // KEEP kFogTail in sync with VulkanRenderer::kFogTail.
+    const float kFogTail = 6.215;
+    const float fogCutT = kFogTail / max(pc.camera.y, 1e-5);
+    tEnd = min(tEnd, fogCutT - tEntryOffset);
+    if (tEnd <= 0.0) {
+        outPixels.outData[idx] = packColor(skyColor(rdWorld));
+        return;
+    }
 
     // Sky-skip: terrain never rises above pc.grid.w, so a ray whose whole
     // region segment stays above that line can only see sky. y is linear in
@@ -257,7 +273,6 @@ void main()
     // current cell, relative to the region entry point; the distance from the
     // camera is tEntryOffset + t.
     float t = 0.0;
-    const float tEntryOffset = max(tEnter, 0.0);
 
     int lastAxis = -1;
     for (int i = 0; i < int(pc.chunkSize.w); ++i) {

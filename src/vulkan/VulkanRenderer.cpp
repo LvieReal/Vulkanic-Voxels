@@ -21,6 +21,11 @@ namespace {
 using namespace vv::render;
 using namespace vv::vulkan::utils;
 
+// Fog tail attenuation: fog density is chosen so the fog is 99.8% opaque
+// (-ln(0.002)) at the full region width, and the shader cuts rays at exactly
+// this distance. KEEP IN SYNC with fogCut in pixels_rgba.comp.
+constexpr float kFogTail = 6.215f;
+
 // Optional VK_EXT_debug_utils callback: routes validation-layer / driver
 // messages to stderr. Harmless (and silent) when no layers are active.
 VKAPI_ATTR VkBool32 VKAPI_CALL debugUtilsCallback(
@@ -308,9 +313,16 @@ glm::vec3 VulkanRenderer::spawnPosition() const {
 
 float VulkanRenderer::computeFogDensity() const {
   const auto& cfg = m_voxelConfig;
-  const float viewDistance = (static_cast<float>(cfg.renderRadiusChunks) + 0.5f) *
-                             static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
-  return viewDistance > 1.0f ? 1.0f / (viewDistance * 0.55f) : 0.1f;
+  // Fog is the primary "how far can a ray see" control and must be ~fully
+  // opaque at the region edge: the shader terminates rays where the fog
+  // reaches kFogTail attenuation, so anything beyond is indistinguishable
+  // from sky regardless of whether the ray was budget- or region-cut (this
+  // coupling is what removes the visible crop/noise shell around the
+  // camera). 99.8% opacity at the full region width.
+  const float regionWidth =
+      static_cast<float>(cfg.gridWidth()) * static_cast<float>(cfg.chunkSizeX) *
+      cfg.voxelSize.x;
+  return regionWidth > 1.0f ? kFogTail / regionWidth : 0.1f;
 }
 
 bool VulkanRenderer::createInstance(const InitInfo& info,
@@ -739,6 +751,15 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   if (!rebuildChunkRegion(0, 0, outError)) {
     return false;
   }
+
+  // Safety net above the fog cut: the budget must never bind before the fog
+  // does. Worst case a ray crosses ~sqrt(3) cells per unit of distance, so
+  // 1.75x the region width (in voxels) covers every in-region ray.
+  const std::uint32_t regionWidthVoxels =
+      m_voxelConfig.gridWidth() * m_voxelConfig.chunkSizeX;
+  m_voxelConfig.maxTraceSteps =
+      std::clamp<std::uint32_t>(m_voxelConfig.maxTraceSteps,
+                                (regionWidthVoxels * 7u) / 4u, 4096u);
 
   m_fogDensity = computeFogDensity();
   return true;

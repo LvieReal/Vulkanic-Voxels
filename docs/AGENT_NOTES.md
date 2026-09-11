@@ -128,6 +128,41 @@ distance-fog banding (concentric rings around the view) remained visible.
   functions covered by the headless test suite, not raw pointer arithmetic
   inside Vulkan setup code.
 
+### Pass 2.3: "pattern on top of voxels" + distance cropping
+
+After the palette fix the user still saw a noisy pattern over the terrain
+and terrain cropping that shrank when close/low and grew when high/far
+("maybe rays miss" — exactly right). One root cause, two symptoms:
+
+- **The DDA step budget counts cell crossings, not distance.** 512 steps
+  reach only ~296–362 world units (a 3D-diagonal ray spends √3 crossings
+  per unit). A ray that exhausts its budget outputs pure sky while a
+  neighbor that hits terrain just inside the boundary is only 92–96%
+  fogged → a per-pixel-varying 4–8% discontinuity = the noise pattern.
+- **The fog was thinner than the region** (99.8% opaque at 711 units vs.
+  588 region diagonal), so fog never caught up before rays were cut —
+  making the cut visible as a crop shell around the camera (from low
+  altitude, horizontal rays burn their budget on air and miss far terrain;
+  from higher up rays steepen and reach further).
+
+Fix (fog is now the primary ray terminator):
+
+- `computeFogDensity()` = `kFogTail / regionWidth` — fog is 99.8% opaque
+  (`kFogTail = 6.215 = -ln(0.002)`) exactly at the region width.
+- The shader cuts every ray at the 99.8%-fog distance (`fogCutT =
+  kFogTail / fogDensity`; `tEnd = min(tEnd, fogCutT - tEntryOffset)`).
+  Beyond it, sky and fogged terrain are indistinguishable, so budget-,
+  region- and fog-cuts all produce the same color — no artifact, by
+  construction.
+- `maxTraceSteps` is a pure safety net: default 1024, and the renderer
+  raises it to ≥ 1.75× the region width (in voxels) so it never binds
+  before the fog does (worst case ~√3 crossings per unit).
+- Trade-off: fog is ~1.7× thicker than before (95% at ~200 units for the
+  default radius 6). More view = raise `renderRadiusChunks` (more GPU
+  work; fog and budget scale with it automatically).
+- `kFogTail` is duplicated in shader and C++ with a KEEP-IN-SYNC note
+  (push constants could carry it, but one constant is not worth it yet).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
