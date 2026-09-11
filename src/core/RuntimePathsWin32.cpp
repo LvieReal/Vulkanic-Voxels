@@ -1,6 +1,9 @@
-#include "core/RuntimePaths.hpp"
-
+// Windows executable path resolution.
+// The whole file is compiled out on non-Windows platforms (see
+// RuntimePathsPosix.cpp).
 #if defined(_WIN32)
+
+#include "core/RuntimePaths.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

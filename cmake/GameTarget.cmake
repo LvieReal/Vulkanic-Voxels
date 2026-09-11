@@ -19,10 +19,44 @@ function(vv_add_game_target target_name)
     target_link_libraries(${target_name} PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
     target_link_libraries(${target_name} PRIVATE Vulkan::Vulkan)
 
-    # The UI layer queries native window handles (XCB connection, Wayland
-    # wl_surface, Cocoa NSView, ...) through Qt's QPA native interface, which
-    # lives in the (installed) private QtGui headers.
-    target_link_libraries(${target_name} PRIVATE Qt6::GuiPrivate)
+    # Qt's (installed) private QtGui headers expose the QPA native interface,
+    # the only way to query some native handles (per-window Wayland
+    # wl_surface). Not every Qt distribution ships them, so they are strictly
+    # OPTIONAL: without them the game still runs on Windows, macOS and X11 via
+    # public native interfaces; only the native Wayland backend is lost (run
+    # via XWayland then, see README).
+    set(VV_HAVE_QT_QPA OFF)
+    if(TARGET Qt6::GuiPrivate)
+        target_link_libraries(${target_name} PRIVATE Qt6::GuiPrivate)
+        set(VV_HAVE_QT_QPA ON)
+    else()
+        # Some distributions install the private headers but not the
+        # Qt6::GuiPrivate CMake target; find them manually. They live in
+        # <qt-prefix>/include/QtGui/<version>/QtGui/qpa/.
+        get_filename_component(VV_QT_INSTALL_PREFIX
+            "${Qt6Gui_DIR}/../../.." ABSOLUTE)
+        file(GLOB VV_QPA_HEADER_GLOB
+            "${VV_QT_INSTALL_PREFIX}/include/QtGui/*/QtGui/qpa/qplatformnativeinterface.h")
+        if(VV_QPA_HEADER_GLOB)
+            list(GET VV_QPA_HEADER_GLOB 0 VV_QPA_HEADER)
+            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_HEADER}" DIRECTORY)  # .../QtGui/qpa
+            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_PRIVATE_DIR}" DIRECTORY)  # .../<version>/QtGui
+            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_PRIVATE_DIR}" DIRECTORY)  # .../QtGui/<version>
+            target_include_directories(${target_name} SYSTEM PRIVATE
+                "${VV_QPA_PRIVATE_DIR}")
+            set(VV_HAVE_QT_QPA ON)
+        endif()
+    endif()
+    if(VV_HAVE_QT_QPA)
+        target_compile_definitions(${target_name} PRIVATE VV_HAVE_QT_QPA=1)
+        message(STATUS "Qt QPA native interface: available (full platform coverage)")
+    else()
+        message(STATUS
+            "Qt QPA native interface: unavailable - Windows, macOS and X11 "
+            "use public interfaces; the native Wayland backend needs Qt "
+            "private headers (run via XWayland instead: "
+            "QT_QPA_PLATFORM=xcb)")
+    endif()
 
     if(WIN32)
         target_link_options(${target_name} PRIVATE

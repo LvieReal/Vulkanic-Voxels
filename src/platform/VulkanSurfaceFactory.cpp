@@ -7,6 +7,13 @@
 //
 // Note: the Vulkan platform headers only declare the surface create-info
 // structs; the native windowing headers must be included first.
+#ifndef VV_HAVE_XCB
+#define VV_HAVE_XCB 0
+#endif
+#ifndef VV_HAVE_WAYLAND
+#define VV_HAVE_WAYLAND 0
+#endif
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

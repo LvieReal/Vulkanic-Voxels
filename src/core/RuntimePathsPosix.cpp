@@ -1,6 +1,8 @@
-#include "core/RuntimePaths.hpp"
-
+// POSIX executable path resolution (Linux, macOS, other Unix-likes).
+// The whole file is compiled out on Windows (see RuntimePathsWin32.cpp).
 #if !defined(_WIN32)
+
+#include "core/RuntimePaths.hpp"
 
 #include <climits>
 #include <string>
@@ -10,6 +12,12 @@
 #include <mach-o/dyld.h>
 #elif defined(__linux__)
 #include <unistd.h>
+#endif
+
+// PATH_MAX is POSIX, not C: it comes along with <climits> on glibc/macOS but
+// is not guaranteed everywhere.
+#ifndef PATH_MAX
+#define PATH_MAX 4096
 #endif
 
 namespace vv::core {

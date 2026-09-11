@@ -40,9 +40,8 @@ cmake --build build
 Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential cmake qt6-base-dev qt6-base-private-dev \
-                 libvulkan-dev glslang-tools libglm-dev \
-                 libxcb1-dev libwayland-dev
+sudo apt install build-essential cmake qt6-base-dev libvulkan-dev \
+                 glslang-tools libglm-dev libxcb1-dev libwayland-dev
 ```
 
 Fedora:
@@ -52,6 +51,11 @@ sudo dnf install gcc-c++ cmake qt6-qtbase-devel vulkan-headers \
                  vulkan-loader-devel glslang-devel glm-devel \
                  libxcb-devel wayland-devel
 ```
+
+> **Optional:** Qt's private headers (`qt6-base-private-dev` on Debian/Ubuntu)
+> enable the native **Wayland** backend. The game builds and runs without them
+> on Windows, macOS and X11; on Wayland without them, run via XWayland:
+> `QT_QPA_PLATFORM=xcb ./build/bin/game`.
 
 Build and run:
 
