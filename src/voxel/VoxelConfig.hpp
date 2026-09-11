@@ -15,8 +15,13 @@ struct VoxelConfig final {
 	glm::vec3 voxelSize = glm::vec3(1.0f, 1.0f, 1.0f);
 
 	// Radius in chunks around the camera that is generated and resident on
-	// the GPU (region is (2r+1) x (2r+1) chunks).
-	std::uint32_t renderRadiusChunks = 6;
+	// the GPU (region is (2r+1) x (2r+1) chunks). Doubled in pass 3.5 for
+	// 2x view distance: the fog cut, step budget and atlas slot count all
+	// scale automatically (fog cut = [r, r+1] chunk extents from the camera
+	// to the nearest region face). Startup generates (2r+1)^2 chunks
+	// (~0.7 s at r=12); each border crossing streams 2(2r+1)-1 new chunks
+	// (~50 ms hitch at r=12) - the LOD pass will make streaming incremental.
+	std::uint32_t renderRadiusChunks = 12;
 
 	std::uint32_t terrainSeed = 1337;
 

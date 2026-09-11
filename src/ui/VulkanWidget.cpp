@@ -44,7 +44,10 @@ VulkanWidget::VulkanWidget(QWidget* parent) : QWidget(parent) {
 	auto* timer = new QTimer(this);
 	timer->setTimerType(Qt::PreciseTimer);
 	connect(timer, &QTimer::timeout, this, [this]() { tick(); });
-	timer->start(16);
+	// 0 ms = tick on every event-loop pass: the loop runs as fast as the
+	// GPU can present (see also choosePresentMode - IMMEDIATE by default).
+	// The old 16 ms interval capped the game at ~62 fps by itself.
+	timer->start(0);
 }
 
 VulkanWidget::~VulkanWidget() = default;

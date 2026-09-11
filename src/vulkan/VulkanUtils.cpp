@@ -1,8 +1,10 @@
 #include "vulkan/VulkanUtils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <set>
+#include <string>
 
 namespace vv::vulkan::utils {
 
@@ -223,10 +225,37 @@ VkSurfaceFormatKHR chooseSwapSurfaceFormat(
 
 VkPresentModeKHR choosePresentMode(
     const std::vector<VkPresentModeKHR>& modes) {
-  for (auto m : modes) {
-    if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
-      return m;
+  const auto isSupported = [&modes](VkPresentModeKHR m) {
+    return std::find(modes.begin(), modes.end(), m) != modes.end();
+  };
+
+  // VV_PRESENT=immediate|mailbox|fifo overrides the preference (must still
+  // be supported by the surface; otherwise ignored). "fifo" restores
+  // vsync.
+  if (const char* env = std::getenv("VV_PRESENT")) {
+    const std::string requested = env;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (requested == "immediate") {
+      mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    } else if (requested == "mailbox") {
+      mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    } else if (requested == "fifo") {
+      mode = VK_PRESENT_MODE_FIFO_KHR;
     }
+    if (mode != VK_PRESENT_MODE_MAX_ENUM_KHR && isSupported(mode)) {
+      return mode;
+    }
+  }
+
+  // Default: uncapped. IMMEDIATE shows the true frame rate (tearing is
+  // possible), MAILBOX is vsync without latency but still caps at the
+  // compositor rate, FIFO is the guaranteed fallback (vsync). Together
+  // with the 0ms tick timer this removes the ~60 fps ceiling.
+  if (isSupported(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+    return VK_PRESENT_MODE_IMMEDIATE_KHR;
+  }
+  if (isSupported(VK_PRESENT_MODE_MAILBOX_KHR)) {
+    return VK_PRESENT_MODE_MAILBOX_KHR;
   }
   return VK_PRESENT_MODE_FIFO_KHR;
 }

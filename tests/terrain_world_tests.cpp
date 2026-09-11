@@ -791,10 +791,44 @@ void testTraversalParity() {
 	}
 }
 
+// CPU mirror of the shader's vertexAO (ported from the user's WGSL):
+// verifies the truth table the AO look depends on.
+void testVertexAO() {
+	auto vertexAO = [](bool side1, bool side2, bool corner) {
+		if (side1 && side2) {
+			return 0.0f;
+		}
+		return 1.0f - ((side1 ? 1.0f : 0.0f) + (side2 ? 1.0f : 0.0f) +
+									 (corner ? 1.0f : 0.0f)) / 3.0f;
+	};
+	check(vertexAO(false, false, false) == 1.0f, "ao: open corner is 1");
+	check(std::abs(vertexAO(true, false, false) - 2.0f / 3.0f) < 1e-6f,
+				"ao: one side is 2/3");
+	check(std::abs(vertexAO(false, false, true) - 2.0f / 3.0f) < 1e-6f,
+				"ao: corner only is 2/3");
+	check(std::abs(vertexAO(true, false, true) - 1.0f / 3.0f) < 1e-6f,
+				"ao: side+corner is 1/3");
+	check(vertexAO(true, true, false) == 0.0f, "ao: two sides fully occluded");
+	check(vertexAO(true, true, true) == 0.0f,
+				"ao: two sides ignore the corner");
+	// Bilinear blend at the face center = mean of the four corners (the
+	// calculateAO weights at localPos = (0.5, 0.5)).
+	const float ao00 = vertexAO(false, false, false);
+	const float ao10 = vertexAO(true, false, false);
+	const float ao01 = vertexAO(false, true, false);
+	const float ao11 = vertexAO(true, true, false);
+	const float center = ao00 * 0.25f + ao10 * 0.25f + ao01 * 0.25f +
+											 ao11 * 0.25f;
+	check(std::abs(center - (1.0f + 2.0f / 3.0f + 2.0f / 3.0f + 0.0f) / 4.0f) <
+					1e-6f,
+				"ao: bilinear center is the corner mean");
+}
+
 }  // namespace
 
 int main() {
 	testVoxelPalette();
+	testVertexAO();
 	testNoiseDeterministic();
 	testNoiseRangeAndContinuity();
 	testNoiseSimdParity();

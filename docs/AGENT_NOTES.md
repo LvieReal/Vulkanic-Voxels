@@ -359,6 +359,49 @@ NEON path for ARM/macOS; AVX2 8-wide noise (marginal over SSE2 for this
 hash-heavy workload); TAA/jitter for sub-pixel aliasing if it ever shows
 up (user: it is NOT the current artifact class - agreed, 2.5 proved it).
 
+### Pass 3.5: fps cap, 2x render distance, AO, sky, debanding
+
+User confirmed pass 3.1 ("voxels are back") and asked for, before LOD:
+uncap the 60 fps ceiling, double the render distance, port the vertex-AO
+from their WGSL reference renderer (saved verbatim as
+docs/reference_renderer.wgsl), a brighter sky, and dithered debanding.
+
+- **FPS cap - there were TWO independent caps.** (1) The widget's QTimer
+  ticked every 16 ms -> max ~62.5 fps by itself; now 0 ms (tick on every
+  event-loop pass). (2) choosePresentMode preferred MAILBOX -> FIFO, both
+  of which sync to the compositor (60 Hz). Now IMMEDIATE > MAILBOX > FIFO
+  (uncapped by default; tearing is possible with IMMEDIATE), overridable
+  with VV_PRESENT=immediate|mailbox|fifo (fifo restores vsync).
+- **Render distance 2x**: renderRadiusChunks 6 -> 12 (region 25x25 = 625
+  slots, atlas ~83 MB). Fog cut, step budget and slot count all scale
+  automatically (cut = 384-416 u from the camera to the nearest region
+  face). Startup generates 625 chunks (~0.7 s, one-time); each border
+  crossing streams 2(2r+1)-1 = 49 chunks (~45 ms hitch) - the LOD pass
+  will make streaming incremental.
+- **Ambient occlusion** (ported from the WGSL reference): vertexAO corner
+  darkening (1 - (side1+side2+corner)/3, two sides -> 0) + calculateAO -
+  8 voxels sampled around the hit face in the plane one cell out along
+  the normal, four corner AO values bilinearly blended by the hit's
+  fractional position on the face; multiplies the lit color. AO fades to
+  1 only in unloaded cells (treated as air), which the fog already hides.
+  CPU truth-table test added (note: 1-1/3 != 2/3 in float32 - 1 ulp - so
+  the test uses tolerance; the shader formula itself is the port target).
+- **Sky** (ported compute_env): horizon/zenith smoothstep gradient +
+  horizon haze (1,0.95,0.9) x (0.12 h + 0.04 h^2) + sun glow
+  (pow(sun,48) x 0.8) and core (pow(sun,512) x 8), using the configured
+  sun dir/color. The old LightingConfig defaults were effectively
+  night-dark ((0.05,0.08,0.12)/(0.2,0.3,0.5)) - hence "too dark". Now the
+  reference palette: horizon (0.8,0.9,1.0), zenith (0.45,0.62,0.95), warm
+  sun (1,0.95,0.85), sun dir normalize(0.5,1,0.5). The sky doubles as
+  the fog target, so terrain fades into exactly the sky it occludes,
+  including sun haze.
+- **Debanding**: interleaved gradient noise (+-0.5 LSB) added in
+  packColor before the 8-bit quantization - converts sky gradient bands
+  into imperceptible noise.
+- Not ported (yet): selection outline, ground grid, the reference's
+  ambient/direct/rim shading split (our lighting kept; AO applied on
+  top).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -379,6 +422,16 @@ up (user: it is NOT the current artifact class - agreed, 2.5 proved it).
 - [x] Infinite worlds via chunking (X/Z only, full-height chunks, GPU chunk
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
+
+**Pass 3.5 — done (pending user verification):**
+- [x] FPS uncapped (0ms tick timer + IMMEDIATE present mode; VV_PRESENT
+      overrides, fifo restores vsync)
+- [x] Render distance 2x (radius 12; fog/budget/slots scale automatically)
+- [x] Per-vertex simulated AO ported from the user's WGSL reference
+      (docs/reference_renderer.wgsl)
+- [x] Bright sky: reference palette + haze + sun glow/core; sky is the fog
+      target
+- [x] Debanding: IGN dither before 8-bit quantization
 
 **Pass 3 — done (pending user verification):**
 - [x] Heightmap-guided air-skipping on the GPU (column DDA + conservative
