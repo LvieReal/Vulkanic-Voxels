@@ -209,8 +209,17 @@ bool VoxelResources::uploadChunks(VkDevice device,
 		return false;
 	}
 
-	std::vector<VkBufferCopy> regions;
-	regions.reserve(uploads.size() * 2);
+	// Two SEPARATE copy commands: voxel data -> voxel atlas, heightmaps ->
+	// height atlas. The regions must never be mixed into one call: a region's
+	// destination BUFFER is chosen by the call, not by the region struct.
+	// (Pass 3.0 shipped them mixed into one vkCmdCopyBuffer targeting the
+	// voxel atlas: heightmap bytes landed in the first 2 KB of every chunk
+	// slot and the height buffer stayed uninitialized -> every column read
+	// bound 0 -> every ray was air-skipped -> "voxels disappeared".)
+	std::vector<VkBufferCopy> voxelRegions;
+	std::vector<VkBufferCopy> heightRegions;
+	voxelRegions.reserve(uploads.size());
+	heightRegions.reserve(uploads.size());
 	{
 		VkDeviceSize voxelOffset = 0;
 		VkDeviceSize heightOffset =
@@ -224,7 +233,7 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			voxelRegion.dstOffset =
 					static_cast<VkDeviceSize>(upload.slot) * m_slotByteStride;
 			voxelRegion.size = static_cast<VkDeviceSize>(m_slotByteStride);
-			regions.push_back(voxelRegion);
+			voxelRegions.push_back(voxelRegion);
 			voxelOffset += static_cast<VkDeviceSize>(m_slotByteStride);
 
 			VkBufferCopy heightRegion{};
@@ -232,12 +241,16 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			heightRegion.dstOffset =
 					static_cast<VkDeviceSize>(upload.slot) * heightBytesPerSlot;
 			heightRegion.size = heightBytesPerSlot;
-			regions.push_back(heightRegion);
+			heightRegions.push_back(heightRegion);
 			heightOffset += heightBytesPerSlot;
 		}
 	}
 	vkCmdCopyBuffer(cmd, stagingBuffer, m_voxelBuffer,
-									static_cast<std::uint32_t>(regions.size()), regions.data());
+								 static_cast<std::uint32_t>(voxelRegions.size()),
+								 voxelRegions.data());
+	vkCmdCopyBuffer(cmd, stagingBuffer, m_heightBuffer,
+								 static_cast<std::uint32_t>(heightRegions.size()),
+								 heightRegions.data());
 
 	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 		outError = "Failed to end chunk upload command buffer.";

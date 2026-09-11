@@ -335,6 +335,25 @@ scalar hot path:
   0.8-1.1 ms/chunk (~2.5x). Startup region build ~400ms -> ~160ms; chunk
   border crossings ~10ms -> ~4ms.
 
+**Pass 3.1 hotfix: "voxels disappeared" - heightmap copied into the voxel
+atlas.** First user run of pass 3 showed a fully empty world (pure sky).
+Root cause (user's bet was correct - the air-skip pipeline, not SIMD noise;
+noise mathematically cannot blank terrain since height = 44 +- 37 is always
+solid): `uploadChunks` built ONE region list containing both the voxel
+regions and the new heightmap regions and issued ONE vkCmdCopyBuffer
+targeting the voxel atlas. A VkBufferCopy region does not carry its target
+buffer - the CALL chooses it - so every chunk's 2 KB of heightmap bytes
+landed in the first 2 KB of its voxel atlas slot (corrupting it), and the
+height atlas (binding 5) was never written: uninitialized device memory
+read as zeros -> every column bound 0 -> every ray air-skipped -> all rays
+miss -> no voxels. Fix: two region vectors + two copy commands (voxel
+regions -> voxel atlas, height regions -> height atlas), with a comment
+explaining why they must never be mixed. Lesson added to the GPU-data-
+layout rule: multi-buffer uploads need per-target region lists; a mixed
+list silently retargets data. (Invisible to the headless suite by
+construction - it is Vulkan command wiring, not logic; the parity test
+remains valid for the traversal algorithm itself.)
+
 Deferred (user decision): assembly inspection ("too far, maybe later").
 NEON path for ARM/macOS; AVX2 8-wide noise (marginal over SSE2 for this
 hash-heavy workload); TAA/jitter for sub-pixel aliasing if it ever shows
