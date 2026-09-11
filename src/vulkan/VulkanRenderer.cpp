@@ -4,13 +4,11 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
-#include <optional>
 #include <set>
 
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
 #include "render/SceneData.hpp"
-#include "vulkan/BufferUtils.hpp"
 #include "vulkan/VulkanUtils.hpp"
 
 namespace vv::vulkan {
