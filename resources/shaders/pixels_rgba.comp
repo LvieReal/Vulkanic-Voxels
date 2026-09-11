@@ -10,7 +10,10 @@ layout(push_constant) uniform Push {
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
     ivec4 region;   // x,z = region origin (min corner) in chunk coords
-    uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words)
+    uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words),
+                    // w=max terrain voxel y (sky-skip ceiling; MUST be a true
+                    // upper bound on solid terrain or the sky-skip early-out
+                    // clips real terrain into noisy contour rings)
 } pc;
 
 // Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types

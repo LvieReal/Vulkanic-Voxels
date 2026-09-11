@@ -163,7 +163,7 @@ Fix (fog is now the primary ray terminator):
 - `kFogTail` is duplicated in shader and C++ with a KEEP-IN-SYNC note
   (push constants could carry it, but one constant is not worth it yet).
 
-### Pass 2.4: the actual root cause - fog cut vs. region box geometry
+### Pass 2.4: fog cut vs. region box geometry (real bug, secondary)
 
 The 2.3 fix (fog cut at the full region WIDTH) did not remove the artifact:
 the user retested and saw the same noisy rings + cropping. Re-auditing the
@@ -230,6 +230,51 @@ the sandbox, so the user's machine must report itself):
   (expected for 1 ray/pixel over a voxel grid at distance), not a logic
   bug - the proper fix then is TAA/jitter, not more terminator tuning.
   Costs ~4x compute; lower renderRadiusChunks if the GPU objects.
+
+### Pass 2.5: THE root cause - sky-skip ceiling was 0 (unassigned member)
+
+The 2.4 fix was verified-correct but the user still saw the same noisy
+rings + cropping (and correctly thinner fog). The VV_DEBUG_TERM
+instrumentation added in 2.4 finally localized it:
+
+- User report: rings render MAGENTA (= TERM_SKY_SKIP), and green / red /
+  yellow never appear. The absence of green/red/yellow is geometric proof
+  the fog-cut side works (region exit can never beat a fog cut placed at
+  the nearest-face distance; the budget cannot be exhausted within it;
+  ascending rays are sky-skipped before they could trigger the ascend
+  break). So the sky-skip early-out itself was claiming rays that should
+  hit terrain.
+- Root cause: `m_maxTerrainVoxelY` was declared `= 0` in the header,
+  read once in the push-constant write (`push.grid.w`), and NEVER
+  ASSIGNED anywhere. The 2.1 commit intended
+  `min(maxHeightVoxels(), worldHeight-1)` (= 80) but the assignment was
+  lost, most likely to the same-file parallel-edit race that struck three
+  times before. The sky-skip ceiling on every build since 2.1 was 0.
+- Effect: sky-skip fired for ANY ray that does not descend below the
+  bedrock floor (y=0) before leaving the region - including rays that
+  would hit terrain well inside it. From a camera at y~56, only steep
+  rays (diving below y=0 within the region) were traced at all: visible
+  terrain was an angle-limited patch whose boundary follows the terrain's
+  own height contours = the "noisy rings ON TOP of voxels", and hilltops
+  passed over by shallow rays were clipped = the "cropping" (worst on Y,
+  worse when higher/farther). This single bug explains every report
+  since 2.1 (when sky-skip was introduced - "noisy rings instead of
+  voxels"); 2.2's palette fix revealed the visible patch, 2.3/2.4's fog
+  work was real but secondary.
+- Fix: assign m_maxTerrainVoxelY in createVoxelWorldAndUpload right after
+  the world is created: clamp(terrain.maxHeightVoxels(), 1,
+  worldHeight-1). debugStats() now also prints skyCeil= (this would have
+  caught the bug immediately).
+- Audited all 48 VulkanRenderer members for the same landmine
+  (declared-but-never-assigned): all others are written via out-params,
+  increments, or are intentionally default-constructed objects.
+- Lessons: (1) a member default that silently flows into a push constant
+  is a correctness trap - push values should either be computed at the
+  write site or the init must be grep-verifiable; (2) the remote debug
+  instrumentation paid for itself in one round-trip: a color-coded
+  terminator + absent-colors reasoning pinned the mechanism without a
+  single local repro; (3) the user's "it's a real traversal artifact" was
+  exactly right.
 
 ## Roadmap status
 

@@ -338,11 +338,11 @@ std::string VulkanRenderer::debugStats() const {
   const float cut = 1.0f / std::max(m_fogDensity, 1e-9f);
   char buf[256];
   std::snprintf(buf, sizeof(buf),
-                "fogCut=%.0fu fog=%.5f steps=%u region=%ux%u@(%d,%d) "
-                "slots=%zu/%llu",
-                cut, m_fogDensity, cfg.maxTraceSteps, cfg.gridWidth(),
-                cfg.gridHeight(), m_regionCenter.x, m_regionCenter.z,
-                m_slotOf.size(),
+                "fogCut=%.0fu fog=%.5f steps=%u skyCeil=%d region=%ux%u@(%d,%d)"
+                " slots=%zu/%llu",
+                cut, m_fogDensity, cfg.maxTraceSteps, m_maxTerrainVoxelY,
+                cfg.gridWidth(), cfg.gridHeight(), m_regionCenter.x,
+                m_regionCenter.z, m_slotOf.size(),
                 static_cast<unsigned long long>(cfg.slotCount()));
   return std::string(buf);
 }
@@ -789,6 +789,17 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   m_world = std::make_unique<vv::voxel::World>(
       terrainConfig, m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
       m_voxelConfig.chunkSizeZ);
+
+  // Sky-skip ceiling: a TRUE upper bound on solid terrain (voxel-space y).
+  // The shader early-outs rays whose whole region segment stays above it,
+  // so a value that is too low clips real terrain into noisy contour rings
+  // (the 2.5 bug: this assignment was missing entirely and the ceiling
+  // silently stayed 0, i.e. every ray that did not dive below the bedrock
+  // floor was skipped). maxHeightVoxels() is guaranteed >= heightAt
+  // everywhere; clamp to the world top for safety.
+  m_maxTerrainVoxelY = std::clamp(
+      m_world->terrain().maxHeightVoxels(), std::int32_t{1},
+      static_cast<std::int32_t>(m_voxelConfig.worldHeight - 1));
 
   if (!m_voxelResources.create(m_device, m_physicalDevice, m_voxelConfig,
                                outError)) {
