@@ -4,25 +4,23 @@
 
 namespace vv::ui {
 
-class PauseMenu final : public QWidget
-{
-    Q_OBJECT
+class PauseMenu final : public QWidget {
+  Q_OBJECT
 
 public:
-    explicit PauseMenu(QWidget* parent = nullptr);
+  explicit PauseMenu(QWidget *parent = nullptr);
 
 signals:
-    void backToGameRequested();
-    void exitRequested();
+  void backToGameRequested();
+  void exitRequested();
 
 protected:
-    void resizeEvent(QResizeEvent* event) override;
+  void resizeEvent(QResizeEvent *event) override;
 
 private:
-    void applySizing();
+  void applySizing();
 
-    QWidget* m_panel = nullptr;
+  QWidget *m_panel = nullptr;
 };
 
 } // namespace vv::ui
-
