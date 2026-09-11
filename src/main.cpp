@@ -1,13 +1,12 @@
 #include <QApplication>
 
-#include "ui/AppWindow.h"
+#include "ui/AppWindow.hpp"
 
-int main(int argc, char** argv)
-{
-    QApplication app(argc, argv);
+int main(int argc, char** argv) {
+	QApplication app(argc, argv);
 
-    vv::ui::AppWindow window;
-    window.showMaximized();
+	vv::ui::AppWindow window;
+	window.showMaximized();
 
-    return app.exec();
+	return app.exec();
 }
