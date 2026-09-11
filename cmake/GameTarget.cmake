@@ -19,6 +19,12 @@ function(vv_add_game_target target_name)
     target_link_libraries(${target_name} PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
     target_link_libraries(${target_name} PRIVATE Vulkan::Vulkan)
 
+    # glm (header-only) location discovered in Dependencies.cmake.
+    if(VV_GLM_INCLUDE_DIR)
+        target_include_directories(${target_name} SYSTEM PRIVATE
+            "${VV_GLM_INCLUDE_DIR}")
+    endif()
+
     # Qt's (installed) private QtGui headers expose the QPA native interface,
     # the only way to query some native handles (per-window Wayland
     # wl_surface). Not every Qt distribution ships them, so they are strictly

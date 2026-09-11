@@ -6,6 +6,7 @@
 
 #include "core/Camera.hpp"
 #include "core/GameTimer.hpp"
+#include "voxel/VoxelConfig.hpp"
 
 namespace vv::vulkan {
 class VulkanRenderer;
@@ -62,8 +63,7 @@ class VulkanWidget final : public QWidget {
 
 	vv::core::Camera m_camera;
 	vv::core::GameTimer m_gameTimer;
-	glm::uvec3 m_chunkSizeVoxels = glm::uvec3(64u, 64u, 64u);
-	glm::vec3 m_voxelSize = glm::vec3(1.0f, 1.0f, 1.0f);
+	vv::voxel::VoxelConfig m_voxelConfig;
 
 	bool m_keyW = false;
 	bool m_keyA = false;

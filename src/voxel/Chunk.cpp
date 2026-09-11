@@ -5,23 +5,35 @@
 
 namespace vv::voxel {
 
-Chunk::Chunk(int32_t chunkX, int32_t chunkY, int32_t chunkZ, Extent3u size)
-		: m_chunkX(chunkX), m_chunkY(chunkY), m_chunkZ(chunkZ), m_size(size), m_voxelsU32(static_cast<size_t>(voxelCount()), 0u) {}
+Chunk::Chunk(std::int32_t chunkX, std::int32_t chunkZ, std::uint32_t sizeX,
+						 std::uint32_t sizeY, std::uint32_t sizeZ)
+		: m_chunkX(chunkX),
+			m_chunkZ(chunkZ),
+			m_sizeX(sizeX),
+			m_sizeY(sizeY),
+			m_sizeZ(sizeZ),
+			m_voxelTypes(static_cast<std::size_t>(voxelCount()),
+									 static_cast<std::uint8_t>(VoxelType::Air)) {}
 
-uint64_t Chunk::index(uint32_t x, uint32_t y, uint32_t z) const {
-	return static_cast<uint64_t>(x) + static_cast<uint64_t>(y) * m_size.x +
-				 static_cast<uint64_t>(z) * static_cast<uint64_t>(m_size.x) *
-					 static_cast<uint64_t>(m_size.y);
+std::uint64_t Chunk::index(std::uint32_t x, std::uint32_t y,
+													 std::uint32_t z) const {
+	return static_cast<std::uint64_t>(x) +
+				 static_cast<std::uint64_t>(y) * m_sizeX +
+				 static_cast<std::uint64_t>(z) * m_sizeX * m_sizeY;
 }
 
-Voxel Chunk::get(uint32_t x, uint32_t y, uint32_t z) const {
-	assert(x < m_size.x && y < m_size.y && z < m_size.z);
-	return Voxel{m_voxelsU32[static_cast<size_t>(index(x, y, z))]};
+vv::voxel::VoxelType Chunk::get(std::uint32_t x, std::uint32_t y,
+																std::uint32_t z) const {
+	assert(x < m_sizeX && y < m_sizeY && z < m_sizeZ);
+	return static_cast<VoxelType>(
+			m_voxelTypes[static_cast<std::size_t>(index(x, y, z))]);
 }
 
-void Chunk::set(uint32_t x, uint32_t y, uint32_t z, Voxel v) {
-	assert(x < m_size.x && y < m_size.y && z < m_size.z);
-	m_voxelsU32[static_cast<size_t>(index(x, y, z))] = v.rgba8;
+void Chunk::set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
+								vv::voxel::VoxelType type) {
+	assert(x < m_sizeX && y < m_sizeY && z < m_sizeZ);
+	m_voxelTypes[static_cast<std::size_t>(index(x, y, z))] =
+			static_cast<std::uint8_t>(type);
 }
 
-} // namespace vv::voxel
+}  // namespace vv::voxel

@@ -2,13 +2,19 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// Push constants must match vv::render::PushConstants in
+// src/render/SceneData.hpp.
 layout(push_constant) uniform Push {
     uvec4 screen;   // x=width, y=height, z=bgra, w=frame
-    vec4 camera;    // x=tanHalfFov
-    uvec4 chunkSize; // xyz=chunk voxel dims
+    vec4 camera;    // x=tanHalfFov, y=fogDensity
+    uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
+    ivec4 region;   // x,z = region origin (min corner) in chunk coords
+    uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words)
 } pc;
 
+// Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types
+// (one byte per type) packed 4-per-uint32 in X + Y*chunkX + Z*chunkX*H order.
 layout(set = 0, binding = 0) readonly buffer Voxels {
     uint data[];
 } voxels;
@@ -29,13 +35,83 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 misc; // x = timeSeconds
 } scene;
 
-uint voxelAt(ivec3 v, uvec3 chunkSize, uint chunkArea)
+// Chunk table: one u32 atlas slot index per region grid cell
+// (row-major over gridWidth x gridHeight, relative to pc.region origin).
+layout(set = 0, binding = 3) readonly buffer ChunkTable {
+    uint slots[];
+} chunkTable;
+
+const uint kEmptySlot = 0xFFFFFFFFu;
+
+// Voxel type palette. KEEP IN SYNC with kVoxelTypeInfo in
+// src/voxel/VoxelTypes.hpp (order: Air, Grass, Dirt, Stone, Sand, Snow,
+// Bedrock).
+const int kTypeCount = 7;
+const vec3 kTopColor[kTypeCount] = vec3[kTypeCount](
+    vec3(0.00, 0.00, 0.00),
+    vec3(0.26, 0.55, 0.14),
+    vec3(0.43, 0.31, 0.18),
+    vec3(0.56, 0.56, 0.58),
+    vec3(0.87, 0.81, 0.60),
+    vec3(0.93, 0.95, 0.98),
+    vec3(0.18, 0.17, 0.19)
+);
+const vec3 kSideColor[kTypeCount] = vec3[kTypeCount](
+    vec3(0.00, 0.00, 0.00),
+    vec3(0.40, 0.31, 0.15),
+    vec3(0.40, 0.29, 0.17),
+    vec3(0.52, 0.52, 0.55),
+    vec3(0.83, 0.77, 0.57),
+    vec3(0.88, 0.90, 0.95),
+    vec3(0.18, 0.17, 0.19)
+);
+const vec3 kBottomColor[kTypeCount] = vec3[kTypeCount](
+    vec3(0.00, 0.00, 0.00),
+    vec3(0.43, 0.31, 0.18),
+    vec3(0.36, 0.25, 0.15),
+    vec3(0.47, 0.47, 0.50),
+    vec3(0.79, 0.73, 0.54),
+    vec3(0.84, 0.86, 0.92),
+    vec3(0.18, 0.17, 0.19)
+);
+
+// Division rounding towards negative infinity (GLSL '/' truncates).
+int floorDiv(int a, int b)
 {
-    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, ivec3(chunkSize)))) {
+    int q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) {
+        --q;
+    }
+    return q;
+}
+
+// Voxel type at a global (possibly negative) voxel coordinate. Returns 0
+// (air) for anything outside the loaded region or in an empty slot.
+uint voxelTypeAt(ivec3 cell)
+{
+    const int chunkX = int(pc.chunkSize.x);
+    const int chunkZ = int(pc.chunkSize.z);
+
+    const ivec2 cc = ivec2(floorDiv(cell.x, chunkX), floorDiv(cell.z, chunkZ));
+    const ivec2 gridLocal = cc - pc.region.xz;
+    if (any(lessThan(gridLocal, ivec2(0))) ||
+        any(greaterThanEqual(gridLocal, ivec2(pc.grid.xy)))) {
         return 0u;
     }
-    uint idx = uint(v.x) + uint(v.y) * chunkSize.x + uint(v.z) * chunkArea;
-    return voxels.data[idx];
+
+    const uint slot =
+        chunkTable.slots[uint(gridLocal.x) + uint(gridLocal.y) * pc.grid.x];
+    if (slot == kEmptySlot) {
+        return 0u;
+    }
+
+    const ivec3 local = ivec3(cell.x - cc.x * chunkX, cell.y,
+                              cell.z - cc.y * chunkZ);
+    const uint idx = uint(local.x) + uint(local.y) * pc.chunkSize.x +
+                     uint(local.z) * (pc.chunkSize.x * pc.chunkSize.y);
+
+    const uint word = voxels.data[slot * pc.grid.z + (idx >> 2u)];
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
 }
 
 bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out float tmax, out vec3 enterNormal)
@@ -82,12 +158,15 @@ vec3 skyColor(vec3 rd)
     return mix(scene.skyLow.xyz, scene.skyHigh.xyz, t);
 }
 
-vec3 voxelColorFromRGBA8(uint v)
+vec3 voxelColor(uint type, vec3 normal)
 {
-    float r = float((v >> 16) & 255u) / 255.0;
-    float g = float((v >> 8) & 255u) / 255.0;
-    float b = float((v >> 0) & 255u) / 255.0;
-    return vec3(r, g, b);
+    if (normal.y > 0.5) {
+        return kTopColor[type];
+    }
+    if (normal.y < -0.5) {
+        return kBottomColor[type];
+    }
+    return kSideColor[type];
 }
 
 void main()
@@ -100,10 +179,8 @@ void main()
 
     uint idx = p.y * size.x + p.x;
 
-    // FIX: View was too stretched on Y due to incorrect aspect handling.
-    // Correct approach: For a vertical FOV, the horizontal axis must be scaled by aspect (width/height).
-    // Previously the aspect was misapplied (or Y was incorrectly scaled), causing vertical stretch.
-    // Now we correctly compute NDC, flip Y, and scale X by aspect.
+    // Aspect handling: vertical FOV; the horizontal axis is scaled by the
+    // aspect ratio.
     vec2 uv = (vec2(p) + vec2(0.5)) / vec2(size);
     uv = uv * 2.0 - 1.0;
     uv.y = -uv.y;
@@ -116,7 +193,6 @@ void main()
     vec3 up = normalize(scene.camUp.xyz);
 
     float tanHalfFov = pc.camera.x;
-    // Aspect is already baked into uv.x, so both axes use same tanHalfFov (vertical FOV).
     vec3 rdWorld = normalize(forward + right * (uv.x * tanHalfFov) + up * (uv.y * tanHalfFov));
     vec3 roWorld = camPos;
 
@@ -124,11 +200,16 @@ void main()
     vec3 ro = roWorld / voxelSize;
     vec3 rd = rdWorld / voxelSize;
 
-    uvec3 chunkSize = pc.chunkSize.xyz;
-    uint chunkArea = chunkSize.x * chunkSize.y;
+    // Region (loaded world) bounds in global voxel space.
+    ivec3 regionMinVox = ivec3(pc.region.x * int(pc.chunkSize.x), 0,
+                               pc.region.z * int(pc.chunkSize.z));
+    ivec3 regionMaxVox = regionMinVox + ivec3(
+        int(pc.grid.x) * int(pc.chunkSize.x),
+        int(pc.chunkSize.y),
+        int(pc.grid.y) * int(pc.chunkSize.z));
 
-    vec3 bmin = vec3(0.0);
-    vec3 bmax = vec3(chunkSize);
+    vec3 bmin = vec3(regionMinVox);
+    vec3 bmax = vec3(regionMaxVox);
     float tEnter = 0.0;
     float tExit = 0.0;
     vec3 enterNormal = vec3(0.0);
@@ -183,14 +264,19 @@ void main()
 
     bool hit = false;
     vec3 normal = vec3(0.0);
-    uint hitVoxel = 0u;
+    uint hitType = 0u;
+    // Ray parameter (world units: rdWorld is normalized) at the entry of the
+    // current cell, relative to the region entry point; the distance from the
+    // camera is tEntryOffset + t.
+    float t = 0.0;
+    const float tEntryOffset = max(tEnter, 0.0);
 
     int lastAxis = -1;
-    for (int i = 0; i < 512; ++i) {
-        uint v = voxelAt(cell, chunkSize, chunkArea);
-        if (v != 0u) {
+    for (int i = 0; i < int(pc.chunkSize.w); ++i) {
+        uint type = voxelTypeAt(cell);
+        if (type != 0u) {
             hit = true;
-            hitVoxel = v;
+            hitType = type;
             if (lastAxis == 0) {
                 normal = vec3(-float(stepX), 0.0, 0.0);
             } else if (lastAxis == 1) {
@@ -224,18 +310,22 @@ void main()
         if (nextT > tEnd) {
             break;
         }
-        if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(chunkSize)))) {
-            break;
-        }
+        t = nextT;
     }
 
     vec3 color = vec3(0.0);
     if (hit) {
         vec3 lightDir = normalize(scene.lightDir.xyz);
         float ndl = max(dot(normalize(normal), lightDir), 0.0);
-        vec3 base = voxelColorFromRGBA8(hitVoxel);
+        vec3 base = voxelColor(hitType, normal);
         vec3 lit = base * (0.15 + 0.85 * ndl);
         color = lit * scene.lightColor.xyz;
+
+        // Distance fog towards the sky in this direction; hides the region
+        // edge and gives the world aerial perspective.
+        float dist = tEntryOffset + t;
+        float fog = 1.0 - exp(-dist * pc.camera.y);
+        color = mix(color, skyColor(rdWorld), clamp(fog, 0.0, 1.0));
     } else {
         color = skyColor(rdWorld);
     }

@@ -17,13 +17,15 @@ Code map:
 | --- | --- |
 | `src/ui/` | Qt shell (`AppWindow`, `VulkanWidget` — hosts swapchain + game loop) |
 | `src/platform/` | **Platform abstraction layer** (see below) — keep OS headers out of everything else |
-| `src/vulkan/` | Renderer, buffers, swapchain, device/surface management |
-| `src/voxel/` | World/chunk/voxel data model (currently a single randomly-filled chunk) |
+| `src/vulkan/` | Renderer, chunk atlas GPU resources (`VoxelResources`), swapchain, device/surface management |
+| `src/voxel/` | World/chunk/voxel data model (`VoxelTypes` palette, `VoxelConfig`, chunked `World`) |
+| `src/terrain/` | Deterministic noise (`Noise2D`) + `TerrainGenerator` (fBm heightmap, layered types) |
 | `src/render/` | Scene uniforms, lighting config, shader data layouts |
 | `src/core/` | Camera, timer, runtime paths, file loading |
 | `resources/shaders/` | GLSL compute shaders, compiled to SPIR-V at build time by glslang |
+| `tests/` | Pure-logic test suite (no Qt/Vulkan); `ctest --test-dir build` |
 | `scripts/` | `build-linux-toolchain.sh` — sandbox build toolchain (see below) |
-| `cmake/` | Build functions (GameTarget, Shaders, Packaging, …) |
+| `cmake/` | Build functions (GameTarget, Tests, Shaders, Packaging, …) |
 
 ### Platform abstraction layer (`src/platform/`)
 
@@ -47,14 +49,41 @@ Qt/Vulkan-free struct of opaque handles) → `VulkanRenderer` →
   (`QtNativeWindowResolver.cpp`), and `VulkanSurfaceFactory.cpp`. Nothing else
   should need touching.
 
-### Input model (as of pass 1)
+### Input model (as of pass 2)
 
-Mouse is locked to window center (hidden cursor) while playing. `Esc` releases
-the pointer and pauses the camera; `Esc` or a click re-locks. Focus loss always
-releases the pointer and clears key state. Mouse grab goes through
+Mouse is locked to window center (hidden cursor) while playing, with
+`setMouseTracking(true)` so look works without holding any button. `Esc`
+releases the pointer and pauses the camera; `Esc` or a click re-locks. Focus
+loss always releases the pointer and clears key state. Mouse grab goes through
 `QWindow::setMouseGrabEnabled` and is deferred to the first Expose event if the
 window is not yet visible (this is what removed the old
 `setMouseGrabEnabled: Not setting mouse grab for invisible window` warning).
+
+### World architecture (as of pass 2)
+
+- Infinite on X/Z, chunked: 32×128×32-voxel chunks (full world height per
+  chunk), CPU cache in `vv::voxel::World` keyed by `ChunkCoord` with
+  radius+1 hysteresis eviction (`ensureRegion`).
+- Terrain: `src/terrain` — hand-rolled deterministic Perlin-style `Noise2D`
+  (integer-hash gradients, no deps; SIMD left for the optimization pass),
+  `TerrainGenerator` = hilliness-masked fBm heightmap + layered types
+  (grass/dirt/stone, sand under `sandLine`, snow above `snowLine`, bedrock at
+  y=0). Same seed → identical terrain on every platform.
+- GPU: `vulkan/VoxelResources` = one device-local **chunk atlas** storage
+  buffer (one byte per VoxelType, packed 4-per-uint32, slot per chunk) + one
+  host-visible **chunk table** SSBO (region grid cell → slot index,
+  `kEmptySlot`=0xFFFFFFFF). The renderer (`rebuildChunkRegion`) maps chunk
+  coords → atlas slots with a free-list, batch-uploads new chunks (single
+  staging buffer + `vkQueueWaitIdle` — rare, only on chunk-border crossings)
+  and rewrites the table. `updateWorld(cameraPos)` is called every frame and
+  no-ops unless the camera chunk changed.
+- Shader `pixels_rgba.comp`: DDA over the region AABB; per-step chunk lookup
+  (floor-div coords → table slot → packed word fetch); per-face type palette;
+  exponential distance fog to sky. **Palette sync**: `kVoxelTypeInfo` in
+  `src/voxel/VoxelTypes.hpp` must match `kTopColor/kSideColor/kBottomColor`
+  in the shader; push constants must match `vv::render::PushConstants`.
+- Default view: render radius 6 chunks (13×13, ~22 MB atlas), fog density
+  derived from the radius in `computeFogDensity()`.
 
 ## Roadmap status
 
@@ -65,15 +94,22 @@ window is not yet visible (this is what removed the old
       Escape now toggles pointer lock + pause
 - [x] Fixed the mouse-grab warning (deferred grab, see above)
 - [x] README with per-OS build instructions
+- [x] Fix: `setMouseTracking(true)` so first-person look needs no button held
+- [x] Docs kept in-repo (this file + toolchain script) per user request
 
-**Pass 2 — planned, user-verified order (not started):**
-- First-person always-locked mouse — *already implemented in pass 1*
-- Voxel types (grass, dirt, stone…) instead of random colors
-- Terrain generation with noise (open choice: hand-rolled SIMD noise vs. a
-  library pulled from the web)
-- Optimizations: SIMD, bitwise ops, faster traversal for large worlds
-- Infinite worlds via chunking
+**Pass 2 — done (pending user verification):**
+- [x] Voxel types (grass, dirt, stone, sand, snow, bedrock) with per-face
+      colors instead of random colors
+- [x] Terrain generation with noise (hand-rolled scalar Perlin fBm; pulling a
+      web library was deemed unnecessary — revisit for SIMD pass)
+- [x] Infinite worlds via chunking (X/Z only, full-height chunks, GPU chunk
+      atlas + region management, distance fog)
+- [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
+
+**Pass 3 — planned, START ONLY AFTER USER VERIFIES PASS 2:**
+- Optimizations: SIMD noise, bitwise ops, faster traversal for large worlds
 - Infinite render distance via level of detail
+- (Later) native in-engine UI instead of Qt widgets for the escape menu
 
 ## Sandbox facts (Arena.ai environment)
 
@@ -102,6 +138,7 @@ export PATH="/tmp/deps/venv/bin:/tmp/deps/prefix/bin:$PATH"
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_PREFIX_PATH="/tmp/deps/qt6;/tmp/deps/prefix"
 cmake --build build            # must be warning-free
+ctest --test-dir build         # terrain/world logic tests (no GPU needed)
 cmake --build build --target package_folder   # packaging check
 
 # Headless smoke test: no GPU -> the game must show the graceful
@@ -124,6 +161,11 @@ xcb/wayland compile shims. It is idempotent — re-running skips finished parts.
 - `git push` / `gh` can fail with an authentication error when the session
   token expires (observed after ~1h). Retry on a later turn; if it persists,
   ask the user to reconnect GitHub in Arena settings.
+- **Never issue parallel `edit_file` calls against the same file** — they
+  race and silently drop each other's changes (observed in pass 2). Parallel
+  edits to *different* files are fine.
+- `/tmp` can be wiped **mid-turn**, not just between prompts (observed in
+  pass 2): don't cache toolchain assumptions even within one turn.
 - Code style: `.clang-format` is Google-based, **tabs**, 2-width. New UI/core
   files follow it; the older `vulkan/` and `render/` files use 2-space indent
   (don't mass-reformat, match the file you edit).

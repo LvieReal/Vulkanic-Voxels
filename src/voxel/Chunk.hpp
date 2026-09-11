@@ -3,39 +3,51 @@
 #include <cstdint>
 #include <vector>
 
-#include "voxel/Extent3.hpp"
-#include "voxel/Voxel.hpp"
+#include "voxel/VoxelTypes.hpp"
 
 namespace vv::voxel {
 
+// One full-height column of the world: chunkSizeX x worldHeight x chunkSizeZ
+// voxels laid out as X + Y*sizeX + Z*sizeX*worldHeight (matching the compute
+// shader's index math). Storage is one byte per voxel (VoxelType).
 class Chunk final {
  public:
 	Chunk() = default;
-	Chunk(int32_t chunkX, int32_t chunkY, int32_t chunkZ, Extent3u size);
+	Chunk(std::int32_t chunkX, std::int32_t chunkZ, std::uint32_t sizeX,
+				std::uint32_t sizeY, std::uint32_t sizeZ);
 
-	int32_t chunkX() const { return m_chunkX; }
-	int32_t chunkY() const { return m_chunkY; }
-	int32_t chunkZ() const { return m_chunkZ; }
+	std::int32_t chunkX() const { return m_chunkX; }
+	std::int32_t chunkZ() const { return m_chunkZ; }
 
-	Extent3u size() const { return m_size; }
-	uint64_t voxelCount() const {
-		return static_cast<uint64_t>(m_size.x) * static_cast<uint64_t>(m_size.y) *
-					 static_cast<uint64_t>(m_size.z);
+	std::uint32_t sizeX() const { return m_sizeX; }
+	std::uint32_t sizeY() const { return m_sizeY; }
+	std::uint32_t sizeZ() const { return m_sizeZ; }
+
+	std::uint64_t voxelCount() const {
+		return static_cast<std::uint64_t>(m_sizeX) * m_sizeY * m_sizeZ;
 	}
 
-	Voxel get(uint32_t x, uint32_t y, uint32_t z) const;
-	void set(uint32_t x, uint32_t y, uint32_t z, Voxel v);
+	// Byte size padded to a multiple of 4 (voxel types are uploaded packed
+	// 4-per-uint32; the pad bytes are never read back).
+	std::uint64_t paddedByteSize() const { return (voxelCount() + 3u) / 4u * 4u; }
 
-	const std::vector<uint32_t>& rawVoxelsU32() const { return m_voxelsU32; }
+	vv::voxel::VoxelType get(std::uint32_t x, std::uint32_t y,
+													 std::uint32_t z) const;
+	void set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
+					 vv::voxel::VoxelType type);
+
+	const std::vector<std::uint8_t>& voxelTypes() const { return m_voxelTypes; }
 
  private:
-	uint64_t index(uint32_t x, uint32_t y, uint32_t z) const;
+	std::uint64_t index(std::uint32_t x, std::uint32_t y,
+											std::uint32_t z) const;
 
-	int32_t m_chunkX = 0;
-	int32_t m_chunkY = 0;
-	int32_t m_chunkZ = 0;
-	Extent3u m_size{};
-	std::vector<uint32_t> m_voxelsU32;
+	std::int32_t m_chunkX = 0;
+	std::int32_t m_chunkZ = 0;
+	std::uint32_t m_sizeX = 0;
+	std::uint32_t m_sizeY = 0;
+	std::uint32_t m_sizeZ = 0;
+	std::vector<std::uint8_t> m_voxelTypes;
 };
 
-} // namespace vv::voxel
+}  // namespace vv::voxel

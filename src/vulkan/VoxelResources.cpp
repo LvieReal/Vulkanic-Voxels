@@ -2,220 +2,222 @@
 
 #include <cstring>
 
-#include "voxel/World.hpp"
+#include "vulkan/BufferUtils.hpp"
 #include "vulkan/VulkanUtils.hpp"
 
 namespace vv::vulkan {
 
 VoxelResources::~VoxelResources() {
-  // Requires device for cleanup; caller should invoke cleanup().
+	// Requires a device for cleanup; callers must invoke cleanup() first.
 }
 
-bool VoxelResources::createAndUpload(VkDevice device,
-                                     VkPhysicalDevice physicalDevice,
-                                     VkCommandPool commandPool, VkQueue queue,
-                                     const vv::voxel::VoxelConfig& config,
-                                     std::string& outError) {
-  m_config = config;
+bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
+														const vv::voxel::VoxelConfig& config,
+														std::string& outError) {
+	const std::uint64_t voxelsPerChunk =
+			static_cast<std::uint64_t>(config.chunkSizeX) * config.worldHeight *
+			config.chunkSizeZ;
+	m_slotByteStride = (voxelsPerChunk + 3u) / 4u * 4u;
+	m_slotCount = static_cast<std::uint32_t>(config.slotCount());
+	m_tableElements =
+			static_cast<std::uint64_t>(config.gridWidth()) * config.gridHeight();
 
-  vv::voxel::World world(
-      vv::voxel::Extent3u{config.chunkSizeVoxels.x, config.chunkSizeVoxels.y,
-                          config.chunkSizeVoxels.z});
-  const vv::voxel::Chunk& chunk = world.chunk0();
-  const auto& voxels = chunk.rawVoxelsU32();
-  const VkDeviceSize voxelBytes =
-      static_cast<VkDeviceSize>(voxels.size() * sizeof(uint32_t));
-  if (voxelBytes == 0) {
-    outError = "World produced an empty chunk.";
-    return false;
-  }
+	if (m_slotCount == 0 || m_slotByteStride == 0) {
+		outError = "Invalid voxel world configuration (zero-sized atlas).";
+		return false;
+	}
 
-  VkResult r = VK_SUCCESS;
-  VkBuffer stagingBuffer = VK_NULL_HANDLE;
-  VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
+	const VkDeviceSize atlasBytes =
+			static_cast<VkDeviceSize>(m_slotCount) * m_slotByteStride;
+	if (!utils::createBuffer(device, physicalDevice, atlasBytes,
+													 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+															 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+													 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+													 m_voxelBuffer, m_voxelMemory, outError)) {
+		return false;
+	}
 
-  auto cleanupTemp = [&]() {
-    if (cmd) {
-      vkFreeCommandBuffers(device, commandPool, 1, &cmd);
-      cmd = VK_NULL_HANDLE;
-    }
-    if (stagingBuffer) {
-      vkDestroyBuffer(device, stagingBuffer, nullptr);
-      stagingBuffer = VK_NULL_HANDLE;
-    }
-    if (stagingMemory) {
-      vkFreeMemory(device, stagingMemory, nullptr);
-      stagingMemory = VK_NULL_HANDLE;
-    }
-  };
+	const VkDeviceSize tableBytes =
+			static_cast<VkDeviceSize>(m_tableElements) * sizeof(std::uint32_t);
+	if (!utils::createBuffer(device, physicalDevice, tableBytes,
+													 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+													 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+													 m_chunkTableBuffer, m_chunkTableMemory,
+													 outError)) {
+		cleanup(device);
+		return false;
+	}
 
-  VkBufferCreateInfo voxelBuf{};
-  voxelBuf.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  voxelBuf.size = voxelBytes;
-  voxelBuf.usage =
-      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  voxelBuf.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkResult r = vkMapMemory(device, m_chunkTableMemory, 0, VK_WHOLE_SIZE, 0,
+													 &m_mappedTable);
+	if (r != VK_SUCCESS || m_mappedTable == nullptr) {
+		outError = "Failed to map the chunk table memory.";
+		cleanup(device);
+		return false;
+	}
+	std::memset(m_mappedTable, 0xFF, static_cast<std::size_t>(tableBytes));
 
-  r = vkCreateBuffer(device, &voxelBuf, nullptr, &m_buffer);
-  if (r != VK_SUCCESS) {
-    outError =
-        "Failed to create voxel buffer (" + utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	return true;
+}
 
-  VkMemoryRequirements voxelReq{};
-  vkGetBufferMemoryRequirements(device, m_buffer, &voxelReq);
-  uint32_t voxelMemType = utils::findMemoryTypeIndex(
-      physicalDevice, voxelReq.memoryTypeBits,
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (voxelMemType == UINT32_MAX) {
-    outError = "No suitable device-local memory type found for voxel buffer.";
-    cleanupTemp();
-    return false;
-  }
+bool VoxelResources::uploadChunks(VkDevice device,
+																	VkPhysicalDevice physicalDevice,
+																	VkCommandPool commandPool, VkQueue queue,
+																	const std::vector<ChunkUpload>& uploads,
+																	std::string& outError) {
+	if (uploads.empty()) {
+		return true;
+	}
 
-  VkMemoryAllocateInfo voxelAlloc{};
-  voxelAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  voxelAlloc.allocationSize = voxelReq.size;
-  voxelAlloc.memoryTypeIndex = voxelMemType;
+	VkDeviceSize totalBytes = 0;
+	for (const ChunkUpload& upload : uploads) {
+		if (upload.chunk == nullptr || upload.slot >= m_slotCount) {
+			outError = "Invalid chunk upload request.";
+			return false;
+		}
+		totalBytes += static_cast<VkDeviceSize>(m_slotByteStride);
+	}
 
-  r = vkAllocateMemory(device, &voxelAlloc, nullptr, &m_memory);
-  if (r != VK_SUCCESS) {
-    outError = "Failed to allocate voxel buffer memory (" +
-               utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	// Wait for in-flight frames before mutating the atlas; region updates are
+	// rare (chunk border crossings), so a queue idle here is acceptable.
+	vkDeviceWaitIdle(device);
 
-  r = vkBindBufferMemory(device, m_buffer, m_memory, 0);
-  if (r != VK_SUCCESS) {
-    outError =
-        "Failed to bind voxel buffer memory (" + utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	VkBuffer stagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	if (!utils::createBuffer(device, physicalDevice, totalBytes,
+													 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+													 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+													 stagingBuffer, stagingMemory, outError)) {
+		return false;
+	}
 
-  VkBufferCreateInfo stagingInfo{};
-  stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  stagingInfo.size = voxelBytes;
-  stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	void* mapped = nullptr;
+	VkResult r = vkMapMemory(device, stagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+	if (r != VK_SUCCESS || mapped == nullptr) {
+		outError = "Failed to map chunk staging memory.";
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
 
-  r = vkCreateBuffer(device, &stagingInfo, nullptr, &stagingBuffer);
-  if (r != VK_SUCCESS) {
-    outError = "Failed to create voxel staging buffer (" +
-               utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	std::memset(mapped, 0, static_cast<std::size_t>(totalBytes));
+	{
+		std::size_t offset = 0;
+		for (const ChunkUpload& upload : uploads) {
+			const auto& types = upload.chunk->voxelTypes();
+			std::memcpy(static_cast<std::uint8_t*>(mapped) + offset, types.data(),
+									types.size());
+			offset += static_cast<std::size_t>(m_slotByteStride);
+		}
+	}
+	vkUnmapMemory(device, stagingMemory);
 
-  VkMemoryRequirements stagingReq{};
-  vkGetBufferMemoryRequirements(device, stagingBuffer, &stagingReq);
-  uint32_t stagingType = utils::findMemoryTypeIndex(
-      physicalDevice, stagingReq.memoryTypeBits,
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  if (stagingType == UINT32_MAX) {
-    outError =
-        "No suitable host-visible memory type found for voxel staging buffer.";
-    cleanupTemp();
-    return false;
-  }
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkCommandBufferAllocateInfo alloc{};
+	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	alloc.commandPool = commandPool;
+	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc.commandBufferCount = 1;
+	r = vkAllocateCommandBuffers(device, &alloc, &cmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to allocate chunk upload command buffer.";
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
 
-  VkMemoryAllocateInfo stagingAlloc{};
-  stagingAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  stagingAlloc.allocationSize = stagingReq.size;
-  stagingAlloc.memoryTypeIndex = stagingType;
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+		outError = "Failed to begin chunk upload command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
 
-  r = vkAllocateMemory(device, &stagingAlloc, nullptr, &stagingMemory);
-  if (r != VK_SUCCESS) {
-    outError = "Failed to allocate voxel staging memory (" +
-               utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	std::vector<VkBufferCopy> regions;
+	regions.reserve(uploads.size());
+	{
+		VkDeviceSize stagingOffset = 0;
+		for (const ChunkUpload& upload : uploads) {
+			VkBufferCopy region{};
+			region.srcOffset = stagingOffset;
+			region.dstOffset =
+					static_cast<VkDeviceSize>(upload.slot) * m_slotByteStride;
+			region.size = static_cast<VkDeviceSize>(m_slotByteStride);
+			regions.push_back(region);
+			stagingOffset += static_cast<VkDeviceSize>(m_slotByteStride);
+		}
+	}
+	vkCmdCopyBuffer(cmd, stagingBuffer, m_voxelBuffer,
+									static_cast<std::uint32_t>(regions.size()), regions.data());
 
-  r = vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
-  if (r != VK_SUCCESS) {
-    outError =
-        "Failed to bind voxel staging memory (" + utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		outError = "Failed to end chunk upload command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
 
-  void* mapped = nullptr;
-  r = vkMapMemory(device, stagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
-  if (r != VK_SUCCESS || !mapped) {
-    outError = "Failed to map voxel staging memory.";
-    cleanupTemp();
-    return false;
-  }
-  std::memcpy(mapped, voxels.data(), static_cast<size_t>(voxelBytes));
-  vkUnmapMemory(device, stagingMemory);
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &cmd;
+	r = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+	if (r == VK_SUCCESS) {
+		vkQueueWaitIdle(queue);
+	}
 
-  VkCommandBufferAllocateInfo cmdAlloc{};
-  cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  cmdAlloc.commandPool = commandPool;
-  cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cmdAlloc.commandBufferCount = 1;
+	vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+	vkDestroyBuffer(device, stagingBuffer, nullptr);
+	vkFreeMemory(device, stagingMemory, nullptr);
 
-  r = vkAllocateCommandBuffers(device, &cmdAlloc, &cmd);
-  if (r != VK_SUCCESS) {
-    outError = "Failed to allocate voxel upload command buffer (" +
-               utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit chunk uploads.";
+		return false;
+	}
+	return true;
+}
 
-  VkCommandBufferBeginInfo begin{};
-  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
-    outError = "Failed to begin voxel upload command buffer.";
-    cleanupTemp();
-    return false;
-  }
-
-  VkBufferCopy copy{};
-  copy.srcOffset = 0;
-  copy.dstOffset = 0;
-  copy.size = voxelBytes;
-  vkCmdCopyBuffer(cmd, stagingBuffer, m_buffer, 1, &copy);
-
-  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-    outError = "Failed to end voxel upload command buffer.";
-    cleanupTemp();
-    return false;
-  }
-
-  VkSubmitInfo submit{};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &cmd;
-
-  r = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
-  if (r != VK_SUCCESS) {
-    outError = "Failed to submit voxel upload (" + utils::vkResultToString(r) + ").";
-    cleanupTemp();
-    return false;
-  }
-  vkQueueWaitIdle(queue);
-
-  cleanupTemp();
-  return true;
+bool VoxelResources::writeChunkTable(
+		const std::vector<std::uint32_t>& slotPerCell) {
+	if (slotPerCell.size() != m_tableElements || m_mappedTable == nullptr) {
+		return false;
+	}
+	std::memcpy(m_mappedTable, slotPerCell.data(),
+							slotPerCell.size() * sizeof(std::uint32_t));
+	return true;
 }
 
 void VoxelResources::cleanup(VkDevice device) {
-  if (m_buffer) {
-    vkDestroyBuffer(device, m_buffer, nullptr);
-    m_buffer = VK_NULL_HANDLE;
-  }
-  if (m_memory) {
-    vkFreeMemory(device, m_memory, nullptr);
-    m_memory = VK_NULL_HANDLE;
-  }
+	if (m_mappedTable != nullptr && m_chunkTableMemory != VK_NULL_HANDLE) {
+		vkUnmapMemory(device, m_chunkTableMemory);
+		m_mappedTable = nullptr;
+	}
+	if (m_chunkTableBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_chunkTableBuffer, nullptr);
+		m_chunkTableBuffer = VK_NULL_HANDLE;
+	}
+	if (m_chunkTableMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_chunkTableMemory, nullptr);
+		m_chunkTableMemory = VK_NULL_HANDLE;
+	}
+	if (m_voxelBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_voxelBuffer, nullptr);
+		m_voxelBuffer = VK_NULL_HANDLE;
+	}
+	if (m_voxelMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_voxelMemory, nullptr);
+		m_voxelMemory = VK_NULL_HANDLE;
+	}
+	m_slotCount = 0;
+	m_slotByteStride = 0;
+	m_tableElements = 0;
 }
 
-} // namespace vv::vulkan
+}  // namespace vv::vulkan

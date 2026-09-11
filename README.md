@@ -1,12 +1,20 @@
 # Vulkanic Voxels
 
-A small voxel-tech experiment: a single 64×64×64 voxel chunk ray-traced in a
-Vulkan **compute shader** (one thread per pixel), presented through Qt Widgets.
+A voxel-tech experiment: infinite terrain ray-traced in a Vulkan **compute
+shader** (one thread per pixel), presented through Qt Widgets.
 
-The renderer lives in `src/vulkan`, the world/voxel model in `src/voxel`, and
-the Qt shell in `src/ui`. Everything platform-specific (Win32/X11/Wayland/macOS
-windowing) is isolated behind `src/platform` so the renderer never touches an
-OS header.
+The world is an infinite (X/Z) grid of chunks, each 32×128×32 voxels generated
+from a deterministic Perlin-style fBm heightmap. Voxels are typed materials
+(grass, dirt, stone, sand, snow, bedrock — grass has distinct top/side/bottom
+colors), stored as one byte per voxel packed 4-per-uint32 in a GPU chunk
+atlas. A region of chunks around the camera stays resident on the GPU
+(re-centered when you cross a chunk boundary), and distance fog hides the
+region edge.
+
+The renderer lives in `src/vulkan`, the world/voxel model in `src/voxel`,
+terrain generation in `src/terrain`, and the Qt shell in `src/ui`. Everything
+platform-specific (Win32/X11/Wayland/macOS windowing) is isolated behind
+`src/platform` so the renderer never touches an OS header.
 
 ## Controls
 
@@ -15,7 +23,7 @@ OS header.
 | `W` `A` `S` `D` | Move |
 | `Space` / `Ctrl` | Fly up / down |
 | `Shift` | Sprint (×3) |
-| Mouse | Look (pointer locked to window center) |
+| Mouse | Look (pointer locked to window center, no button needed) |
 | `Esc` | Release pointer & pause camera — press again (or click) to resume |
 
 ## Building
@@ -64,6 +72,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/bin/game
 ```
+
+A small pure-logic test suite (noise, terrain layering, chunked world) builds
+alongside by default — run it with `ctest --test-dir build` (or disable with
+`-DVV_BUILD_TESTS=OFF`).
 
 Both the X11 (XCB) and Wayland surface backends are compiled in when their
 headers are found; the correct one is picked at run time from the Qt platform.

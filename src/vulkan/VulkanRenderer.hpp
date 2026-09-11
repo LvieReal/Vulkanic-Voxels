@@ -3,7 +3,9 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/Camera.hpp"
@@ -11,6 +13,7 @@
 #include "render/LightingConfig.hpp"
 #include "render/SceneUniform.hpp"
 #include "voxel/VoxelConfig.hpp"
+#include "voxel/World.hpp"
 #include "vulkan/VoxelResources.hpp"
 
 namespace vv::vulkan {
@@ -35,8 +38,14 @@ class VulkanRenderer final {
   void resize(uint32_t width, uint32_t height);
   void drawFrame();
   void setCamera(const vv::core::Camera& camera, float timeSeconds);
-  void setWorldConfig(const glm::uvec3& chunkSizeVoxels,
-                      const glm::vec3& voxelSize);
+  void setWorldConfig(const vv::voxel::VoxelConfig& config);
+
+  // Keeps the GPU chunk region centered on the camera. Cheap no-op unless the
+  // camera crossed a chunk boundary; call every frame before drawFrame().
+  void updateWorld(const glm::vec3& cameraPosition);
+
+  // Suggested camera spawn: above the terrain at the center of chunk (0,0).
+  glm::vec3 spawnPosition() const;
 
   // New: allow external configuration of lighting (separated concern).
   void setLighting(const vv::render::LightingConfig& lighting) {
@@ -59,6 +68,11 @@ class VulkanRenderer final {
                          std::string& outError);
 
   bool createVoxelWorldAndUpload(std::string& outError);
+  // Generates/evicts chunks for the new region center, uploads new chunk
+  // data into free atlas slots and rewrites the chunk table.
+  bool rebuildChunkRegion(int32_t centerChunkX, int32_t centerChunkZ,
+                          std::string& outError);
+  float computeFogDensity() const;
   void cleanupVoxelResources();
 
   bool createSceneResources(std::string& outError);
@@ -130,11 +144,21 @@ class VulkanRenderer final {
   vv::core::Camera m_camera;
   float m_timeSeconds = 0.0f;
 
-  // World voxel configuration separated into VoxelConfig utility.
+  // World layout (chunk dims, render radius, seed, ...).
   vv::voxel::VoxelConfig m_voxelConfig{};
 
-  // Voxel storage separated into VoxelResources utility class.
+  // CPU-side world: terrain-generated chunk cache keyed by chunk coords.
+  std::unique_ptr<vv::voxel::World> m_world;
+
+  // GPU-side world: chunk atlas + chunk table (see vulkan/VoxelResources).
   vv::vulkan::VoxelResources m_voxelResources;
+
+  // Chunk coord -> atlas slot; free slots are the reuse pool.
+  std::unordered_map<vv::voxel::ChunkCoord, uint32_t, vv::voxel::ChunkCoordHash>
+      m_slotOf;
+  std::vector<uint32_t> m_freeSlots;
+  vv::voxel::ChunkCoord m_regionCenter{};
+  float m_fogDensity = 0.01f;
 
   // Scene uniform (camera + lighting) separated into SceneUniform utility.
   vv::render::SceneUniform m_sceneUniform;
@@ -143,4 +167,4 @@ class VulkanRenderer final {
   vv::render::LightingConfig m_lighting{};
 };
 
-} // namespace vv::vulkan
+}  // namespace vv::vulkan

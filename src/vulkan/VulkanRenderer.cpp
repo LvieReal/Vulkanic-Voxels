@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <set>
@@ -197,16 +198,64 @@ void VulkanRenderer::setCamera(const vv::core::Camera& camera,
   m_timeSeconds = timeSeconds;
 }
 
-void VulkanRenderer::setWorldConfig(const glm::uvec3& chunkSizeVoxels,
-                                    const glm::vec3& voxelSize) {
+void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
   if (m_initialized) {
     return;
   }
 
-  m_voxelConfig.chunkSizeVoxels =
-      glm::max(chunkSizeVoxels, glm::uvec3(1u, 1u, 1u));
-  m_voxelConfig.voxelSize =
-      glm::max(voxelSize, glm::vec3(1e-3f, 1e-3f, 1e-3f));
+  if (!config.isValid()) {
+    return;
+  }
+
+  m_voxelConfig = config;
+  m_voxelConfig.renderRadiusChunks =
+      std::min(m_voxelConfig.renderRadiusChunks, 16u);
+  m_voxelConfig.maxTraceSteps =
+      std::min(m_voxelConfig.maxTraceSteps, 4096u);
+}
+
+void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
+  if (!m_initialized || !m_world) {
+    return;
+  }
+
+  const auto& cfg = m_voxelConfig;
+  const float chunkWorldX = static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
+  const float chunkWorldZ = static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
+  const int32_t chunkX = static_cast<int32_t>(
+      std::floor(cameraPosition.x / chunkWorldX));
+  const int32_t chunkZ = static_cast<int32_t>(
+      std::floor(cameraPosition.z / chunkWorldZ));
+
+  if (chunkX == m_regionCenter.x && chunkZ == m_regionCenter.z) {
+    return;
+  }
+
+  std::string error;
+  if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+    // Region stays where it was; the next frame retries. Not fatal: rendering
+    // continues with the previous (fully consistent) region state.
+    (void)error;
+  }
+}
+
+glm::vec3 VulkanRenderer::spawnPosition() const {
+  const auto& cfg = m_voxelConfig;
+  const float x = (static_cast<float>(cfg.chunkSizeX) * 0.5f) * cfg.voxelSize.x;
+  const float z = (static_cast<float>(cfg.chunkSizeZ) * 0.5f) * cfg.voxelSize.z;
+  float height = 64.0f;
+  if (m_world) {
+    height = static_cast<float>(
+        m_world->terrain().heightAt(double(x), double(z)));
+  }
+  return glm::vec3(x, height + 12.0f, z);
+}
+
+float VulkanRenderer::computeFogDensity() const {
+  const auto& cfg = m_voxelConfig;
+  const float viewDistance = (static_cast<float>(cfg.renderRadiusChunks) + 0.5f) *
+                             static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
+  return viewDistance > 1.0f ? 1.0f / (viewDistance * 0.55f) : 0.1f;
 }
 
 bool VulkanRenderer::createInstance(const InitInfo& info,
@@ -499,12 +548,19 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   sceneBinding.descriptorCount = 1;
   sceneBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  VkDescriptorSetLayoutBinding chunkTableBinding{};
+  chunkTableBinding.binding = 3;
+  chunkTableBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  chunkTableBinding.descriptorCount = 1;
+  chunkTableBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutBinding bindings[] = {voxelBufferBinding,
-                                             outputBufferBinding, sceneBinding};
+                                             outputBufferBinding, sceneBinding,
+                                             chunkTableBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 3;
+  info.bindingCount = 4;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -538,10 +594,109 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
 }
 
 bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
-  // Delegated to VoxelResources utility (voxel domain separated from renderer)
-  return m_voxelResources.createAndUpload(
-      m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
-      m_voxelConfig, outError);
+  if (!m_voxelConfig.isValid()) {
+    outError = "Invalid voxel world configuration.";
+    return false;
+  }
+
+  vv::terrain::TerrainConfig terrainConfig;
+  terrainConfig.seed = m_voxelConfig.terrainSeed;
+  m_world = std::make_unique<vv::voxel::World>(
+      terrainConfig, m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
+      m_voxelConfig.chunkSizeZ);
+
+  if (!m_voxelResources.create(m_device, m_physicalDevice, m_voxelConfig,
+                               outError)) {
+    return false;
+  }
+
+  m_slotOf.clear();
+  m_freeSlots.clear();
+  m_freeSlots.reserve(m_voxelResources.slotCount());
+  for (uint32_t slot = m_voxelResources.slotCount(); slot-- > 0;) {
+    m_freeSlots.push_back(slot);
+  }
+
+  // Initial region around chunk (0,0); the camera spawns inside it.
+  if (!rebuildChunkRegion(0, 0, outError)) {
+    return false;
+  }
+
+  m_fogDensity = computeFogDensity();
+  return true;
+}
+
+bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
+                                        int32_t centerChunkZ,
+                                        std::string& outError) {
+  const uint32_t radius = m_voxelConfig.renderRadiusChunks;
+
+  std::vector<const vv::voxel::Chunk*> newChunks;
+  std::vector<vv::voxel::ChunkCoord> evicted;
+  m_world->ensureRegion(centerChunkX, centerChunkZ, radius, newChunks, evicted);
+
+  for (const vv::voxel::ChunkCoord& coord : evicted) {
+    const auto it = m_slotOf.find(coord);
+    if (it != m_slotOf.end()) {
+      m_freeSlots.push_back(it->second);
+      m_slotOf.erase(it);
+    }
+  }
+
+  if (newChunks.size() > m_freeSlots.size()) {
+    outError = "Chunk atlas exhausted (need " +
+               std::to_string(newChunks.size()) + " slots, have " +
+               std::to_string(m_freeSlots.size()) + " free).";
+    return false;
+  }
+
+  std::vector<vv::vulkan::VoxelResources::ChunkUpload> uploads;
+  uploads.reserve(newChunks.size());
+  for (const vv::voxel::Chunk* chunk : newChunks) {
+    const uint32_t slot = m_freeSlots.back();
+    m_freeSlots.pop_back();
+    m_slotOf[vv::voxel::ChunkCoord{chunk->chunkX(), chunk->chunkZ()}] = slot;
+    uploads.push_back({slot, chunk});
+  }
+
+  if (!uploads.empty() &&
+      !m_voxelResources.uploadChunks(m_device, m_physicalDevice, m_commandPool,
+                                     m_graphicsQueue, uploads, outError)) {
+    // Roll the slot bookkeeping back; chunks stay cached on the CPU side and
+    // the next attempt re-uploads them into fresh slots.
+    for (const vv::vulkan::VoxelResources::ChunkUpload& upload : uploads) {
+      m_freeSlots.push_back(upload.slot);
+      m_slotOf.erase(
+          vv::voxel::ChunkCoord{upload.chunk->chunkX(), upload.chunk->chunkZ()});
+    }
+    return false;
+  }
+
+  m_regionCenter = vv::voxel::ChunkCoord{centerChunkX, centerChunkZ};
+
+  // Rewrite the whole chunk table for the new region grid.
+  const int32_t originX = centerChunkX - static_cast<int32_t>(radius);
+  const int32_t originZ = centerChunkZ - static_cast<int32_t>(radius);
+  const uint32_t gridW = m_voxelConfig.gridWidth();
+  const uint32_t gridH = m_voxelConfig.gridHeight();
+
+  std::vector<uint32_t> table(static_cast<size_t>(gridW) * gridH,
+                              vv::vulkan::VoxelResources::kEmptySlot);
+  for (const auto& [coord, slot] : m_slotOf) {
+    const int32_t gx = coord.x - originX;
+    const int32_t gz = coord.z - originZ;
+    if (gx < 0 || gz < 0 || gx >= static_cast<int32_t>(gridW) ||
+        gz >= static_cast<int32_t>(gridH)) {
+      continue;
+    }
+    table[static_cast<size_t>(gx) + static_cast<size_t>(gz) * gridW] = slot;
+  }
+  if (!m_voxelResources.writeChunkTable(table)) {
+    outError = "Failed to update the chunk table.";
+    return false;
+  }
+
+  return true;
 }
 
 void VulkanRenderer::cleanupVoxelResources() {
@@ -630,16 +785,14 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[3] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 1;
-  poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  poolSizes[0].descriptorCount = 3;  // voxel atlas, output, chunk table
+  poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
-  poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  poolSizes[2].descriptorCount = 1;
 
   VkDescriptorPoolCreateInfo pool{};
   pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool.maxSets = 1;
-  pool.poolSizeCount = 3;
+  pool.poolSizeCount = 2;
   pool.pPoolSizes = poolSizes;
 
   VkResult r =
@@ -664,7 +817,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   }
 
   VkDescriptorBufferInfo bufferInfo{};
-  bufferInfo.buffer = m_voxelResources.buffer();
+  bufferInfo.buffer = m_voxelResources.voxelBuffer();
   bufferInfo.offset = 0;
   bufferInfo.range = VK_WHOLE_SIZE;
 
@@ -678,7 +831,12 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   sceneInfo.offset = 0;
   sceneInfo.range = sizeof(vv::render::SceneUBO);
 
-  VkWriteDescriptorSet writes[3] = {};
+  VkDescriptorBufferInfo chunkTableInfo{};
+  chunkTableInfo.buffer = m_voxelResources.chunkTableBuffer();
+  chunkTableInfo.offset = 0;
+  chunkTableInfo.range = VK_WHOLE_SIZE;
+
+  VkWriteDescriptorSet writes[4] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -700,7 +858,14 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   writes[2].pBufferInfo = &sceneInfo;
 
-  vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+  writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[3].dstSet = m_descriptorSet;
+  writes[3].dstBinding = 3;
+  writes[3].descriptorCount = 1;
+  writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[3].pBufferInfo = &chunkTableInfo;
+
+  vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
   return true;
 }
 
@@ -839,7 +1004,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
   preComputeBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[0].buffer = m_voxelResources.buffer();
+  preComputeBarriers[0].buffer = m_voxelResources.voxelBuffer();
   preComputeBarriers[0].offset = 0;
   preComputeBarriers[0].size = VK_WHOLE_SIZE;
 
@@ -879,9 +1044,20 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   vv::render::PushConstants push{};
   push.screen = glm::uvec4(m_swapchainExtent.width, m_swapchainExtent.height,
                            isBgra, m_frameCounter);
-  push.camera = glm::vec4(m_camera.tanHalfFovRadians(), 0.0f, 0.0f, 0.0f);
-  push.chunkSize = glm::uvec4(m_voxelConfig.chunkSizeVoxels, 0u);
+  push.camera = glm::vec4(m_camera.tanHalfFovRadians(), m_fogDensity, 0.0f,
+                          0.0f);
+  push.chunkSize =
+      glm::uvec4(m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
+                 m_voxelConfig.chunkSizeZ, m_voxelConfig.maxTraceSteps);
   push.voxelSize = glm::vec4(m_voxelConfig.voxelSize, 0.0f);
+  const int32_t originX =
+      m_regionCenter.x - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+  const int32_t originZ =
+      m_regionCenter.z - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+  push.region = glm::ivec4(originX, 0, originZ, 0);
+  push.grid = glm::uvec4(m_voxelConfig.gridWidth(), m_voxelConfig.gridHeight(),
+                         static_cast<uint32_t>(m_voxelResources.slotWordStride()),
+                         0u);
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(push), &push);
 

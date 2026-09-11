@@ -22,6 +22,10 @@ VulkanWidget::VulkanWidget(QWidget* parent) : QWidget(parent) {
 
 	setFocusPolicy(Qt::StrongFocus);
 
+	// Deliver mouse moves while no button is held (first-person look).
+	// Without this, mouseMoveEvent only fires while a button is pressed.
+	setMouseTracking(true);
+
 	// Ensure the native window exists early, so we can create the VkSurfaceKHR.
 	(void)winId();
 
@@ -98,7 +102,7 @@ void VulkanWidget::ensureInitialized() {
 	}
 
 	m_renderer = std::make_unique<vv::vulkan::VulkanRenderer>();
-	m_renderer->setWorldConfig(m_chunkSizeVoxels, m_voxelSize);
+	m_renderer->setWorldConfig(m_voxelConfig);
 
 	vv::vulkan::VulkanRenderer::InitInfo init{};
 	init.nativeWindow = native;
@@ -107,17 +111,15 @@ void VulkanWidget::ensureInitialized() {
 
 	if (!m_renderer->init(init, error)) {
 		QMessageBox::critical(this, "Vulkan unsupported",
-														QString::fromStdString(error));
+													QString::fromStdString(error));
 		m_renderer.reset();
 		return;
 	}
 
-	// Start at a sensible place relative to the initial chunk (0..64).
-	const glm::vec3 chunkSizeWorld = glm::vec3(m_chunkSizeVoxels) * m_voxelSize;
-	const glm::vec3 center = chunkSizeWorld * 0.5f;
-	m_camera.setPosition(center + glm::vec3(0.0f, chunkSizeWorld.y * 0.35f,
-																				chunkSizeWorld.z * 1.75f));
-	m_camera.setYawPitchDegrees(180.0f, -10.0f);
+	// Spawn above the terrain at the center of chunk (0,0), looking out over
+	// the world.
+	m_camera.setPosition(m_renderer->spawnPosition());
+	m_camera.setYawPitchDegrees(180.0f, -18.0f);
 	m_gameTimer.reset();
 
 	m_initialized = true;
@@ -155,6 +157,10 @@ void VulkanWidget::tick() {
 
 	m_renderer->setCamera(m_camera,
 												static_cast<float>(m_gameTimer.totalSeconds()));
+
+	// Keep the GPU chunk region centered on the camera (no-op unless the
+	// camera crossed a chunk boundary).
+	m_renderer->updateWorld(m_camera.position());
 
 	// Do not present while the window is not on screen (minimized/hidden);
 	// presenting to an unexposed surface just burns swapchain cycles.
