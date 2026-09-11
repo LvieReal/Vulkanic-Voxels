@@ -1,0 +1,15 @@
+BasedOnStyle: Google
+IndentWidth: 2
+TabWidth: 2
+UseTab: Always
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+ColumnLimit: 0
+SortIncludes: true
+IncludeBlocks: Regroup
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReflowComments: true
+SpacesBeforeTrailingComments: 1
+IndentCaseLabels: true
+ContinuationIndentWidth: 2

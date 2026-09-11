@@ -1,0 +1,20 @@
+If:
+	PathMatch: .*\.(c|h)
+CompileFlags:
+	Add: [-std=c23, -Iinclude]
+---
+If:
+	PathMatch: .*\.(cpp|hpp|inl)
+CompileFlags:
+	Add: [-std=c++26, -Iinclude]
+	Remove: [-std=c++*]
+---
+If:
+	PathMatch: .*\.h
+CompileFlags:
+	Add: [-xc-header, -std=c23]
+---
+If:
+	PathMatch: .*\.(hpp|inl)
+CompileFlags:
+	Add: [-xc++-header, -std=c++26]
