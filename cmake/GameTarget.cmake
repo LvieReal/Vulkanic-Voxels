@@ -12,6 +12,17 @@ function(vv_add_game_target target_name)
         "${CMAKE_BINARY_DIR}/generated"
     )
 
+    # Terrain generation runs in float32 with a bit-exactness contract
+    # between the scalar reference and the SSE2 path (see terrain/Noise.hpp):
+    # forbid FMA contraction so GCC/Clang cannot fuse a*b+c into fma (which
+    # would diverge across compilers/CPUs). MSVC does not contract.
+    if(NOT MSVC)
+        set_source_files_properties(
+            src/terrain/Noise.cpp
+            src/terrain/TerrainGenerator.cpp
+            PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
+
     target_compile_options(${target_name} PRIVATE
         $<$<CONFIG:Debug>:-O0 -g>
         $<$<CONFIG:Release>:-O3 -DNDEBUG -s>

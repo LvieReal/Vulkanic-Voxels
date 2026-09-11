@@ -276,6 +276,70 @@ instrumentation added in 2.4 finally localized it:
   single local repro; (3) the user's "it's a real traversal artifact" was
   exactly right.
 
+### Pass 3: optimizations - heightmap-guided GPU traversal + vectorized CPU generation
+
+User-verified clean after 2.5 ("cropping and noisy rings are gone, build
+matches"); scope agreed: heightmap-guided air-skipping, vectorization
+(SIMD), with assembly inspection explicitly deferred to a later pass.
+
+**3a. Heightmap-guided traversal (GPU).** The old tracer stepped through
+every voxel cell, air included (~200-700 storage fetches per ray). Now:
+
+- CPU: `Chunk::heightMap()` = per-column (highest solid voxel Y + 1, 0 =
+  all-air), a ground-truth scan of the actual voxel data (lazy, invalidated
+  by `set()`), packed two-u16-per-u32 (`heightMapWords()`). Uploaded as a
+  new SSBO (binding 5) alongside each chunk in `uploadChunks`.
+- Shader: 2D DDA over XZ *columns*. A column whose whole ray segment stays
+  at/above the height bound costs ONE step (the air-skip). Columns the ray
+  can reach get a bounded cell walk that starts no higher than the bound
+  (cells above it are provably air), with the atlas slot resolved once per
+  column. The bound is CONSERVATIVE, so overhangs/caves/edits stay correct
+  (they only make the walk longer, never wrong).
+- **Parity guarantee**: CPU mirrors of both algorithms live in the test
+  suite; 12,000 rays over a pure heightfield AND over
+  overhang content (floating slab, wall, carved shaft) produce identical
+  hit cell / t / entry face / type. The rewrite cannot change the image.
+- Work per ray is now ~(columns crossed <= ~sqrt(2) x fog cut) + (cells in
+  non-skipped columns <= |rd.y| x fog cut + 1 each); the step budget
+  (1024) counts column steps and never binds before the fog cut.
+- Sync contracts (breaking = silent corruption): heightmap slot stride in
+  u32 words = (chunkSizeX * chunkSizeZ + 1) / 2 in THREE places (shader
+  computes it from push constants; Chunk::heightMapWordStride();
+  VoxelResources::heightSlotWordStride()); u16 pair packing: column i even
+  -> low half of word i>>1 (explicit CPU-side packing, endian-independent);
+  heightmap row-major X + Z*chunkSizeX; 0xFFFF sentinel = column not
+  loaded (forces the exact walk - can never hide geometry).
+
+**3b. Vectorization (CPU).** Terrain generation was the last double-based
+scalar hot path:
+
+- `Noise2D` is now float32: `noiseF`/`fbmF` (scalar reference) and `fbm4`
+  (4-lane SSE2; x86-64 baseline, no dispatch needed - the 32-bit multiply
+  is emulated from 16-bit lanes since SSE2 lacks pmulld). NEON is future
+  work; other platforms fall back to the scalar reference.
+- **Bit-exactness contract**: `fbm4` lanes == `fbmF` bit-for-bit (same op
+  order; `-ffp-contract=off` on the terrain TUs in both CMake targets so
+  GCC/Clang cannot FMA-contract differently per target; MSVC never
+  contracts). Verified by unit test incl. lattice-line coordinates. This
+  is what keeps `testChunkMatchesGenerator` meaningful: chunks generated
+  via `heightAt4` match `typeAt` via `heightAtF` exactly.
+- `World::generateChunk` fills 4 columns at a time and writes only the
+  solid range [0, surface] (air stays from the Chunk constructor) instead
+  of all 128 cells.
+- Terrain VALUES shift microscopically vs pass 2.5 (float32 vs float64
+  noise) - same seed still produces identical terrain for a given build
+  (the determinism promise), but old and new builds do not produce
+  bit-identical worlds. Documented in Noise.hpp; float32 is exact for
+  lattice coords up to ~2^24 (region coords are ~600).
+- Measured on the 2-core sandbox (169-chunk region): 2.0-2.4 ms/chunk ->
+  0.8-1.1 ms/chunk (~2.5x). Startup region build ~400ms -> ~160ms; chunk
+  border crossings ~10ms -> ~4ms.
+
+Deferred (user decision): assembly inspection ("too far, maybe later").
+NEON path for ARM/macOS; AVX2 8-wide noise (marginal over SSE2 for this
+hash-heavy workload); TAA/jitter for sub-pixel aliasing if it ever shows
+up (user: it is NOT the current artifact class - agreed, 2.5 proved it).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -296,6 +360,15 @@ instrumentation added in 2.4 finally localized it:
 - [x] Infinite worlds via chunking (X/Z only, full-height chunks, GPU chunk
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
+
+**Pass 3 — done (pending user verification):**
+- [x] Heightmap-guided air-skipping on the GPU (column DDA + conservative
+      per-column height bound; provably image-identical via the traversal
+      parity test - 12k rays incl. overhang content)
+- [x] Vectorized CPU terrain generation (4-lane SSE2 float32 fBm,
+      bit-identical to the scalar reference; solid-range-only column fill;
+      ~2.5x faster chunk generation)
+- [x] Assembly inspection deferred to a later pass (user decision)
 
 **Pass 2.1 — done (crash investigation after user report):**
 - [x] Region slot-exhaustion bug fixed (first border crossing always failed

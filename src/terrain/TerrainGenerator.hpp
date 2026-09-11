@@ -28,13 +28,23 @@ struct TerrainConfig final {
 
 // Procedural terrain: a hilliness-modulated fBm heightmap with layered voxel
 // types (grass/dirt/stone, sand in valleys, snow on peaks, bedrock at y=0).
-// Fully deterministic for a given TerrainConfig.
+// Fully deterministic for a given TerrainConfig. The noise runs in float32
+// (see Noise.hpp) with a vectorized 4-column path used by chunk generation;
+// heightAt() and heightAt4() are bit-identical by construction.
 class TerrainGenerator final {
  public:
 	explicit TerrainGenerator(const TerrainConfig& config);
 
-	// Terrain surface height (voxel-space y) at column (x, z).
+	// Terrain surface height (voxel-space y) at column (x, z). Thin wrapper
+	// over the float32 core (heightAtF).
 	double heightAt(double x, double z) const;
+
+	// Float32 height core (scalar reference).
+	float heightAtF(float x, float z) const;
+
+	// heightAtF for 4 columns at once (vectorized noise; bit-identical to
+	// heightAtF per lane). x/z/out must hold 4 elements.
+	void heightAt4(const float* x, const float* z, float* out) const;
 
 	// Conservative upper bound (voxel-space y) on every height this
 	// generator can produce: base + 1.35 * amplitude. Guaranteed >= heightAt
@@ -52,7 +62,7 @@ class TerrainGenerator final {
 
 	// Voxel type within a column whose terrain height is already known
 	// (cheaper: no second noise evaluation). y=0 is the bottom of the world.
-	vv::voxel::VoxelType typeForColumn(std::int32_t y, double height) const;
+	vv::voxel::VoxelType typeForColumn(std::int32_t y, float height) const;
 
 	const TerrainConfig& config() const { return m_config; }
 

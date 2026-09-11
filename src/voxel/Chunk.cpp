@@ -34,6 +34,56 @@ void Chunk::set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
 	assert(x < m_sizeX && y < m_sizeY && z < m_sizeZ);
 	m_voxelTypes[static_cast<std::size_t>(index(x, y, z))] =
 			static_cast<std::uint8_t>(type);
+	m_heightMapDirty = true;
+}
+
+void Chunk::recomputeHeightMap() const {
+	// Ground truth scan (not derived from the generator): the highest
+	// non-air cell per column. Conservative upper bound on solid content, so
+	// the shader's air-skip stays correct even for future overhangs/edits.
+	m_heightMap.assign(static_cast<std::size_t>(m_sizeX) * m_sizeZ, 0);
+	for (std::uint32_t z = 0; z < m_sizeZ; ++z) {
+		for (std::uint32_t x = 0; x < m_sizeX; ++x) {
+			for (std::uint32_t y = m_sizeY; y-- > 0;) {
+				if (m_voxelTypes[static_cast<std::size_t>(index(x, y, z))] !=
+						static_cast<std::uint8_t>(VoxelType::Air)) {
+					m_heightMap[static_cast<std::size_t>(x) +
+											static_cast<std::size_t>(z) * m_sizeX] =
+							static_cast<std::uint16_t>(y + 1u);
+					break;
+				}
+			}
+		}
+	}
+	// Pack u16 pairs into u32 words (column i even -> low half). Explicit
+	// packing, independent of host endianness.
+	const std::size_t words =
+			static_cast<std::size_t>((m_sizeX * m_sizeZ + 1u) / 2u);
+	m_heightMapWords.assign(words, 0);
+	for (std::size_t i = 0; i < m_heightMap.size(); ++i) {
+		if ((i & 1u) == 0u) {
+			m_heightMapWords[i >> 1u] |=
+					static_cast<std::uint32_t>(m_heightMap[i]);
+		} else {
+			m_heightMapWords[i >> 1u] |=
+					static_cast<std::uint32_t>(m_heightMap[i]) << 16u;
+		}
+	}
+	m_heightMapDirty = false;
+}
+
+const std::vector<std::uint16_t>& Chunk::heightMap() const {
+	if (m_heightMapDirty) {
+		recomputeHeightMap();
+	}
+	return m_heightMap;
+}
+
+const std::vector<std::uint32_t>& Chunk::heightMapWords() const {
+	if (m_heightMapDirty) {
+		recomputeHeightMap();
+	}
+	return m_heightMapWords;
 }
 
 }  // namespace vv::voxel

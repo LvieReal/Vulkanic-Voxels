@@ -738,14 +738,19 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   paletteBinding.descriptorCount = 1;
   paletteBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  VkDescriptorSetLayoutBinding bindings[] = {voxelBufferBinding,
-                                             outputBufferBinding, sceneBinding,
-                                             chunkTableBinding,
-                                             paletteBinding};
+  VkDescriptorSetLayoutBinding heightBinding{};
+  heightBinding.binding = 5;
+  heightBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  heightBinding.descriptorCount = 1;
+  heightBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  VkDescriptorSetLayoutBinding bindings[] = {
+      voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
+      paletteBinding, heightBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 5;
+  info.bindingCount = 6;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1026,7 +1031,8 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[2] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 4;  // voxel atlas, output, chunk table, palette
+  poolSizes[0].descriptorCount = 5;  // voxel atlas, output, chunk table,
+                                     // palette, column heights
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
 
@@ -1082,7 +1088,12 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   paletteInfo.offset = 0;
   paletteInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[5] = {};
+  VkDescriptorBufferInfo heightInfo{};
+  heightInfo.buffer = m_voxelResources.heightBuffer();
+  heightInfo.offset = 0;
+  heightInfo.range = VK_WHOLE_SIZE;
+
+  VkWriteDescriptorSet writes[6] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -1118,7 +1129,14 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[4].pBufferInfo = &paletteInfo;
 
-  vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
+  writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[5].dstSet = m_descriptorSet;
+  writes[5].dstBinding = 5;
+  writes[5].descriptorCount = 1;
+  writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[5].pBufferInfo = &heightInfo;
+
+  vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
   return true;
 }
 

@@ -21,6 +21,12 @@ namespace vv::vulkan {
 //    (chunk coords relative to the region origin) to atlas slot indices;
 //    kEmptySlot marks "not loaded" (treated as air by the shader).
 //
+//  - column height atlas: per chunk slot, one u16 per voxel column (highest
+//    solid voxel Y + 1, 0 = all-air), packed two-per-u32, row-major over
+//    X + Z*chunkSizeX. The compute shader's air-skip uses it to step over
+//    empty columns in O(1); the bound is conservative, so it stays correct
+//    for any future voxel content (overhangs, edits).
+//
 //  - voxel palette: small buffer with per-type, per-face base colors, filled
 //    from vv::voxel::kVoxelTypeInfo. Placeholder until the texturing pass;
 //    the plan is a bindless texture array with real per-type albedo textures.
@@ -58,11 +64,15 @@ class VoxelResources final {
 
 	VkBuffer voxelBuffer() const { return m_voxelBuffer; }
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
+	VkBuffer heightBuffer() const { return m_heightBuffer; }
 	VkBuffer paletteBuffer() const { return m_paletteBuffer; }
 
 	std::uint32_t slotCount() const { return m_slotCount; }
 	std::uint64_t slotByteStride() const { return m_slotByteStride; }
 	std::uint64_t slotWordStride() const { return m_slotByteStride / 4u; }
+	// Heightmap slot stride in u32 words (sync contract with the shader's
+	// (chunkSizeX * chunkSizeZ + 1) / 2).
+	std::uint64_t heightSlotWordStride() const { return m_heightSlotWords; }
 
  private:
 	VkBuffer m_voxelBuffer = VK_NULL_HANDLE;
@@ -71,6 +81,9 @@ class VoxelResources final {
 	VkBuffer m_chunkTableBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_chunkTableMemory = VK_NULL_HANDLE;
 	void* m_mappedTable = nullptr;
+
+	VkBuffer m_heightBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_heightMemory = VK_NULL_HANDLE;
 
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;
@@ -81,6 +94,7 @@ class VoxelResources final {
 
 	std::uint32_t m_slotCount = 0;
 	std::uint64_t m_slotByteStride = 0;
+	std::uint64_t m_heightSlotWords = 0;
 	std::uint64_t m_tableElements = 0;
 };
 

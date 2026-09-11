@@ -16,6 +16,15 @@ function(vv_add_tests)
         "${CMAKE_SOURCE_DIR}/src"
     )
 
+    # Same float32 bit-exactness contract as the game target
+    # (terrain/Noise.hpp): no FMA contraction on GCC/Clang.
+    if(NOT MSVC)
+        set_source_files_properties(
+            src/terrain/Noise.cpp
+            src/terrain/TerrainGenerator.cpp
+            PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
+
     # glm headers only needed if a voxel header starts including them.
     if(VV_GLM_INCLUDE_DIR)
         target_include_directories(voxel_tests SYSTEM PRIVATE

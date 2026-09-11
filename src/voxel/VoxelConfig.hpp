@@ -23,9 +23,11 @@ struct VoxelConfig final {
 	// Safety net on DDA iterations per pixel. The primary ray terminator is
 	// the fog distance cut (see VulkanRenderer::fogCutDistance and the
 	// shader's fogCut): the renderer raises this to at least ~1.75x the
-	// region width so the budget never cuts a ray before the fog does. A
-	// step budget alone would crop the world in a noisy shell (steps count
-	// cell crossings, which varies with ray direction).
+	// region width so the budget never cuts a ray before the fog does.
+	// Since the heightmap-guided traversal this counts COLUMN steps (the
+	// worst ray crosses ~sqrt(2) columns per unit of distance); the cell
+	// walks inside columns are bounded by the world height and the fog cut.
+	// A step budget alone would crop the world in a noisy shell.
 	std::uint32_t maxTraceSteps = 1024;
 
 	std::uint32_t gridWidth() const { return 2 * renderRadiusChunks + 1; }

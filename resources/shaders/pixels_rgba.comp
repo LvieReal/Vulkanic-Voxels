@@ -54,7 +54,19 @@ layout(set = 0, binding = 4) readonly buffer VoxelPalette {
     vec4 bottom[8];
 } palette;
 
+// Column height atlas (air-skip): per chunk slot, one u16 per voxel column
+// holding (highest solid voxel Y + 1; 0 = all-air), packed two-per-u32
+// (column i even -> low half), row-major over X + Z*chunkSizeX. Slot stride
+// in words = (chunkSizeX * chunkSizeZ + 1) / 2 (sync contract with
+// VoxelResources::heightSlotWordStride / Chunk::heightMapWordStride).
+layout(set = 0, binding = 5) readonly buffer ColumnHeights {
+    uint data[];
+} heights;
+
 const uint kEmptySlot = 0xFFFFFFFFu;
+// Heightmap sentinel: column not loaded -> no bound known, force the exact
+// cell walk (never skips, so it can never hide solid geometry).
+const uint kNoHeightData = 0xFFFFu;
 
 // Fog contract (must match VulkanRenderer::fogCutDistance):
 //   pc.camera.y = 1 / cutDistance, where cutDistance is the distance from
@@ -109,33 +121,67 @@ int floorDiv(int a, int b)
     return q;
 }
 
-// Voxel type at a global (possibly negative) voxel coordinate. Returns 0
-// (air) for anything outside the loaded region or in an empty slot.
-uint voxelTypeAt(ivec3 cell)
+// Resolves a global voxel column to its atlas slot + chunk-local (x, z).
+// False when outside the loaded region or in an empty slot.
+bool resolveColumn(int voxX, int voxZ, out uint slot, out ivec2 local)
 {
     const int chunkX = int(pc.chunkSize.x);
     const int chunkZ = int(pc.chunkSize.z);
 
-    const ivec2 cc = ivec2(floorDiv(cell.x, chunkX), floorDiv(cell.z, chunkZ));
+    const ivec2 cc = ivec2(floorDiv(voxX, chunkX), floorDiv(voxZ, chunkZ));
     const ivec2 gridLocal = cc - pc.region.xz;
     if (any(lessThan(gridLocal, ivec2(0))) ||
         any(greaterThanEqual(gridLocal, ivec2(pc.grid.xy)))) {
-        return 0u;
+        return false;
     }
 
-    const uint slot =
-        chunkTable.slots[uint(gridLocal.x) + uint(gridLocal.y) * pc.grid.x];
+    slot = chunkTable.slots[uint(gridLocal.x) + uint(gridLocal.y) * pc.grid.x];
     if (slot == kEmptySlot) {
-        return 0u;
+        return false;
     }
+    local = ivec2(voxX - cc.x * chunkX, voxZ - cc.y * chunkZ);
+    return true;
+}
 
-    const ivec3 local = ivec3(cell.x - cc.x * chunkX, cell.y,
-                              cell.z - cc.y * chunkZ);
-    const uint idx = uint(local.x) + uint(local.y) * pc.chunkSize.x +
-                     uint(local.z) * (pc.chunkSize.x * pc.chunkSize.y);
-
+// Voxel type at a packed atlas index (within one chunk slot).
+uint fetchVoxel(uint slot, uint idx)
+{
     const uint word = voxels.data[slot * pc.grid.z + (idx >> 2u)];
     return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// Height bound of the column containing (voxX, voxZ): highest solid voxel
+// Y + 1 (0 = all air), or kNoHeightData when the column is not loaded.
+uint columnHeightBound(int voxX, int voxZ)
+{
+    uint slot = 0u;
+    ivec2 local = ivec2(0);
+    if (!resolveColumn(voxX, voxZ, slot, local)) {
+        return kNoHeightData;
+    }
+    const uint heightStride =
+        (pc.chunkSize.x * pc.chunkSize.z + 1u) / 2u;
+    const uint col = uint(local.x) + uint(local.y) * pc.chunkSize.x;
+    const uint word = heights.data[slot * heightStride + (col >> 1u)];
+    return ((col & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
+}
+
+// Voxel type at a global (possibly negative) voxel coordinate. Returns 0
+// (air) for anything outside the loaded region, in an empty slot, or
+// outside the world's Y range.
+uint voxelTypeAt(ivec3 cell)
+{
+    uint slot = 0u;
+    ivec2 local = ivec2(0);
+    if (!resolveColumn(cell.x, cell.z, slot, local)) {
+        return 0u;
+    }
+    if (cell.y < 0 || cell.y >= int(pc.chunkSize.y)) {
+        return 0u;
+    }
+    const uint idx = uint(local.x) + uint(cell.y) * pc.chunkSize.x +
+                     uint(local.y) * (pc.chunkSize.x * pc.chunkSize.y);
+    return fetchVoxel(slot, idx);
 }
 
 bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out float tmax, out vec3 enterNormal)
@@ -247,15 +293,24 @@ vec3 traceRay(vec2 uv, bool debugTerm)
 
     const float EPS = 1e-6;
 
+    // --- Heightmap-guided traversal -------------------------------
+    // 2D DDA over XZ voxel columns. Per column, the height bound decides
+    // whether the ray can possibly touch solid cells:
+    //   - the segment stays at/above the bound -> ONE step to the next
+    //     column (the air-skip; the old tracer burned a cell crossing per
+    //     air voxel instead);
+    //   - otherwise -> walk only the cells the segment actually occupies,
+    //     starting no higher than the bound (cells above it are provably
+    //     air), with the slot resolved once per column.
+    // The walk enumerates exactly the same solid cells (and entry faces) as
+    // a plain 3D DDA - see the traversal parity test - so the image is
+    // identical while air becomes nearly free.
     int stepX = (rd.x > 0.0) ? 1 : -1;
-    int stepY = (rd.y > 0.0) ? 1 : -1;
     int stepZ = (rd.z > 0.0) ? 1 : -1;
 
     float tMaxX = 1e30;
-    float tMaxY = 1e30;
     float tMaxZ = 1e30;
     float tDeltaX = 1e30;
-    float tDeltaY = 1e30;
     float tDeltaZ = 1e30;
 
     if (abs(rd.x) > EPS) {
@@ -264,14 +319,6 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         tDeltaX = abs(1.0 / rd.x);
     } else {
         stepX = 0;
-    }
-
-    if (abs(rd.y) > EPS) {
-        float nextY = float(cell.y + ((stepY > 0) ? 1 : 0));
-        tMaxY = (nextY - start.y) / rd.y;
-        tDeltaY = abs(1.0 / rd.y);
-    } else {
-        stepY = 0;
     }
 
     if (abs(rd.z) > EPS) {
@@ -285,62 +332,135 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     bool hit = false;
     vec3 normal = vec3(0.0);
     uint hitType = 0u;
-    // Ray parameter (world units: rdWorld is normalized) at the entry of the
-    // current cell, relative to the region entry point; the distance from the
-    // camera is tEntryOffset + t.
-    float t = 0.0;
+    // Ray parameter (same units as the old tracer: t multiplies rd, and the
+    // distance from the camera is tEntryOffset + t) at the hit, relative to
+    // the region entry point.
+    float tHit = 0.0;
     // Why the ray ended, for the VV_DEBUG_TERM view. Defaults to the budget
     // (loop exhausted); every break overwrites it.
     int termCause = TERM_BUDGET;
 
+    // Axis of the XZ boundary crossed to enter the current column (-1 for
+    // the segment's first column -> use the region entry normal).
     int lastAxis = -1;
+    // Entry parameter of the current column.
+    float t = 0.0;
+    const int worldTop = int(pc.chunkSize.y) - 1;
+
     for (int i = 0; i < int(pc.chunkSize.w); ++i) {
-        uint type = voxelTypeAt(cell);
-        if (type != 0u) {
-            hit = true;
-            hitType = type;
-            termCause = TERM_HIT;
-            if (lastAxis == 0) {
-                normal = vec3(-float(stepX), 0.0, 0.0);
-            } else if (lastAxis == 1) {
-                normal = vec3(0.0, -float(stepY), 0.0);
-            } else if (lastAxis == 2) {
-                normal = vec3(0.0, 0.0, -float(stepZ));
-            } else {
-                normal = enterNormal;
-            }
+        if (t >= tEnd) {
+            termCause = (tEndFog < tEndRegion) ? TERM_FOG_CUT : TERM_REGION_EXIT;
             break;
         }
+        const float tColExit = min(min(tMaxX, tMaxZ), tEnd);
+        const float y0 = start.y + rd.y * t;        // y at column entry
+        const float y1 = start.y + rd.y * tColExit; // y at column exit
+        const float yMin = min(y0, y1);
 
         // Ascending above the highest possible terrain: nothing left to hit.
-        if (rd.y > 0.0 && float(cell.y) >= maxTerrainY) {
+        // (maxTerrainY is the top solid cell index; its top face is at
+        // maxTerrainY + 1.)
+        if (rd.y > 0.0 && y0 >= maxTerrainY + 1.0) {
             termCause = TERM_ASCEND;
             break;
         }
 
-        float nextT = 0.0;
-        if (tMaxX < tMaxY && tMaxX < tMaxZ) {
-            nextT = tMaxX;
+        const uint bound = columnHeightBound(cell.x, cell.z);
+        const bool skip = (bound != kNoHeightData) && (yMin >= float(bound));
+
+        if (!skip) {
+            uint slot = 0u;
+            ivec2 local = ivec2(0);
+            const bool haveSlot = resolveColumn(cell.x, cell.z, slot, local);
+            const uint colBase = haveSlot
+                ? uint(local.x) + uint(local.y) *
+                      (pc.chunkSize.x * pc.chunkSize.y)
+                : 0u;
+
+            // First cell to check: the segment's entry cell, clamped down to
+            // the height bound / world top (cells above are provably air).
+            int yFirst = min(int(floor(y0)), worldTop);
+            if (bound != kNoHeightData) {
+                yFirst = min(yFirst, int(bound) - 1);
+            }
+            const int yLast = int(floor(y1));
+
+            if (rd.y < 0.0) {
+                // Descending: cells in t order from yFirst down to the
+                // lowest cell the segment reaches (clamped into the world).
+                for (int y = yFirst; y >= max(yLast, 0); --y) {
+                    const uint type = haveSlot
+                        ? fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x)
+                        : voxelTypeAt(ivec3(cell.x, y, cell.z));
+                    if (type != 0u) {
+                        hit = true;
+                        hitType = type;
+                        if (y == int(floor(y0))) {
+                            // Entered this cell at column entry (XZ face or
+                            // the segment start).
+                            tHit = t;
+                            normal = (lastAxis == 0)
+                                ? vec3(-float(stepX), 0.0, 0.0)
+                                : (lastAxis == 2)
+                                    ? vec3(0.0, 0.0, -float(stepZ))
+                                    : enterNormal;
+                        } else {
+                            // Crossed into this cell through its top face.
+                            tHit = (float(y + 1) - start.y) / rd.y;
+                            normal = vec3(0.0, 1.0, 0.0);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                // Ascending or horizontal: cells from yFirst up to the
+                // highest cell the segment reaches, stopping above the
+                // height bound (cells there are provably air).
+                const int yTop = min(yLast, worldTop);
+                for (int y = max(yFirst, 0); y <= yTop; ++y) {
+                    if (bound != kNoHeightData && y >= int(bound)) {
+                        break;
+                    }
+                    const uint type = haveSlot
+                        ? fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x)
+                        : voxelTypeAt(ivec3(cell.x, y, cell.z));
+                    if (type != 0u) {
+                        hit = true;
+                        hitType = type;
+                        if (y == int(floor(y0))) {
+                            tHit = t;
+                            normal = (lastAxis == 0)
+                                ? vec3(-float(stepX), 0.0, 0.0)
+                                : (lastAxis == 2)
+                                    ? vec3(0.0, 0.0, -float(stepZ))
+                                    : enterNormal;
+                        } else {
+                            // Crossed into this cell through its bottom face.
+                            tHit = (float(y) - start.y) / rd.y;
+                            normal = vec3(0.0, -1.0, 0.0);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (hit) {
+                termCause = TERM_HIT;
+                break;
+            }
+        }
+
+        // Advance to the next column (2D XZ DDA step).
+        if (tMaxX < tMaxZ) {
+            t = tMaxX;
             tMaxX += tDeltaX;
             cell.x += stepX;
             lastAxis = 0;
-        } else if (tMaxY < tMaxZ) {
-            nextT = tMaxY;
-            tMaxY += tDeltaY;
-            cell.y += stepY;
-            lastAxis = 1;
         } else {
-            nextT = tMaxZ;
+            t = tMaxZ;
             tMaxZ += tDeltaZ;
             cell.z += stepZ;
             lastAxis = 2;
         }
-
-        if (nextT > tEnd) {
-            termCause = (tEndFog < tEndRegion) ? TERM_FOG_CUT : TERM_REGION_EXIT;
-            break;
-        }
-        t = nextT;
     }
 
     if (hit) {
@@ -352,7 +472,7 @@ vec3 traceRay(vec2 uv, bool debugTerm)
 
         // Distance fog towards the sky in this direction; hides the region
         // edge and gives the world aerial perspective.
-        float fog = clamp(fogAmount(tEntryOffset + t), 0.0, 1.0);
+        float fog = clamp(fogAmount(tEntryOffset + tHit), 0.0, 1.0);
         return mix(color, skyColor(rdWorld), fog);
     }
     return debugTerm ? termColor(termCause) : skyColor(rdWorld);

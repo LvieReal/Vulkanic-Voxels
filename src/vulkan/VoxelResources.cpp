@@ -30,10 +30,27 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 	const VkDeviceSize atlasBytes =
 			static_cast<VkDeviceSize>(m_slotCount) * m_slotByteStride;
 	if (!utils::createBuffer(device, physicalDevice, atlasBytes,
-													 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-															 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-													 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-													 m_voxelBuffer, m_voxelMemory, outError)) {
+														VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+																VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+														VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+														m_voxelBuffer, m_voxelMemory, outError)) {
+		return false;
+	}
+
+	// Column height atlas (see class comment). One slot per chunk, u16 per
+	// column packed two-per-u32.
+	m_heightSlotWords =
+			(static_cast<std::uint64_t>(config.chunkSizeX) * config.chunkSizeZ +
+			 1u) /
+			2u;
+	const VkDeviceSize heightBytes =
+			static_cast<VkDeviceSize>(m_slotCount) * m_heightSlotWords * 4u;
+	if (!utils::createBuffer(device, physicalDevice, heightBytes,
+														VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+																VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+														VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+														m_heightBuffer, m_heightMemory, outError)) {
+		cleanup(device);
 		return false;
 	}
 
@@ -112,7 +129,12 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			outError = "Invalid chunk upload request.";
 			return false;
 		}
-		totalBytes += static_cast<VkDeviceSize>(m_slotByteStride);
+		if (upload.chunk->heightMapWordStride() != m_heightSlotWords) {
+			outError = "Chunk heightmap stride does not match the atlas.";
+			return false;
+		}
+		totalBytes += static_cast<VkDeviceSize>(m_slotByteStride) +
+		              static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
 	}
 
 	// Wait for in-flight frames before mutating the atlas; region updates are
@@ -140,12 +162,24 @@ bool VoxelResources::uploadChunks(VkDevice device,
 
 	std::memset(mapped, 0, static_cast<std::size_t>(totalBytes));
 	{
-		std::size_t offset = 0;
+		// Staging layout: [voxel data for all uploads][heightmaps for all
+		// uploads], so each section is copied with contiguous per-upload
+		// regions.
+		std::size_t voxelOffset = 0;
+		std::size_t heightOffset =
+				static_cast<std::size_t>(m_slotByteStride) * uploads.size();
+		const std::size_t heightBytesPerSlot =
+				static_cast<std::size_t>(m_heightSlotWords) * 4u;
 		for (const ChunkUpload& upload : uploads) {
 			const auto& types = upload.chunk->voxelTypes();
-			std::memcpy(static_cast<std::uint8_t*>(mapped) + offset, types.data(),
-									types.size());
-			offset += static_cast<std::size_t>(m_slotByteStride);
+			std::memcpy(static_cast<std::uint8_t*>(mapped) + voxelOffset,
+									types.data(), types.size());
+			voxelOffset += static_cast<std::size_t>(m_slotByteStride);
+
+			const auto& heights = upload.chunk->heightMapWords();
+			std::memcpy(static_cast<std::uint8_t*>(mapped) + heightOffset,
+									heights.data(), heights.size() * sizeof(std::uint32_t));
+			heightOffset += heightBytesPerSlot;
 		}
 	}
 	vkUnmapMemory(device, stagingMemory);
@@ -176,17 +210,30 @@ bool VoxelResources::uploadChunks(VkDevice device,
 	}
 
 	std::vector<VkBufferCopy> regions;
-	regions.reserve(uploads.size());
+	regions.reserve(uploads.size() * 2);
 	{
-		VkDeviceSize stagingOffset = 0;
+		VkDeviceSize voxelOffset = 0;
+		VkDeviceSize heightOffset =
+				static_cast<VkDeviceSize>(m_slotByteStride) *
+				static_cast<VkDeviceSize>(uploads.size());
+		const VkDeviceSize heightBytesPerSlot =
+				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
 		for (const ChunkUpload& upload : uploads) {
-			VkBufferCopy region{};
-			region.srcOffset = stagingOffset;
-			region.dstOffset =
+			VkBufferCopy voxelRegion{};
+			voxelRegion.srcOffset = voxelOffset;
+			voxelRegion.dstOffset =
 					static_cast<VkDeviceSize>(upload.slot) * m_slotByteStride;
-			region.size = static_cast<VkDeviceSize>(m_slotByteStride);
-			regions.push_back(region);
-			stagingOffset += static_cast<VkDeviceSize>(m_slotByteStride);
+			voxelRegion.size = static_cast<VkDeviceSize>(m_slotByteStride);
+			regions.push_back(voxelRegion);
+			voxelOffset += static_cast<VkDeviceSize>(m_slotByteStride);
+
+			VkBufferCopy heightRegion{};
+			heightRegion.srcOffset = heightOffset;
+			heightRegion.dstOffset =
+					static_cast<VkDeviceSize>(upload.slot) * heightBytesPerSlot;
+			heightRegion.size = heightBytesPerSlot;
+			regions.push_back(heightRegion);
+			heightOffset += heightBytesPerSlot;
 		}
 	}
 	vkCmdCopyBuffer(cmd, stagingBuffer, m_voxelBuffer,
@@ -235,6 +282,14 @@ void VoxelResources::cleanup(VkDevice device) {
 		vkUnmapMemory(device, m_chunkTableMemory);
 		m_mappedTable = nullptr;
 	}
+	if (m_heightBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_heightBuffer, nullptr);
+		m_heightBuffer = VK_NULL_HANDLE;
+	}
+	if (m_heightMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_heightMemory, nullptr);
+		m_heightMemory = VK_NULL_HANDLE;
+	}
 	if (m_paletteBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_paletteBuffer, nullptr);
 		m_paletteBuffer = VK_NULL_HANDLE;
@@ -261,6 +316,7 @@ void VoxelResources::cleanup(VkDevice device) {
 	}
 	m_slotCount = 0;
 	m_slotByteStride = 0;
+	m_heightSlotWords = 0;
 	m_tableElements = 0;
 }
 
