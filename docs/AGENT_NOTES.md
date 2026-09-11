@@ -402,6 +402,77 @@ docs/reference_renderer.wgsl), a brighter sky, and dithered debanding.
   ambient/direct/rim shading split (our lighting kept; AO applied on
   top).
 
+### Pass 4: far-LOD height field (2k-unit view distance)
+
+User asked for LOD + "infinite" render distance, accepting an arbitrary
+huge distance for the first test (full detail at that range would need
+~1.25 GB; the far field needs 4 MB).
+
+Architecture - two-tier LOD that leaves the near tier untouched:
+
+- NEAR (unchanged, parity-tested): full-detail voxel region, radius 12
+  chunks, fog hidden the region boundary (when far is off, exactly as in
+  3.5).
+- FAR (new, binding 6): a coarse height field covering a square of
+  2*farLodRadiusChunks chunks per side (default 64 -> +/-2048 units),
+  cells of farLodCellVoxels (4) voxels. One u32 per cell:
+  u16 (max solid height + 1) | u8 surface type << 16, row-major
+  X + Z*dim - see terrain/FarField.{hpp,cpp} (pure, unit-tested; one
+  heightAtF per cell at the cell CENTER). 1024x1024 cells = 4 MB.
+- SHADER: after a ray exits the near region without a hit (and pc.far.z
+  > 0), a second 2D DDA marches the far grid (one u32 fetch + compares
+  per cell; budget = dim.x + dim.y). Side-face hit when entering a cell
+  below its surface top; top-face hit when crossing the top plane inside
+  a cell; height 0 = no surface (never hit - a ray below y=0 over an
+  air/outside cell must NOT hit; found by the DDA-vs-brute test).
+  Far hits shade with the cell's surface type (palette) + normal + fog,
+  no AO. The near traversal is byte-identical (its tEnd is still
+  min(region exit, fog cut); with far active the cut >= 1536 > region
+  exit ~588, so the near loop always ends at the region exit).
+- FOG: with the far field active, fogCutDistance() measures the FAR box
+  faces (cut in [1536, 2560] as the camera wanders within the recenter
+  hysteresis; the wall breathes subtly). The near-region boundary is
+  hidden GEOMETRICALLY (the far field continues the same terrain), not
+  by fog. Invariant (enforced in VoxelConfig::isValid):
+  far half-extent >= recenter hysteresis + near-region half-diagonal
+  -> farRadius >= 2*renderRadius + 4, so the cut always exceeds the
+  near-region exit along any ray (no gap between the two marches).
+- CPU: FarField::build runs on a std::thread (1M noise evals ~0.3-0.6 s
+  background; renders start immediately with the old 400u fog wall and
+  the far field pops in once). VulkanRenderer owns the thread state:
+  launchFarFieldBuild / ensureFarField (called from updateWorld);
+  the thread only touches m_farPending (released via m_farPendingReady)
+  and the const terrain generator; cleanup() joins it BEFORE the world
+  is destroyed. Recenter: rebuild when the camera strays > max(4,
+  far/4) chunks (= 512u) from the field center; the old field keeps
+  rendering until the new one uploads (camera always inside both).
+  VoxelResources::uploadFarField: staging + single copy, queue idle
+  (rare).
+- Push constants grew to exactly 128 B (spec minimum guarantee):
+  ivec4 far (origin vox X/Z, cell dims; z=0 = off) + vec4 farParams
+  (cell footprint). static_assert in SceneData.hpp; the far buffer
+  always exists (4-byte dummy when disabled) so binding 6 is always a
+  valid descriptor.
+- debugStats() title now shows far=on/building/off(dims@center).
+
+Testing: testFarField (builder conventions, packing, determinism) and
+testFarMarch (CPU mirror of the far DDA vs dense brute force over the
+same synthetic grid incl. towers/holes; hit/t agreement on 4000 rays).
+Two reference bugs found while writing it (both fixed in test AND
+shader semantics): outside-grid cells must be "no data", and height-0
+cells have no surface - a ray below y=0 there must not hit. Also mind
+C++ int+unsigned promotion when mixing negative origins with uint32
+math (the test hit this: -48 + 4u wrapped to 4.29e9).
+
+Known trade-offs (first test, by design):
+- Far silhouettes quantize by ~ +-cellVoxels/2 of height (center
+  sampling); visible as slight steps on distant ridgelines against the
+  sky. Mitigation later: conservative max-of-samples seam band or a
+  finer (C=2) inner far ring.
+- The seam ring (near region edge, ~400u, fog ~1-2%) can show small
+  up/down steps where coarse hands off to fine.
+- No shadows/AO in the far field; the sun lights it flat.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -423,7 +494,16 @@ docs/reference_renderer.wgsl), a brighter sky, and dithered debanding.
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 3.5 — done (pending user verification):**
+**Pass 4 — done (pending user verification):**
+- [x] Far-LOD height field: 2k-unit view distance (radius 64 chunks,
+      4x4-voxel cells, 4 MB) on top of the unchanged near region;
+      background-thread build + upload, automatic recentering, fog cut
+      moved to the far boundary
+- [x] Far march unit tests (builder + DDA-vs-brute-force parity)
+- [x] Future: finer inner far ring / conservative seam band; true
+      "infinite" via nested far rings (clipmap)
+
+**Pass 3.5 — done (user-verified):**
 - [x] FPS uncapped (0ms tick timer + IMMEDIATE present mode; VV_PRESENT
       overrides, fifo restores vsync)
 - [x] Render distance 2x (radius 12; fog/budget/slots scale automatically)

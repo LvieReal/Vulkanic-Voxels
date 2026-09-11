@@ -1,5 +1,6 @@
 #include "vulkan/VoxelResources.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 #include "vulkan/BufferUtils.hpp"
@@ -52,6 +53,26 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 														m_heightBuffer, m_heightMemory, outError)) {
 		cleanup(device);
 		return false;
+	}
+
+	// Far-LOD height field (binding 6): one u32 per coarse cell, dim =
+	// 2 * farLodRadiusChunks * chunkSizeX / farLodCellVoxels (square). The
+	// buffer always exists (tiny dummy when far LOD is disabled) so the
+	// binding-6 descriptor is always valid; the shader never reads it when
+	// the push-constant far dims are 0.
+	{
+		const std::uint64_t farDim =
+				std::max<std::uint64_t>(config.farLodDim(), 1u);
+		const VkDeviceSize farBytes =
+				static_cast<VkDeviceSize>(farDim) * farDim * 4u;
+		if (!utils::createBuffer(device, physicalDevice, farBytes,
+															VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+																	VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+															VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+															m_farBuffer, m_farMemory, outError)) {
+			cleanup(device);
+			return false;
+		}
 	}
 
 	const VkDeviceSize tableBytes =
@@ -280,6 +301,102 @@ bool VoxelResources::uploadChunks(VkDevice device,
 	return true;
 }
 
+bool VoxelResources::uploadFarField(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		VkQueue queue, const std::vector<std::uint32_t>& cells,
+		std::string& outError) {
+	if (m_farBuffer == VK_NULL_HANDLE) {
+		outError = "Far LOD is not enabled on this resource set.";
+		return false;
+	}
+	const VkDeviceSize bytes =
+			static_cast<VkDeviceSize>(cells.size()) * sizeof(std::uint32_t);
+	if (bytes == 0) {
+		return true;
+	}
+
+	// Rare upload (far-field recenter); a queue idle keeps in-flight frames
+	// from reading a half-updated field.
+	vkDeviceWaitIdle(device);
+
+	VkBuffer stagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	if (!utils::createBuffer(device, physicalDevice, bytes,
+														VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+														VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+																VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+														stagingBuffer, stagingMemory, outError)) {
+		return false;
+	}
+
+	void* mapped = nullptr;
+	VkResult r = vkMapMemory(device, stagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+	if (r != VK_SUCCESS || mapped == nullptr) {
+		outError = "Failed to map far field staging memory.";
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+	std::memcpy(mapped, cells.data(), static_cast<std::size_t>(bytes));
+	vkUnmapMemory(device, stagingMemory);
+
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkCommandBufferAllocateInfo alloc{};
+	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	alloc.commandPool = commandPool;
+	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc.commandBufferCount = 1;
+	r = vkAllocateCommandBuffers(device, &alloc, &cmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to allocate far field command buffer.";
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+		outError = "Failed to begin far field command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+
+	VkBufferCopy region{};
+	region.size = bytes;
+	vkCmdCopyBuffer(cmd, stagingBuffer, m_farBuffer, 1, &region);
+
+	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		outError = "Failed to end far field command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &cmd;
+	r = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+	if (r == VK_SUCCESS) {
+		vkQueueWaitIdle(queue);
+	}
+
+	vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+	vkDestroyBuffer(device, stagingBuffer, nullptr);
+	vkFreeMemory(device, stagingMemory, nullptr);
+
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit far field upload.";
+		return false;
+	}
+	return true;
+}
+
 bool VoxelResources::writeChunkTable(
 		const std::vector<std::uint32_t>& slotPerCell) {
 	if (slotPerCell.size() != m_tableElements || m_mappedTable == nullptr) {
@@ -302,6 +419,14 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_heightMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_heightMemory, nullptr);
 		m_heightMemory = VK_NULL_HANDLE;
+	}
+	if (m_farBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_farBuffer, nullptr);
+		m_farBuffer = VK_NULL_HANDLE;
+	}
+	if (m_farMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_farMemory, nullptr);
+		m_farMemory = VK_NULL_HANDLE;
 	}
 	if (m_paletteBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_paletteBuffer, nullptr);

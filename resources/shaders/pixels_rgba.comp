@@ -14,6 +14,9 @@ layout(push_constant) uniform Push {
                     // w=max terrain voxel y (sky-skip ceiling; MUST be a true
                     // upper bound on solid terrain or the sky-skip early-out
                     // clips real terrain into noisy contour rings)
+    ivec4 far;      // x,y = far-LOD min corner (voxel X/Z), z,w = cell dims;
+                    // z = 0 means far LOD is off
+    vec4 farParams; // x = far cell footprint in voxels
 } pc;
 
 // Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types
@@ -62,6 +65,14 @@ layout(set = 0, binding = 4) readonly buffer VoxelPalette {
 layout(set = 0, binding = 5) readonly buffer ColumnHeights {
     uint data[];
 } heights;
+
+// Far-LOD height field: one u32 per coarse cell = (u16 max-solid height + 1
+// in the low half) | (u8 surface voxel type in bits 16..23), row-major over
+// X + Z * dim. Covers voxel space [pc.far.xy, pc.far.xy + pc.far.zw *
+// farParams.x). Built by vv::terrain::FarField on a background thread.
+layout(set = 0, binding = 6) readonly buffer FarLod {
+    uint cells[];
+} farLod;
 
 const uint kEmptySlot = 0xFFFFFFFFu;
 // Heightmap sentinel: column not loaded -> no bound known, force the exact
@@ -548,15 +559,123 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         }
     }
 
-    if (hit) {
+    // --- Far-LOD march ------------------------------------------------
+    // Runs only when the ray left the full-detail region without a hit and
+    // far LOD is active (pc.far.z > 0). 2D DDA over coarse height cells:
+    // each cell is a column of footprint farParams.x voxels whose surface
+    // top plane sits at its stored height. One u32 fetch + compares per
+    // cell; the near-region traversal above is untouched, so its parity
+    // guarantee still holds.
+    bool farHit = false;
+    if (!hit && pc.far.z > 0) {
+        const float cell = pc.farParams.x;
+        const ivec2 farDim = pc.far.zw;
+        const vec2 farOrigin = vec2(pc.far.xy);
+
+        int fStepX = (rd.x > 0.0) ? 1 : -1;
+        int fStepZ = (rd.z > 0.0) ? 1 : -1;
+        float fMaxX = 1e30;
+        float fMaxZ = 1e30;
+        float fDeltaX = 1e30;
+        float fDeltaZ = 1e30;
+
+        const vec2 p = start.xz + rd.xz * tEndRegion;
+        ivec2 c2 = ivec2(floor((p - farOrigin) / cell));
+        if (abs(rd.x) > EPS) {
+            float nextX =
+                farOrigin.x + float(c2.x + ((fStepX > 0) ? 1 : 0)) * cell;
+            fMaxX = (nextX - start.x) / rd.x;
+            fDeltaX = cell / abs(rd.x);
+        } else {
+            fStepX = 0;
+        }
+        if (abs(rd.z) > EPS) {
+            float nextZ =
+                farOrigin.y + float(c2.y + ((fStepZ > 0) ? 1 : 0)) * cell;
+            fMaxZ = (nextZ - start.z) / rd.z;
+            fDeltaZ = cell / abs(rd.z);
+        } else {
+            fStepZ = 0;
+        }
+
+        float ft = tEndRegion;  // entry param of the current far cell
+        int fLastAxis = -1;
+        // A ray can cross at most dim.x + dim.y cells of the grid.
+        const int farBudget = farDim.x + farDim.y;
+        for (int i = 0; i < farBudget; ++i) {
+            if (ft >= tEndFog) {
+                termCause = TERM_FOG_CUT;
+                break;
+            }
+            const float ftExit = min(min(fMaxX, fMaxZ), tEndFog);
+            const float fy0 = start.y + rd.y * ft;
+            const float fy1 = start.y + rd.y * ftExit;
+
+            // Ascending above all possible terrain: sky.
+            if (rd.y > 0.0 && fy0 >= maxTerrainY + 1.0) {
+                termCause = TERM_ASCEND;
+                break;
+            }
+
+            const bool inGrid = all(greaterThanEqual(c2, ivec2(0))) &&
+                                all(lessThan(c2, farDim));
+            const uint packed = inGrid
+                ? farLod.cells[uint(c2.x) + uint(c2.y) * uint(farDim.x)]
+                : 0u;
+            const float fh = float(packed & 0xFFFFu);
+
+            if (fh > 0.0 && fy0 < fh) {
+                // Entered this cell below the surface top: side-face hit.
+                // (fh > 0: an all-air column or a cell outside the grid has
+                // no surface - a ray below y = 0 there must NOT hit.)
+                farHit = true;
+                hitType = (packed >> 16u) & 0xFFu;
+                tHit = ft;
+                normal = (fLastAxis == 0)
+                    ? vec3(-float(fStepX), 0.0, 0.0)
+                    : (fLastAxis == 2)
+                        ? vec3(0.0, 0.0, -float(fStepZ))
+                        : vec3(0.0, 1.0, 0.0);
+                termCause = TERM_HIT;
+                break;
+            }
+            if (fh > 0.0 && rd.y < 0.0 && fy1 < fh) {
+                // Crossed the surface top plane inside this cell.
+                farHit = true;
+                hitType = (packed >> 16u) & 0xFFu;
+                tHit = clamp((fh - start.y) / rd.y, ft, ftExit);
+                normal = vec3(0.0, 1.0, 0.0);
+                termCause = TERM_HIT;
+                break;
+            }
+
+            if (fMaxX < fMaxZ) {
+                ft = fMaxX;
+                fMaxX += fDeltaX;
+                c2.x += fStepX;
+                fLastAxis = 0;
+            } else {
+                ft = fMaxZ;
+                fMaxZ += fDeltaZ;
+                c2.y += fStepZ;
+                fLastAxis = 2;
+            }
+        }
+    }
+
+    if (hit || farHit) {
         vec3 lightDir = normalize(scene.lightDir.xyz);
         float ndl = max(dot(normalize(normal), lightDir), 0.0);
         vec3 base = voxelColor(hitType, normal);
         // Per-vertex simulated AO on the hit face (ported from the user's
         // WGSL renderer): darkens creases and corners where neighboring
-        // solid voxels would block ambient light.
-        const vec3 hitPos = start + rd * tHit;
-        const float ao = calculateAO(ivec3(cell.x, hitY, cell.z), normal, hitPos);
+        // solid voxels would block ambient light. Far-LOD hits skip AO
+        // (invisible at multi-hundred-unit distances).
+        float ao = 1.0;
+        if (!farHit) {
+            const vec3 hitPos = start + rd * tHit;
+            ao = calculateAO(ivec3(cell.x, hitY, cell.z), normal, hitPos);
+        }
         vec3 lit = base * (0.15 + 0.85 * ndl) * ao;
         vec3 color = lit * scene.lightColor.xyz;
 

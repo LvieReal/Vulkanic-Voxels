@@ -56,6 +56,14 @@ class VoxelResources final {
 										const std::vector<ChunkUpload>& uploads,
 										std::string& outError);
 
+	// Uploads a freshly built far-LOD field (vv::terrain::FarField::cells)
+	// into the far buffer. Rare (far-field recenters), so a queue idle is
+	// acceptable.
+	bool uploadFarField(VkDevice device, VkPhysicalDevice physicalDevice,
+											VkCommandPool commandPool, VkQueue queue,
+											const std::vector<std::uint32_t>& cells,
+											std::string& outError);
+
 	// Rewrites the whole chunk table (one u32 slot index per region grid
 	// cell, row-major over gridWidth x gridHeight).
 	bool writeChunkTable(const std::vector<std::uint32_t>& slotPerCell);
@@ -65,6 +73,7 @@ class VoxelResources final {
 	VkBuffer voxelBuffer() const { return m_voxelBuffer; }
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
+	VkBuffer farBuffer() const { return m_farBuffer; }
 	VkBuffer paletteBuffer() const { return m_paletteBuffer; }
 
 	std::uint32_t slotCount() const { return m_slotCount; }
@@ -84,6 +93,9 @@ class VoxelResources final {
 
 	VkBuffer m_heightBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_heightMemory = VK_NULL_HANDLE;
+
+	VkBuffer m_farBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;
 
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;

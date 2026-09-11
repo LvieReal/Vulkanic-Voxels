@@ -207,6 +207,14 @@ void VulkanRenderer::setDeviceLost(const std::string& message) {
 }
 
 void VulkanRenderer::cleanup() {
+  // Join the far-LOD builder thread FIRST: it reads the terrain generator
+  // owned by m_world (destroyed below) and fills m_farPending.
+  if (m_farThread.joinable()) {
+    m_farThread.join();
+  }
+  m_farBuildRunning = false;
+  m_farPendingReady = false;
+
   if (m_device) {
     vkDeviceWaitIdle(m_device);
   }
@@ -309,6 +317,7 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       std::floor(cameraPosition.z / chunkWorldZ));
 
   if (chunkX == m_regionCenter.x && chunkZ == m_regionCenter.z) {
+    ensureFarField(chunkX, chunkZ);
     return;
   }
 
@@ -318,6 +327,91 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
     // continues with the previous (fully consistent) region state.
     std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
                  error.c_str());
+  }
+  ensureFarField(chunkX, chunkZ);
+}
+
+void VulkanRenderer::launchFarFieldBuild(int32_t centerChunkX,
+                                         int32_t centerChunkZ) {
+  if (m_farBuildRunning.load() || !m_world ||
+      m_voxelConfig.farLodRadiusChunks == 0) {
+    return;
+  }
+  m_farPendingReady = false;
+  m_farBuildRunning = true;
+  m_farPendingCenterX = centerChunkX;
+  m_farPendingCenterZ = centerChunkZ;
+
+  // The thread only reads the const generator (owned by m_world, alive
+  // until cleanup() joins this thread) and writes m_farPending, which the
+  // main thread touches only after m_farPendingReady flips.
+  const vv::terrain::TerrainGenerator* gen = &m_world->terrain();
+  const uint32_t radius = m_voxelConfig.farLodRadiusChunks;
+  const uint32_t cell = m_voxelConfig.farLodCellVoxels;
+  const uint32_t chunkSize = m_voxelConfig.chunkSizeX;
+  m_farThread = std::thread(
+      [gen, centerChunkX, centerChunkZ, radius, cell, chunkSize, this]() {
+        m_farPending = vv::terrain::FarField::build(
+            *gen, centerChunkX, centerChunkZ, radius, cell, chunkSize);
+        m_farPendingReady.store(true, std::memory_order_release);
+      });
+}
+
+void VulkanRenderer::ensureFarField(int32_t centerChunkX,
+                                    int32_t centerChunkZ) {
+  if (m_voxelConfig.farLodRadiusChunks == 0 || !m_world) {
+    return;
+  }
+
+  // A finished build is waiting: join, upload, activate.
+  if (m_farBuildRunning.load() && m_farPendingReady.load()) {
+    if (m_farThread.joinable()) {
+      m_farThread.join();
+    }
+    m_farBuildRunning = false;
+
+    const auto& cfg = m_voxelConfig;
+    std::string error;
+    if (m_farPending.dim != 0 &&
+        m_farPending.dim == cfg.farLodDim() &&
+        m_farPending.cellVoxels == cfg.farLodCellVoxels &&
+        m_voxelResources.uploadFarField(m_device, m_physicalDevice,
+                                        m_commandPool, m_graphicsQueue,
+                                        m_farPending.cells, error)) {
+      m_farOriginVoxX = m_farPending.originVoxX;
+      m_farOriginVoxZ = m_farPending.originVoxZ;
+      m_farDim = m_farPending.dim;
+      m_farCell = m_farPending.cellVoxels;
+      m_farFieldActive = true;
+      m_farCenterChunkX = m_farPendingCenterX;
+      m_farCenterChunkZ = m_farPendingCenterZ;
+      std::fprintf(stderr,
+                   "[vulkan] far LOD field active: %ux%u cells of %u voxels "
+                   "at (%d,%d)\n",
+                   m_farDim, m_farDim, m_farCell, m_farOriginVoxX,
+                   m_farOriginVoxZ);
+    } else {
+      std::fprintf(stderr, "[vulkan] far LOD upload failed: %s\n",
+                   error.c_str());
+    }
+    m_farPendingReady = false;
+    return;
+  }
+
+  // Recenter when the camera strays too far from the active field's center
+  // (quarter of the radius, >= 4 chunks). The old field keeps rendering
+  // until the new one is uploaded.
+  if (!m_farBuildRunning.load()) {
+    const int32_t threshold = std::max<int32_t>(
+        4, static_cast<int32_t>(m_voxelConfig.farLodRadiusChunks) / 4);
+    const int32_t dx = centerChunkX - m_farCenterChunkX;
+    const int32_t dz = centerChunkZ - m_farCenterChunkZ;
+    const bool needsRebuild = !m_farFieldActive ||
+                              std::abs(dx) > threshold ||
+                              std::abs(dz) > threshold;
+    if (needsRebuild) {
+      launchFarFieldBuild(centerChunkX, centerChunkZ);
+    }
   }
 }
 
@@ -336,11 +430,13 @@ glm::vec3 VulkanRenderer::spawnPosition() const {
 std::string VulkanRenderer::debugStats() const {
   const auto& cfg = m_voxelConfig;
   const float cut = 1.0f / std::max(m_fogDensity, 1e-9f);
-  char buf[256];
+  char buf[288];
   std::snprintf(buf, sizeof(buf),
-                "fogCut=%.0fu fog=%.5f steps=%u skyCeil=%d region=%ux%u@(%d,%d)"
-                " slots=%zu/%llu",
+                "fogCut=%.0fu fog=%.5f steps=%u skyCeil=%d far=%s(%ux%u@%d,%d)"
+                " region=%ux%u@(%d,%d) slots=%zu/%llu",
                 cut, m_fogDensity, cfg.maxTraceSteps, m_maxTerrainVoxelY,
+                m_farFieldActive ? "on" : (m_farBuildRunning.load() ? "building" : "off"),
+                m_farDim, m_farDim, m_farCenterChunkX, m_farCenterChunkZ,
                 cfg.gridWidth(), cfg.gridHeight(), m_regionCenter.x,
                 m_regionCenter.z, m_slotOf.size(),
                 static_cast<unsigned long long>(cfg.slotCount()));
@@ -348,34 +444,43 @@ std::string VulkanRenderer::debugStats() const {
 }
 
 float VulkanRenderer::fogCutDistance() const {
-  // The loaded region is a box around the camera's chunk; the camera can be
-  // anywhere inside that (center) chunk, so its distance to the nearest side
-  // face lies in [radius * chunkExtent, (radius + 1) * chunkExtent]. Cutting
-  // rays (and reaching 99.8% fog) exactly at the NEAREST side-face distance
-  // is what makes the box invisible: any ray's region exit happens at >= the
-  // perpendicular distance to the face it crosses, which is >= this value,
-  // i.e. always in fully-opaque fog. (Top face: no terrain exists above
-  // worldHeight, so sky there is correct. Bottom face: y=0 is solid bedrock
-  // everywhere, so no ray can exit through it.)
+  // The fog cut must make the boundary of whatever the ray can possibly
+  // reach invisible. With the far-LOD field active that boundary is the FAR
+  // box (the near-region boundary is hidden geometrically: the far field
+  // continues the same terrain beyond it); without it, the near-region box
+  // as before. Cut = distance from the camera to the nearest side face; any
+  // ray's box exit lies at >= that perpendicular distance, i.e. in >= 99.8%
+  // fog.
   const auto& cfg = m_voxelConfig;
-  const int32_t originX =
-      m_regionCenter.x - static_cast<int32_t>(cfg.renderRadiusChunks);
-  const int32_t originZ =
-      m_regionCenter.z - static_cast<int32_t>(cfg.renderRadiusChunks);
   const float chunkWorldX =
       static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
   const float chunkWorldZ =
       static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
-  const float x0 = static_cast<float>(originX) * chunkWorldX;
-  const float x1 = x0 + static_cast<float>(cfg.gridWidth()) * chunkWorldX;
-  const float z0 = static_cast<float>(originZ) * chunkWorldZ;
-  const float z1 = z0 + static_cast<float>(cfg.gridHeight()) * chunkWorldZ;
+
+  float x0, x1, z0, z1;
+  if (m_farFieldActive) {
+    x0 = static_cast<float>(m_farOriginVoxX) * cfg.voxelSize.x;
+    x1 = x0 + static_cast<float>(m_farDim) * static_cast<float>(m_farCell) *
+                  cfg.voxelSize.x;
+    z0 = static_cast<float>(m_farOriginVoxZ) * cfg.voxelSize.z;
+    z1 = z0 + static_cast<float>(m_farDim) * static_cast<float>(m_farCell) *
+                  cfg.voxelSize.z;
+  } else {
+    const int32_t originX =
+        m_regionCenter.x - static_cast<int32_t>(cfg.renderRadiusChunks);
+    const int32_t originZ =
+        m_regionCenter.z - static_cast<int32_t>(cfg.renderRadiusChunks);
+    x0 = static_cast<float>(originX) * chunkWorldX;
+    x1 = x0 + static_cast<float>(cfg.gridWidth()) * chunkWorldX;
+    z0 = static_cast<float>(originZ) * chunkWorldZ;
+    z1 = z0 + static_cast<float>(cfg.gridHeight()) * chunkWorldZ;
+  }
 
   const glm::vec3 pos = m_camera.position();
   const float dx = std::min(pos.x - x0, x1 - pos.x);
   const float dz = std::min(pos.z - z0, z1 - pos.z);
   // Floor of one chunk extent guards the (transient) case of the camera
-  // being outside the region after a failed region rebuild.
+  // being outside the box after a failed region rebuild.
   const float floorDist = std::min(chunkWorldX, chunkWorldZ);
   return std::clamp(std::min(dx, dz), floorDist, 1e9f);
 }
@@ -744,13 +849,19 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   heightBinding.descriptorCount = 1;
   heightBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  VkDescriptorSetLayoutBinding farBinding{};
+  farBinding.binding = 6;
+  farBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  farBinding.descriptorCount = 1;
+  farBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
-      paletteBinding, heightBinding};
+      paletteBinding, heightBinding, farBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 6;
+  info.bindingCount = 7;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -822,6 +933,11 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   if (!rebuildChunkRegion(0, 0, outError)) {
     return false;
   }
+
+  // Kick off the first far-LOD build on the background thread (~1M noise
+  // evaluations at the default radius; renders start immediately with the
+  // fog wall at the near-region boundary until the field pops in).
+  launchFarFieldBuild(0, 0);
 
   // Safety net above the fog cut: the budget must never bind before the fog
   // does. Worst case a ray crosses ~sqrt(3) cells per unit of distance; the
@@ -1031,8 +1147,8 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[2] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 5;  // voxel atlas, output, chunk table,
-                                     // palette, column heights
+  poolSizes[0].descriptorCount = 6;  // voxel atlas, output, chunk table,
+                                     // palette, column heights, far LOD
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
 
@@ -1093,7 +1209,12 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   heightInfo.offset = 0;
   heightInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[6] = {};
+  VkDescriptorBufferInfo farInfo{};
+  farInfo.buffer = m_voxelResources.farBuffer();
+  farInfo.offset = 0;
+  farInfo.range = VK_WHOLE_SIZE;
+
+  VkWriteDescriptorSet writes[7] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -1136,7 +1257,14 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[5].pBufferInfo = &heightInfo;
 
-  vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
+  writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[6].dstSet = m_descriptorSet;
+  writes[6].dstBinding = 6;
+  writes[6].descriptorCount = 1;
+  writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[6].pBufferInfo = &farInfo;
+
+  vkUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
   return true;
 }
 
@@ -1329,6 +1457,15 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   push.grid = glm::uvec4(m_voxelConfig.gridWidth(), m_voxelConfig.gridHeight(),
                          static_cast<uint32_t>(m_voxelResources.slotWordStride()),
                          static_cast<uint32_t>(m_maxTerrainVoxelY));
+  if (m_farFieldActive) {
+    push.far = glm::ivec4(m_farOriginVoxX, m_farOriginVoxZ,
+                          static_cast<int32_t>(m_farDim),
+                          static_cast<int32_t>(m_farDim));
+    push.farParams = glm::vec4(static_cast<float>(m_farCell), 0.0f, 0.0f, 0.0f);
+  } else {
+    push.far = glm::ivec4(0, 0, 0, 0);  // z = 0: far LOD off in the shader
+    push.farParams = glm::vec4(0.0f);
+  }
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(push), &push);
 

@@ -2,9 +2,11 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +14,7 @@
 #include "platform/NativeWindow.hpp"
 #include "render/LightingConfig.hpp"
 #include "render/SceneUniform.hpp"
+#include "terrain/FarField.hpp"
 #include "voxel/VoxelConfig.hpp"
 #include "voxel/World.hpp"
 #include "vulkan/VoxelResources.hpp"
@@ -43,6 +46,12 @@ class VulkanRenderer final {
   // Keeps the GPU chunk region centered on the camera. Cheap no-op unless the
   // camera crossed a chunk boundary; call every frame before drawFrame().
   void updateWorld(const glm::vec3& cameraPosition);
+
+  // Far-LOD field lifecycle: launches background builds when the camera
+  // strays too far from the active field, and uploads finished builds.
+  // Called from updateWorld; needs the queue for uploads.
+  void ensureFarField(int32_t centerChunkX, int32_t centerChunkZ);
+  void launchFarFieldBuild(int32_t centerChunkX, int32_t centerChunkZ);
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
@@ -181,6 +190,29 @@ class VulkanRenderer final {
   // (diagnoses aliasing/moire). Both default off.
   bool m_debugTerminators = false;
   bool m_debugSuperSample = false;
+
+  // --- Far-LOD field (background build + upload state) ---
+  // The builder thread only touches m_farPending (sole ownership until
+  // m_farPendingReady flips to true) and reads the const terrain generator;
+  // the main thread joins it in cleanup() before the world is destroyed.
+  std::thread m_farThread;
+  std::atomic<bool> m_farBuildRunning{false};
+  std::atomic<bool> m_farPendingReady{false};
+  vv::terrain::FarField m_farPending;
+  // Chunk the in-flight build is centered on (becomes the active center on
+  // upload).
+  std::int32_t m_farPendingCenterX = 0;
+  std::int32_t m_farPendingCenterZ = 0;
+  // Active (uploaded) field geometry: origin in voxels, cell count and
+  // footprint; valid only while m_farFieldActive.
+  std::int32_t m_farOriginVoxX = 0;
+  std::int32_t m_farOriginVoxZ = 0;
+  std::uint32_t m_farDim = 0;
+  std::uint32_t m_farCell = 0;
+  bool m_farFieldActive = false;
+  // Chunk the active field is centered on (recenter decision).
+  std::int32_t m_farCenterChunkX = 0;
+  std::int32_t m_farCenterChunkZ = 0;
 
   // Upper bound on terrain height (voxels); rays above it can never hit.
   std::int32_t m_maxTerrainVoxelY = 0;

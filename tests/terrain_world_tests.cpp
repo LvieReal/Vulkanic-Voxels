@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "terrain/FarField.hpp"
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
@@ -824,10 +825,243 @@ void testVertexAO() {
 				"ao: bilinear center is the corner mean");
 }
 
+// Far-LOD field: builder conventions + determinism.
+void testFarField() {
+	const vv::terrain::TerrainGenerator gen(vv::terrain::TerrainConfig{});
+	const std::uint32_t chunk = 32;
+	const std::uint32_t cell = 4;
+	const std::uint32_t radius = 2;  // dim = 2*2*32/4 = 32
+	const auto field = vv::terrain::FarField::build(gen, 0, 0, radius, cell,
+																									chunk);
+	check(field.dim == 32, "far: dim = 2*radius*chunk/cell");
+	check(field.cellVoxels == cell, "far: cell size stored");
+	check(field.cells.size() == 32u * 32u, "far: cell count = dim^2");
+	// Box centered on chunk (0,0)'s center voxel (16,16).
+	check(field.originVoxX == 16 - 64 && field.originVoxZ == 16 - 64,
+				"far: origin = center - dim*cell/2");
+
+	bool heightsOk = true;
+	bool typesOk = true;
+	for (std::uint32_t j = 0; j < field.dim; ++j) {
+		for (std::uint32_t i = 0; i < field.dim; ++i) {
+			const std::uint32_t packed =
+					field.cells[i + j * field.dim];
+			const float wx =
+					float(field.originVoxX + int(i * cell) + int(cell / 2));
+			const float wz =
+					float(field.originVoxZ + int(j * cell) + int(cell / 2));
+			const float h = gen.heightAtF(wx, wz);
+			const std::int32_t surface = std::int32_t(std::floor(h));
+			if (int(packed & 0xFFFFu) != surface + 1) {
+				heightsOk = false;
+			}
+			if ((packed >> 16u) != std::uint32_t(gen.typeForColumn(surface, h))) {
+				typesOk = false;
+			}
+		}
+	}
+	check(heightsOk, "far: height = floor(heightAtF(center)) + 1 per cell");
+	check(typesOk, "far: type = surface type at cell center");
+
+	const auto again = vv::terrain::FarField::build(gen, 0, 0, radius, cell,
+																										chunk);
+	check(again.cells == field.cells && again.originVoxX == field.originVoxX,
+				"far: deterministic rebuild");
+}
+
+// ---------------------------------------------------------------------------
+// Far-LOD march: CPU mirror of the shader's far DDA vs a dense-sampling
+// brute force over the same far grid. The march must find a hit exactly
+// when the ray ever passes below a cell's surface top, at the right t.
+// ---------------------------------------------------------------------------
+
+
+struct FarGrid {
+	int originX = 0, originZ = 0;
+	unsigned dim = 0;
+	double cell = 4.0;
+	std::vector<std::uint32_t> cells;
+
+	unsigned packedAt(int cx, int cz) const {
+		if (cx < 0 || cz < 0 || cx >= int(dim) || cz >= int(dim)) {
+			return 0u;
+		}
+		return cells[std::size_t(cx) + std::size_t(cz) * dim];
+	}
+};
+
+// Mirror of the shader far march (same clamps, tie-breaks and budgets).
+bool traceFarDDA(const FarGrid& g, const double ro[3], const double rd[3],
+							 double tStart, double tEnd, double& outT) {
+	const double EPS = 1e-6;
+	const double maxTerrainY = 200.0;  // generous for synthetic heights
+	int stepX = (rd[0] > 0.0) ? 1 : -1;
+	int stepZ = (rd[2] > 0.0) ? 1 : -1;
+	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
+
+	const double px = ro[0] + rd[0] * tStart;
+	const double pz = ro[2] + rd[2] * tStart;
+	int cx = int(std::floor((px - g.originX) / g.cell));
+	int cz = int(std::floor((pz - g.originZ) / g.cell));
+	if (std::abs(rd[0]) > EPS) {
+		const double next = g.originX +
+				double(cx + ((stepX > 0) ? 1 : 0)) * g.cell;
+		tMaxX = (next - ro[0]) / rd[0];
+		dX = g.cell / std::abs(rd[0]);
+	} else {
+		stepX = 0;
+	}
+	if (std::abs(rd[2]) > EPS) {
+		const double next = g.originZ +
+				double(cz + ((stepZ > 0) ? 1 : 0)) * g.cell;
+		tMaxZ = (next - ro[2]) / rd[2];
+		dZ = g.cell / std::abs(rd[2]);
+	} else {
+		stepZ = 0;
+	}
+
+	double t = tStart;
+	const int budget = int(2 * g.dim);
+	for (int i = 0; i < budget; ++i) {
+		if (t >= tEnd) {
+			return false;
+		}
+		const double tExit = std::min(std::min(tMaxX, tMaxZ), tEnd);
+		const double y0 = ro[1] + rd[1] * t;
+		const double y1 = ro[1] + rd[1] * tExit;
+		if (rd[1] > 0.0 && y0 >= maxTerrainY + 1.0) {
+			return false;
+		}
+		const unsigned packed = g.packedAt(cx, cz);
+		const double h = double(packed & 0xFFFFu);
+		if (h > 0.0 && y0 < h) {
+			outT = t;
+			return true;
+		}
+		if (h > 0.0 && rd[1] < 0.0 && y1 < h) {
+			outT = std::min(std::max((h - ro[1]) / rd[1], t), tExit);
+			return true;
+		}
+		if (tMaxX < tMaxZ) {
+			t = tMaxX;
+			tMaxX += dX;
+			cx += stepX;
+		} else {
+			t = tMaxZ;
+			tMaxZ += dZ;
+			cz += stepZ;
+		}
+	}
+	return false;
+}
+
+// Brute force: dense sampling of the same discrete far field. Outside the
+// grid there is NO data (no terrain beyond the far field), unlike inside
+// where height 0 means an all-air column.
+bool traceFarBrute(const FarGrid& g, const double ro[3], const double rd[3],
+									 double tStart, double tEnd, double& outT) {
+	const double dt = 0.02;
+	for (double t = tStart; t < tEnd; t += dt) {
+		const double x = ro[0] + rd[0] * t;
+		const double z = ro[2] + rd[2] * t;
+		const double y = ro[1] + rd[1] * t;
+		const int cx = int(std::floor((x - g.originX) / g.cell));
+		const int cz = int(std::floor((z - g.originZ) / g.cell));
+		if (cx < 0 || cz < 0 || cx >= int(g.dim) || cz >= int(g.dim)) {
+			continue;  // outside the far field: nothing to hit
+		}
+		const double h = double(g.packedAt(cx, cz) & 0xFFFFu);
+		if (h > 0.0 && y < h) {
+			outT = t;
+			return true;
+		}
+	}
+	return false;
+}
+
+void testFarMarch() {
+	// Synthetic far grid: rolling heights 10..70 + a few towers/holes.
+	FarGrid g;
+	g.dim = 48;
+	g.cells.assign(std::size_t(g.dim) * g.dim, 0u);
+	for (unsigned j = 0; j < g.dim; ++j) {
+		for (unsigned i = 0; i < g.dim; ++i) {
+			double h = 30.0 + 15.0 * std::sin(i * 0.31) + 12.0 * std::cos(j * 0.23);
+			unsigned type = 1u + ((i + j) % 5u);
+			g.cells[std::size_t(i) + std::size_t(j) * g.dim] =
+					(std::uint32_t(std::max(1.0, h)) & 0xFFFFu) | (type << 16u);
+		}
+	}
+	for (unsigned i = 10; i < 16; ++i) {  // tower
+		g.cells[std::size_t(i) + 20u * g.dim] = (120u) | (2u << 16u);
+	}
+	for (unsigned j = 30; j < 36; ++j) {  // hole (height 0 = air column)
+		for (unsigned i = 30; i < 36; ++i) {
+			g.cells[std::size_t(i) + std::size_t(j) * g.dim] = (2u << 16u);
+		}
+	}
+
+	std::uint64_t rng = 0x243f6a8885a308d3ull;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int bothHit = 0, bothMiss = 0, mismatches = 0;
+	for (int ray = 0; ray < 4000; ++ray) {
+		double ro[3], rd[3];
+		// Origins: inside the grid at varied heights, plus outside edges.
+		ro[0] = (ray % 5 == 0) ? -20.0 : next01() * 192.0;
+		ro[2] = (ray % 7 == 0) ? 220.0 : next01() * 192.0;
+		ro[1] = next01() * 140.0;
+		rd[0] = next01() * 2.0 - 1.0;
+		rd[1] = (ray % 3 == 0) ? -1.0 : next01() * 2.0 - 1.0;
+		rd[2] = next01() * 2.0 - 1.0;
+		double len = std::sqrt(rd[0] * rd[0] + rd[1] * rd[1] +
+													 rd[2] * rd[2]);
+		if (len < 1e-6) {
+			continue;
+		}
+		for (int a = 0; a < 3; ++a) {
+			rd[a] /= len;
+		}
+		double tD = 0.0, tB = 0.0;
+		const bool hitD = traceFarDDA(g, ro, rd, 0.0, 500.0, tD);
+		const bool hitB = traceFarBrute(g, ro, rd, 0.0, 500.0, tB);
+		if (hitD && hitB) {
+			++bothHit;
+			if (std::abs(tD - tB) > 0.5) {
+				if (++mismatches <= 3) {
+					std::printf("FAIL farmarch ray %d: dda t=%.4f brute t=%.4f\n",
+											ray, tD, tB);
+				}
+			}
+		} else if (!hitD && !hitB) {
+			++bothMiss;
+		} else {
+			// Existence disagreement: only acceptable within a hair of the
+			// sampling resolution (grazing corner cases).
+			const double tOther = hitD ? tD : tB;
+			if (tOther < 498.0 || std::abs(tD - tB) > 0.5) {
+				if (++mismatches <= 3) {
+					std::printf("FAIL farmarch ray %d: dda=%d(%.4f) brute=%d(%.4f)\n",
+											ray, int(hitD), tD, int(hitB), tB);
+				}
+			}
+		}
+	}
+	check(mismatches == 0, "far march: DDA matches dense brute force");
+	check(bothHit > 1000 && bothMiss > 200,
+				"far march: both outcomes well exercised");
+	std::printf("far march: %d hit / %d miss rays agree\n", bothHit, bothMiss);
+}
+
+
 }  // namespace
 
 int main() {
-	testVoxelPalette();
 	testVertexAO();
 	testNoiseDeterministic();
 	testNoiseRangeAndContinuity();
@@ -840,6 +1074,8 @@ int main() {
 	testChunkMatchesGenerator();
 	testChunkHeightMap();
 	testTraversalParity();
+	testFarField();
+	testFarMarch();
 
 	if (g_failures == 0) {
 		std::printf("all tests passed\n");

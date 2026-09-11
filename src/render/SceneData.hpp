@@ -14,7 +14,13 @@ struct PushConstants final {
 	glm::vec4 voxelSize{};  // xyz=voxel size in world units
 	glm::ivec4 region{};    // x,z = region origin (min corner) in chunk coords
 	glm::uvec4 grid{};      // x=gridWidth, y=gridHeight, z=slot stride (words), w=max terrain voxel y (sky-skip)
+	glm::ivec4 far{};       // x,y = far-LOD field min corner (voxel X/Z), z,w = cell dims (z=0 = far LOD off)
+	glm::vec4 farParams{};  // x = far cell footprint in voxels
 };
+
+// The Vulkan spec guarantees at least 128 bytes of push constants; this
+// layout must also match the Push block in pixels_rgba.comp exactly.
+static_assert(sizeof(PushConstants) == 128, "push constant layout grew");
 
 // Uniform buffer updated each frame with camera and lighting.
 struct SceneUBO final {
