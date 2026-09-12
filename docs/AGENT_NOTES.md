@@ -848,6 +848,37 @@ history (08fd680) and can be reintroduced alone if the owner wants.
 **Verified**: shader compiles; Release + Debug warning-free; all tests
 pass; offscreen smoke clean (default + VV_SSAA=1).
 
+### Pass 10: streaming-stutter fix (fence-scoped uploads), SSAA removed
+
+First pass of the one-problem-at-a-time plan (owner instruction after
+the pass-9 revert; pass 9 was verified stable: "voxel vibration is
+gone, seams gone").
+
+**Chunk streaming stutter** - root cause: while streaming (every frame
+of a border crossing), the pump used the SYNCHRONOUS upload path:
+vkDeviceWaitIdle (drains up to 2 in-flight frames), a staging buffer
+ALLOCATED AND FREED every frame, and vkQueueWaitIdle. That bundle of
+GPU stalls per frame was the stutter. Fix: uploadChunksStreaming - a
+persistent staging buffer + command buffer + fence created once; each
+pump waits ONLY the previous pump's fence (a frame old, normally
+already signaled). No device/queue waits, no allocator churn. Safety
+is unchanged: streaming only writes spare-ring slots no uploaded table
+references; finishRegionMove's existing full device wait (once per
+crossing) drains the last upload before the table that references it
+goes live. The sync path stays for the initial region, teleports and
+the >2-chunk catch-up. This is the pass-8 upload fix reintroduced
+ALONE - without the early-swap that caused missing chunks.
+Remaining per-frame cost during a crossing: chunk generation (~2.8 ms
+CPU), which is a smooth fps dip, not a hitch.
+
+**SSAA removed** (owner: "too heavy"): VV_SSAA / VV_DEBUG_SSAA no
+longer exist; the shader traces exactly one ray per pixel through the
+pixel center. The 4-sample rotated-grid branch, the misc.z flag and
+the renderer's m_debugSuperSample are gone. VV_DEBUG_TERM remains.
+
+**Verified**: shader compiles; Release + Debug warning-free; all tests
+pass; offscreen smoke clean (VV_SSAA now silently ignored).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -869,7 +900,12 @@ pass; offscreen smoke clean (default + VV_SSAA=1).
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 9 — done (pending user verification):**
+**Pass 10 — done (pending user verification):**
+- [x] Streaming stutter: fence-scoped per-chunk uploads (no per-frame
+      device/queue stalls, no staging alloc churn)
+- [x] SSAA removed (VV_SSAA / VV_DEBUG_SSAA gone; 1 ray/pixel)
+
+**Pass 9 — done (user-verified: stable; vibration and seams gone):**
 - [x] Revert to pass-6 streaming behavior (sync fallbacks; no
       early-swap holes)
 - [x] TAA fully removed (no AA by default; VV_SSAA=1 opt-in)

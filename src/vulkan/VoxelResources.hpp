@@ -50,12 +50,26 @@ class VoxelResources final {
 
 	// Batch-uploads chunk data into their slots (single staging buffer + one
 	// one-time submit; waits for the queue so in-flight frames never read a
-	// half-updated atlas). Synchronous - used for the initial region and
+	// half-uploaded atlas). Synchronous - used for the initial region and
 	// genuine teleports.
 	bool uploadChunks(VkDevice device, VkPhysicalDevice physicalDevice,
 										VkCommandPool commandPool, VkQueue queue,
 										const std::vector<ChunkUpload>& uploads,
 										std::string& outError);
+
+	// Streaming upload (one chunk per call): persistent staging buffer +
+	// command buffer + fence; waits ONLY for the previous streaming submit
+	// (a frame old by then) - never the device or queue. The synchronous
+	// path above stalls on vkDeviceWaitIdle + vkQueueWaitIdle every
+	// streaming frame, which read as per-frame stutter during border
+	// crossings; this path removes the stalls.
+	// Safety: only upload slots no uploaded chunk table references (spare
+	// ring); the region table swap (finishRegionMove) drains everything
+	// with its own full device wait before publishing.
+	bool uploadChunksStreaming(VkDevice device, VkPhysicalDevice physicalDevice,
+															VkCommandPool commandPool, VkQueue queue,
+															const ChunkUpload& upload,
+															std::string& outError);
 	// Uploads a freshly built far-LOD field (vv::terrain::FarField::cells)
 	// into the far buffer. Rare (far-field recenters), so a queue idle is
 	// acceptable.
@@ -99,6 +113,15 @@ class VoxelResources final {
 
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;
+
+	// --- Streaming upload path (uploadChunksStreaming) ---
+	VkBuffer m_streamStaging = VK_NULL_HANDLE;
+	VkDeviceMemory m_streamStagingMemory = VK_NULL_HANDLE;
+	void* m_streamStagingMapped = nullptr;
+	VkCommandPool m_streamCommandPool = VK_NULL_HANDLE;
+	VkCommandBuffer m_streamCmd = VK_NULL_HANDLE;
+	VkFence m_streamFence = VK_NULL_HANDLE;
+	bool m_streamFencePending = false;
 	// Uploads the palette built from vv::voxel::kVoxelTypeInfo.
 	bool createPalette(VkDevice device, VkPhysicalDevice physicalDevice,
 										 std::string& outError);

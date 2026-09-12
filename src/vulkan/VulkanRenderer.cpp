@@ -78,18 +78,12 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     return false;
   }
 
-  // Debug visualizations (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
-  // colors each pixel by ray-termination cause; VV_DEBUG_SSAA traces four
-  // jittered rays per pixel (aliasing differential; ~4x compute cost).
+  // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
+  // colors each pixel by ray-termination cause.
   m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
-  m_debugSuperSample = std::getenv("VV_DEBUG_SSAA") != nullptr ||
-                       std::getenv("VV_SSAA") != nullptr;
   if (m_debugTerminators) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
-  }
-  if (m_debugSuperSample) {
-    std::fprintf(stderr, "[vulkan] VV_DEBUG_SSAA: on (4 rays/pixel)\n");
   }
 
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
@@ -139,10 +133,8 @@ void VulkanRenderer::drawFrame() {
   m_fogDensity = 1.0f / fogCutDistance();
 
   // Delegated to SceneUniform utility: updates camera + lighting UBO.
-  m_sceneUniform.update(
-      m_camera, m_timeSeconds, m_lighting,
-      glm::vec2(m_debugTerminators ? 1.0f : 0.0f,
-                m_debugSuperSample ? 1.0f : 0.0f));
+  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
+                         glm::vec2(m_debugTerminators ? 1.0f : 0.0f, 0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -453,34 +445,13 @@ void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
     return;
   }
   const auto start = std::chrono::steady_clock::now();
-  std::vector<vv::vulkan::VoxelResources::ChunkUpload> batch;
-  const auto flushBatch = [this, &batch]() -> bool {
-    if (batch.empty()) {
-      return true;
-    }
-    std::string error;
-    if (!m_voxelResources.uploadChunks(m_device, m_physicalDevice,
-                                       m_commandPool, m_graphicsQueue, batch,
-                                       error)) {
-      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
-                   error.c_str());
-      // Roll back the slot assignments; the coords return to pending.
-      for (const auto& upload : batch) {
-        m_slotOf.erase(vv::voxel::ChunkCoord{upload.chunk->chunkX(),
-                                             upload.chunk->chunkZ()});
-        m_freeSlots.push_back(upload.slot);
-      }
-      batch.clear();
-      return false;
-    }
-    batch.clear();
-    return true;
-  };
 
-  // Hard cap per frame (kStreamChunksPerFrame): one generation + one
-  // upload flush. Pass-9 revert: back to the synchronous upload path
-  // (pass-6 behavior); the pass-8 fence-scoped path is shelved until the
-  // remaining stutter is chased down with the owner's help.
+  // One chunk per frame (kStreamChunksPerFrame) through the FENCE-SCOPED
+  // upload path: no vkDeviceWaitIdle / vkQueueWaitIdle / per-frame staging
+  // allocation (those were the streaming stutter). The upload only touches
+  // spare-ring slots no uploaded table references; finishRegionMove drains
+  // everything with its own device wait before the table swap. The
+  // remaining per-frame cost is the chunk generation itself (~2.8 ms).
   std::size_t streamed = 0;
   while (!m_streamPending.empty() && streamed < kStreamChunksPerFrame) {
     const std::chrono::duration<double> elapsed =
@@ -498,15 +469,18 @@ void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
     m_slotOf[coord] = slot;
-    batch.push_back({slot, chunk});
-    ++streamed;
-    if (!flushBatch()) {
+    std::string error;
+    if (!m_voxelResources.uploadChunksStreaming(
+            m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+            {slot, chunk}, error)) {
+      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
+                   error.c_str());
+      m_slotOf.erase(coord);
+      m_freeSlots.push_back(slot);
       m_streamPending.push_back(coord);
       break;
     }
-  }
-  if (!flushBatch()) {
-    return;  // retried next frame
+    ++streamed;
   }
   if (m_streamPending.empty()) {
     finishRegionMove();
@@ -535,7 +509,9 @@ void VulkanRenderer::finishRegionMove() {
                         cfg.renderRadiusChunks + 1, evicted);
 
   // Build and swap the region table. The device wait guarantees no frame
-  // submitted since the last streaming upload still reads the old table.
+  // submitted since the last streaming upload still reads the old table -
+  // AND that the final fence-scoped streaming upload has fully landed
+  // before the table that references its slot goes live.
   std::vector<uint32_t> table(
       static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight(),
       vv::vulkan::VoxelResources::kEmptySlot);

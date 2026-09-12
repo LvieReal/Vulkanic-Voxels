@@ -38,7 +38,7 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 lightColor;
     vec4 skyLow;
     vec4 skyHigh;
-    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = VV_DEBUG_SSAA
+    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM (z, w unused)
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -887,34 +887,16 @@ void main()
     uint idx = p.y * size.x + p.x;
 
     const bool debugTerm = scene.misc.y > 0.5;
-    const bool superSample = scene.misc.z > 0.5;
 
     // Aspect handling: vertical FOV; the horizontal axis is scaled by the
     // aspect ratio. uv spans [-1, 1] with y flipped (screen y grows down).
-    // To NDC for one sub-pixel sample: ((pixel + 0.5 + offset) / size) * 2-1.
+    // One ray per pixel through the pixel center. (The 4x supersampling
+    // mode was removed in pass 10 - too heavy per the owner; the far LOD
+    // keeps distant edges stable on its own.)
     vec2 uvStep = 2.0 / vec2(size);  // NDC units per pixel
+    vec2 uv = (vec2(p) + vec2(0.5)) * uvStep - 1.0;
+    uv.y = -uv.y;
+    uv.x *= float(size.x) / float(size.y);
 
-    vec3 color = vec3(0.0);
-    if (superSample) {
-        // VV_DEBUG_SSAA: 4 samples per pixel (rotated grid). A diagnostic
-        // for aliasing/moire: if the "noisy pattern" disappears here, it
-        // is sub-pixel aliasing, not a logic bug.
-        const vec2 offsets[4] = vec2[4](
-            vec2(-0.25, -0.25), vec2(0.25, -0.25),
-            vec2(-0.25, 0.25), vec2(0.25, 0.25));
-        for (int s = 0; s < 4; ++s) {
-            vec2 uv = (vec2(p) + vec2(0.5) + offsets[s]) * uvStep - 1.0;
-            uv.y = -uv.y;
-            uv.x *= float(size.x) / float(size.y);
-            color += traceRay(uv, debugTerm);
-        }
-        color *= 0.25;
-    } else {
-        vec2 uv = (vec2(p) + vec2(0.5)) * uvStep - 1.0;
-        uv.y = -uv.y;
-        uv.x *= float(size.x) / float(size.y);
-        color = traceRay(uv, debugTerm);
-    }
-
-    outPixels.outData[idx] = packColor(color);
+    outPixels.outData[idx] = packColor(traceRay(uv, debugTerm));
 }

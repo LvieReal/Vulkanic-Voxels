@@ -25,8 +25,7 @@ class SceneUniform final {
   void cleanup(VkDevice device);
 
   // debugFlags: x = termination-cause visualization (VV_DEBUG_TERM),
-  // y = 4x supersampling (VV_DEBUG_SSAA); both land in SceneUBO.misc.yz,
-  // which the shader consumes. Defaults keep the plain path.
+  // landing in SceneUBO.misc.y (y kept for layout stability, unused).
   void update(const vv::core::Camera& camera, float timeSeconds,
               const LightingConfig& lighting,
               const glm::vec2& debugFlags = glm::vec2(0.0f));

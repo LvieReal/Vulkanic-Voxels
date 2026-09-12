@@ -301,6 +301,121 @@ bool VoxelResources::uploadChunks(VkDevice device,
 	return true;
 }
 
+bool VoxelResources::uploadChunksStreaming(
+		VkDevice device, VkPhysicalDevice physicalDevice,
+		VkCommandPool commandPool, VkQueue queue, const ChunkUpload& upload,
+		std::string& outError) {
+	if (upload.chunk == nullptr || upload.slot >= m_slotCount) {
+		outError = "Invalid streaming chunk upload request.";
+		return false;
+	}
+	if (upload.chunk->heightMapWordStride() != m_heightSlotWords) {
+		outError = "Chunk heightmap stride does not match the atlas.";
+		return false;
+	}
+
+	// Lazily create the persistent staging (exactly one chunk's worth:
+	// voxel bytes + height words), command buffer and fence.
+	if (m_streamStaging == VK_NULL_HANDLE) {
+		const VkDeviceSize bytes = static_cast<VkDeviceSize>(m_slotByteStride) +
+				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+		if (!utils::createBuffer(device, physicalDevice, bytes,
+														 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+																 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+														 m_streamStaging, m_streamStagingMemory,
+														 outError)) {
+			return false;
+		}
+		VkResult r = vkMapMemory(device, m_streamStagingMemory, 0, VK_WHOLE_SIZE, 0,
+														 &m_streamStagingMapped);
+		if (r != VK_SUCCESS || m_streamStagingMapped == nullptr) {
+			outError = "Failed to map streaming staging memory.";
+			return false;
+		}
+		VkCommandBufferAllocateInfo alloc{};
+		alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		alloc.commandPool = commandPool;
+		alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		alloc.commandBufferCount = 1;
+		r = vkAllocateCommandBuffers(device, &alloc, &m_streamCmd);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to allocate streaming command buffer.";
+			return false;
+		}
+		m_streamCommandPool = commandPool;
+		VkFenceCreateInfo fence{};
+		fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+		r = vkCreateFence(device, &fence, nullptr, &m_streamFence);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to create streaming upload fence.";
+			return false;
+		}
+	}
+
+	// Wait for the PREVIOUS streaming submit only (not the device/queue):
+	// by the next frame it is long done, so this normally costs nothing.
+	if (m_streamFencePending) {
+		vkWaitForFences(device, 1, &m_streamFence, VK_TRUE, UINT64_MAX);
+		vkResetFences(device, 1, &m_streamFence);
+		m_streamFencePending = false;
+	}
+
+	// Staging layout: [voxel bytes][heightmap words].
+	const auto& types = upload.chunk->voxelTypes();
+	std::memcpy(m_streamStagingMapped, types.data(), types.size());
+	const auto& heights = upload.chunk->heightMapWords();
+	std::memcpy(static_cast<std::uint8_t*>(m_streamStagingMapped) +
+								static_cast<std::size_t>(m_slotByteStride),
+							heights.data(), heights.size() * sizeof(std::uint32_t));
+
+	VkResult r = vkResetCommandBuffer(m_streamCmd, 0);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to reset streaming command buffer.";
+		return false;
+	}
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	r = vkBeginCommandBuffer(m_streamCmd, &begin);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to begin streaming command buffer.";
+		return false;
+	}
+	// Two SEPARATE copy commands (voxels -> voxel atlas, heights -> height
+	// atlas): one vkCmdCopyBuffer must never span destination buffers.
+	VkBufferCopy voxelRegion{};
+	voxelRegion.size = static_cast<VkDeviceSize>(m_slotByteStride);
+	voxelRegion.dstOffset =
+			static_cast<VkDeviceSize>(upload.slot) * m_slotByteStride;
+	vkCmdCopyBuffer(m_streamCmd, m_streamStaging, m_voxelBuffer, 1, &voxelRegion);
+	VkBufferCopy heightRegion{};
+	heightRegion.srcOffset = static_cast<VkDeviceSize>(m_slotByteStride);
+	heightRegion.size = static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+	heightRegion.dstOffset = static_cast<VkDeviceSize>(upload.slot) *
+														static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+	vkCmdCopyBuffer(m_streamCmd, m_streamStaging, m_heightBuffer, 1,
+									&heightRegion);
+	r = vkEndCommandBuffer(m_streamCmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to end streaming command buffer.";
+		return false;
+	}
+
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &m_streamCmd;
+	r = vkQueueSubmit(queue, 1, &submit, m_streamFence);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit streaming chunk upload.";
+		return false;
+	}
+	m_streamFencePending = true;
+	return true;
+}
+
 bool VoxelResources::uploadFarField(
 		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
 		VkQueue queue, const std::vector<std::uint32_t>& cells,
@@ -408,6 +523,28 @@ bool VoxelResources::writeChunkTable(
 }
 
 void VoxelResources::cleanup(VkDevice device) {
+	if (m_streamFence != VK_NULL_HANDLE) {
+		vkDestroyFence(device, m_streamFence, nullptr);
+		m_streamFence = VK_NULL_HANDLE;
+	}
+	if (m_streamCmd != VK_NULL_HANDLE && m_streamCommandPool != VK_NULL_HANDLE) {
+		vkFreeCommandBuffers(device, m_streamCommandPool, 1, &m_streamCmd);
+		m_streamCmd = VK_NULL_HANDLE;
+	}
+	m_streamCommandPool = VK_NULL_HANDLE;
+	if (m_streamStagingMapped != nullptr) {
+		vkUnmapMemory(device, m_streamStagingMemory);
+		m_streamStagingMapped = nullptr;
+	}
+	if (m_streamStaging != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_streamStaging, nullptr);
+		m_streamStaging = VK_NULL_HANDLE;
+	}
+	if (m_streamStagingMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_streamStagingMemory, nullptr);
+		m_streamStagingMemory = VK_NULL_HANDLE;
+	}
+	m_streamFencePending = false;
 	if (m_mappedTable != nullptr && m_chunkTableMemory != VK_NULL_HANDLE) {
 		vkUnmapMemory(device, m_chunkTableMemory);
 		m_mappedTable = nullptr;

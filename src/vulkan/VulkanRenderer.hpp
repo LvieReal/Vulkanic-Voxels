@@ -214,11 +214,10 @@ class VulkanRenderer final {
   std::vector<vv::voxel::ChunkCoord> m_streamPending;
   float m_fogDensity = 0.01f;
 
-  // Debug visualizations (see AGENT_NOTES): VV_DEBUG_TERM colors each pixel
-  // by ray-termination cause, VV_DEBUG_SSAA traces 4 jittered rays per pixel
-  // (diagnoses aliasing/moire). Both default off.
+  // Debug visualization (see AGENT_NOTES): VV_DEBUG_TERM colors each pixel
+  // by ray-termination cause. Default off. (VV_DEBUG_SSAA / VV_SSAA were
+  // removed in pass 10 - supersampling was too heavy.)
   bool m_debugTerminators = false;
-  bool m_debugSuperSample = false;
 
 
   // --- Far-LOD field (background build + upload state) ---
