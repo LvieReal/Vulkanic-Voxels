@@ -62,26 +62,6 @@ bool extensionSupported(const char* name,
                      });
 }
 
-// Halton low-discrepancy sequence for the TAA sub-pixel jitter (8-point
-// (2,3) sequence, amplitude 3/4 of a pixel - full-pixel amplitude shows as
-// edge crawl on hard voxel silhouettes at alpha 0.1).
-float halton(std::uint32_t index, std::uint32_t base) {
-  float f = 1.0f;
-  float r = 0.0f;
-  while (index > 0) {
-    f /= static_cast<float>(base);
-    r += f * static_cast<float>(index % base);
-    index /= base;
-  }
-  return r;
-}
-
-glm::vec2 taaJitterForFrame(std::uint32_t frameCounter) {
-  const std::uint32_t i = frameCounter % 8u + 1u;
-  return (glm::vec2(halton(i, 2u), halton(i, 3u)) - glm::vec2(0.5f)) *
-         0.75f;
-}
-
 }  // namespace
 
 VulkanRenderer::~VulkanRenderer() {
@@ -104,15 +84,6 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
   m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
   m_debugSuperSample = std::getenv("VV_DEBUG_SSAA") != nullptr ||
                        std::getenv("VV_SSAA") != nullptr;
-  // TAA is the default AA (pass 6): one jittered ray per pixel + temporal
-  // accumulation. VV_TAA=0 falls back to the plain un-jittered path.
-  m_taaEnabled = true;
-  if (const char* taaEnv = std::getenv("VV_TAA")) {
-    m_taaEnabled = std::strcmp(taaEnv, "0") != 0;
-    std::fprintf(stderr, "[vulkan] VV_TAA: %s (1 jittered ray/pixel + "
-                         "history blend; 0 = off)\n",
-                 m_taaEnabled ? "on" : "off");
-  }
   if (m_debugTerminators) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
@@ -167,37 +138,11 @@ void VulkanRenderer::drawFrame() {
   // rays at 1/fogDensity and is 99.8% opaque there.
   m_fogDensity = 1.0f / fogCutDistance();
 
-  // TAA inputs: this frame's sub-pixel jitter plus the camera that rendered
-  // the history this frame reads (ring slot (N-2)%4 - fully retired by the
-  // in-flight fence). History stays unread for a few frames after a
-  // (re)allocation until the whole ring has been rewritten.
-  const bool taaActive =
-      m_taaEnabled && !m_debugTerminators && !m_debugSuperSample;
-  const std::uint32_t taaFrame = m_frameCounter;
-  const glm::vec2 taaJitter = taaJitterForFrame(taaFrame);
-  vv::render::TaaData taaData{};
-  if (taaActive) {
-    if (m_taaResetCountdown > 0) {
-      --m_taaResetCountdown;
-      taaData.taa = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
-      taaData.taaJitter = glm::vec4(taaJitter, 0.0f, 0.0f);
-    } else {
-      const TaaRingEntry& hist = m_taaRing[(taaFrame + 2u) % 4u];
-      taaData.prevCamPos = glm::vec4(hist.pos, 0.0f);
-      taaData.prevCamForward = glm::vec4(hist.forward, 0.0f);
-      taaData.prevCamRight = glm::vec4(hist.right, 0.0f);
-      taaData.prevCamUp = glm::vec4(hist.up, 0.0f);
-      taaData.taa = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);
-      taaData.taaJitter = glm::vec4(taaJitter, hist.jitter);
-    }
-  }
-
   // Delegated to SceneUniform utility: updates camera + lighting UBO.
   m_sceneUniform.update(
       m_camera, m_timeSeconds, m_lighting,
       glm::vec2(m_debugTerminators ? 1.0f : 0.0f,
-                m_debugSuperSample ? 1.0f : 0.0f),
-      taaData);
+                m_debugSuperSample ? 1.0f : 0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -262,17 +207,6 @@ void VulkanRenderer::drawFrame() {
     setDeviceLost("vkQueuePresentKHR failed (" +
                   utils::vkResultToString(present) + ").");
     return;
-  }
-
-  // Record this frame's camera + jitter into its ring slot (only after a
-  // successful submit - early-returned frames never wrote the history).
-  if (taaActive) {
-    TaaRingEntry& entry = m_taaRing[taaFrame % 4u];
-    entry.pos = m_camera.position();
-    entry.forward = m_camera.forward();
-    entry.right = m_camera.right();
-    entry.up = m_camera.up();
-    entry.jitter = taaJitter;
   }
 
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
@@ -406,19 +340,30 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       rebuildStreamPending();
       const std::size_t needed = m_streamPending.size();
       if (needed > m_freeSlots.size()) {
-        handleStreamOverflow(chunkX, chunkZ);
+        // Too far for the spare ring (teleport-scale): fall back to the
+        // synchronous rebuild.
+        m_streamActive = false;
+        m_streamPending.clear();
+        std::string error;
+        if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+          std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                       error.c_str());
+        }
       } else if (m_streamPending.empty()) {
         finishRegionMove();
       }
-    }
-    // Fast cameras no longer trigger a synchronous catch-up: the old
-    // fallback (rebuild the whole region at once when the camera ran more
-    // than 2 chunks ahead of the active center) was the multi-second
-    // stutter - at ~3 ms/chunk it generated dozens of chunks in one frame.
-    // Streaming now ALWAYS proceeds at the per-frame cap and re-aims as
-    // the target moves; the trailing edge of the old region is covered by
-    // the far-LOD field until the table swaps.
-    if (m_streamActive) {
+    } else if (std::abs(chunkX - m_regionCenter.x) > 2 ||
+               std::abs(chunkZ - m_regionCenter.z) > 2) {
+      // Streaming cannot keep up with a fast camera: catch up
+      // synchronously (pass-6 behavior, restored by the pass-9 revert).
+      m_streamActive = false;
+      m_streamPending.clear();
+      std::string error;
+      if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+        std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                     error.c_str());
+      }
+    } else {
       pumpRegionStreaming(kStreamBudgetMs);
     }
     ensureFarField(chunkX, chunkZ);
@@ -445,7 +390,13 @@ void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
     return;
   }
   if (m_streamPending.size() > m_freeSlots.size()) {
-    handleStreamOverflow(targetChunkX, targetChunkZ);
+    // Not enough spare slots (teleport-scale move): synchronous rebuild.
+    m_streamPending.clear();
+    std::string error;
+    if (!rebuildChunkRegion(targetChunkX, targetChunkZ, error)) {
+      std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                   error.c_str());
+    }
     return;
   }
   m_streamActive = true;
@@ -497,48 +448,39 @@ void VulkanRenderer::rebuildStreamPending() {
             });
 }
 
-// The camera outran the 1-chunk-per-frame stream and the spare ring cannot
-// hold both region edges. A full synchronous rebuild here was the
-// multi-second sprint freeze (hundreds of ~3 ms generations in one frame).
-// Instead: a TRUE teleport (most of the region missing) still rebuilds
-// synchronously - it beats tens of seconds of far-LOD-only world - but an
-// ordinary overrun EARLY-SWAPS the table to the target with the
-// not-yet-streamed chunks as empty cells. Those were the lowest-priority
-// pending items (behind/beside the camera); the far LOD renders the same
-// terrain through the holes, and they re-enter the pending set on the next
-// border crossing, so they self-heal.
-void VulkanRenderer::handleStreamOverflow(int32_t chunkX, int32_t chunkZ) {
-  const auto& cfg = m_voxelConfig;
-  const std::size_t regionChunks =
-      static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight();
-  if (m_streamPending.size() > regionChunks / 2) {
-    m_streamActive = false;
-    m_streamPending.clear();
-    std::string error;
-    if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-      std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                   error.c_str());
-    }
-    return;
-  }
-  std::fprintf(stderr,
-               "[vulkan] streaming overrun: swapping region table early "
-               "(%zu chunks pending as holes)\n",
-               m_streamPending.size());
-  finishRegionMove();
-}
-
 void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
   if (!m_streamActive) {
     return;
   }
   const auto start = std::chrono::steady_clock::now();
-  // Hard cap per frame (see kStreamChunksPerFrame): one generation + one
-  // NON-BLOCKING upload (uploadChunksStreaming waits only its own fence
-  // from the previous frame - the old synchronous path did a
-  // vkDeviceWaitIdle + vkQueueWaitIdle per frame, serializing CPU and GPU
-  // whenever the camera moved: the fps sawtooth read as "twitching").
-  // The budget below is a secondary guard for slow machines.
+  std::vector<vv::vulkan::VoxelResources::ChunkUpload> batch;
+  const auto flushBatch = [this, &batch]() -> bool {
+    if (batch.empty()) {
+      return true;
+    }
+    std::string error;
+    if (!m_voxelResources.uploadChunks(m_device, m_physicalDevice,
+                                       m_commandPool, m_graphicsQueue, batch,
+                                       error)) {
+      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
+                   error.c_str());
+      // Roll back the slot assignments; the coords return to pending.
+      for (const auto& upload : batch) {
+        m_slotOf.erase(vv::voxel::ChunkCoord{upload.chunk->chunkX(),
+                                             upload.chunk->chunkZ()});
+        m_freeSlots.push_back(upload.slot);
+      }
+      batch.clear();
+      return false;
+    }
+    batch.clear();
+    return true;
+  };
+
+  // Hard cap per frame (kStreamChunksPerFrame): one generation + one
+  // upload flush. Pass-9 revert: back to the synchronous upload path
+  // (pass-6 behavior); the pass-8 fence-scoped path is shelved until the
+  // remaining stutter is chased down with the owner's help.
   std::size_t streamed = 0;
   while (!m_streamPending.empty() && streamed < kStreamChunksPerFrame) {
     const std::chrono::duration<double> elapsed =
@@ -556,18 +498,15 @@ void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
     m_slotOf[coord] = slot;
-    std::string error;
-    if (!m_voxelResources.uploadChunksStreaming(
-            m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
-            {slot, chunk}, error)) {
-      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
-                   error.c_str());
-      m_slotOf.erase(coord);
-      m_freeSlots.push_back(slot);
+    batch.push_back({slot, chunk});
+    ++streamed;
+    if (!flushBatch()) {
       m_streamPending.push_back(coord);
       break;
     }
-    ++streamed;
+  }
+  if (!flushBatch()) {
+    return;  // retried next frame
   }
   if (m_streamPending.empty()) {
     finishRegionMove();
@@ -606,10 +545,7 @@ void VulkanRenderer::finishRegionMove() {
                                         m_streamTarget.z + dz};
       const auto it = m_slotOf.find(coord);
       if (it == m_slotOf.end()) {
-        // Legal since the streaming-overrun early swap: un-streamed
-        // trailing chunks stay empty cells; the far LOD covers them and
-        // the next border crossing re-requests them.
-        continue;
+        continue;  // cannot happen: streaming completes before finish
       }
       const std::size_t cell =
           static_cast<std::size_t>(dx + r) +
@@ -785,15 +721,13 @@ std::string VulkanRenderer::debugStats() const {
   char buf[288];
   std::snprintf(buf, sizeof(buf),
                 "fogCut=%.0fu fog=%.5f steps=%u skyCeil=%d far=%s(%ux%u@%d,%d)"
-                " region=%ux%u@(%d,%d) slots=%zu/%llu taa=%s",
+                " region=%ux%u@(%d,%d) slots=%zu/%llu",
                 cut, m_fogDensity, cfg.maxTraceSteps, m_maxTerrainVoxelY,
                 m_farFieldActive ? "on" : (m_farBuildRunning.load() ? "building" : "off"),
                 m_farDim, m_farDim, m_farCenterChunkX, m_farCenterChunkZ,
                 cfg.gridWidth(), cfg.gridHeight(), m_regionCenter.x,
                 m_regionCenter.z, m_slotOf.size(),
-                static_cast<unsigned long long>(cfg.slotCount()),
-                (m_taaEnabled && !m_debugTerminators && !m_debugSuperSample)
-                    ? "on" : "off");
+                static_cast<unsigned long long>(cfg.slotCount()));
   return std::string(buf);
 }
 
@@ -1209,42 +1143,13 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   farBinding.descriptorCount = 1;
   farBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  // TAA history ring (pass 6): four rgba16f-ish pixel buffers (uvec2 per
-  // pixel = two packed half2s: rgb + ray distance); frame N writes
-  // ring[N % 4] and reads ring[(N - 2) % 4]. Selected per dispatch via
-  // push constants (farParams.yz), so the descriptor set itself is static.
-  VkDescriptorSetLayoutBinding taa0Binding{};
-  taa0Binding.binding = 7;
-  taa0Binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  taa0Binding.descriptorCount = 1;
-  taa0Binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  VkDescriptorSetLayoutBinding taa1Binding{};
-  taa1Binding.binding = 8;
-  taa1Binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  taa1Binding.descriptorCount = 1;
-  taa1Binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  VkDescriptorSetLayoutBinding taa2Binding{};
-  taa2Binding.binding = 9;
-  taa2Binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  taa2Binding.descriptorCount = 1;
-  taa2Binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  VkDescriptorSetLayoutBinding taa3Binding{};
-  taa3Binding.binding = 10;
-  taa3Binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  taa3Binding.descriptorCount = 1;
-  taa3Binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  VkDescriptorSetLayoutBinding bindings[] = {
+VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
-      paletteBinding, heightBinding, farBinding, taa0Binding, taa1Binding,
-      taa2Binding, taa3Binding};
+      paletteBinding, heightBinding, farBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 11;
+  info.bindingCount = 7;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1514,80 +1419,10 @@ bool VulkanRenderer::createStorageResources(std::string& outError) {
     return false;
   }
 
-  // TAA history ring: 4 buffers, one uvec2 (8 bytes) per pixel - rgb +
-  // ray distance packed as half floats. ~33 MB at 1080p total; device
-  // local, never touched by the host. Recreated (and the ring reset) with
-  // the swapchain.
-  const VkDeviceSize taaBufferSize =
-      static_cast<VkDeviceSize>(elements) * 8u;
-  for (std::size_t i = 0; i < 4; ++i) {
-    VkBufferCreateInfo taaBuf{};
-    taaBuf.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    taaBuf.size = taaBufferSize;
-    taaBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    taaBuf.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    r = vkCreateBuffer(m_device, &taaBuf, nullptr, &m_taaHistBuffer[i]);
-    if (r != VK_SUCCESS) {
-      outError = "Failed to create TAA history buffer (" +
-                 utils::vkResultToString(r) + ").";
-      return false;
-    }
-
-    VkMemoryRequirements taaReq{};
-    vkGetBufferMemoryRequirements(m_device, m_taaHistBuffer[i], &taaReq);
-    uint32_t taaMemType = utils::findMemoryTypeIndex(
-        m_physicalDevice, taaReq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (taaMemType == UINT32_MAX) {
-      taaMemType = utils::findMemoryTypeIndex(
-          m_physicalDevice, taaReq.memoryTypeBits,
-          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    }
-    if (taaMemType == UINT32_MAX) {
-      outError = "No suitable memory type found for TAA history buffer.";
-      return false;
-    }
-
-    VkMemoryAllocateInfo taaAlloc{};
-    taaAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    taaAlloc.allocationSize = taaReq.size;
-    taaAlloc.memoryTypeIndex = taaMemType;
-
-    r = vkAllocateMemory(m_device, &taaAlloc, nullptr, &m_taaHistMemory[i]);
-    if (r != VK_SUCCESS) {
-      outError = "Failed to allocate TAA history memory (" +
-                 utils::vkResultToString(r) + ").";
-      return false;
-    }
-
-    r = vkBindBufferMemory(m_device, m_taaHistBuffer[i], m_taaHistMemory[i],
-                           0);
-    if (r != VK_SUCCESS) {
-      outError = "Failed to bind TAA history memory (" +
-                 utils::vkResultToString(r) + ").";
-      return false;
-    }
-  }
-  // Fresh (garbage) buffers: the whole ring must be rewritten before any
-  // frame may read history.
-  m_taaResetCountdown = 4;
-
   return true;
 }
 
 void VulkanRenderer::cleanupStorageResources() {
-  for (std::size_t i = 0; i < 4; ++i) {
-    if (m_taaHistBuffer[i]) {
-      vkDestroyBuffer(m_device, m_taaHistBuffer[i], nullptr);
-      m_taaHistBuffer[i] = VK_NULL_HANDLE;
-    }
-    if (m_taaHistMemory[i]) {
-      vkFreeMemory(m_device, m_taaHistMemory[i], nullptr);
-      m_taaHistMemory[i] = VK_NULL_HANDLE;
-    }
-  }
   if (m_outputBuffer) {
     vkDestroyBuffer(m_device, m_outputBuffer, nullptr);
     m_outputBuffer = VK_NULL_HANDLE;
@@ -1601,9 +1436,8 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[2] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 10;  // voxel atlas, output, chunk table,
-                                      // palette, column heights, far LOD,
-                                      // TAA history ring x4
+  poolSizes[0].descriptorCount = 6;  // voxel atlas, output, chunk table,
+                                     // palette, column heights, far LOD
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
 
@@ -1669,14 +1503,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkDescriptorBufferInfo taaInfo[4] = {};
-  for (std::size_t i = 0; i < 4; ++i) {
-    taaInfo[i].buffer = m_taaHistBuffer[i];
-    taaInfo[i].offset = 0;
-    taaInfo[i].range = VK_WHOLE_SIZE;
-  }
-
-  VkWriteDescriptorSet writes[11] = {};
+  VkWriteDescriptorSet writes[7] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -1726,16 +1553,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[6].pBufferInfo = &farInfo;
 
-  for (std::size_t i = 0; i < 4; ++i) {
-    writes[7 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[7 + i].dstSet = m_descriptorSet;
-    writes[7 + i].dstBinding = 7 + static_cast<uint32_t>(i);
-    writes[7 + i].descriptorCount = 1;
-    writes[7 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[7 + i].pBufferInfo = &taaInfo[i];
-  }
-
-  vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
+  vkUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
   return true;
 }
 
@@ -1868,53 +1686,39 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     return false;
   }
 
-  VkBufferMemoryBarrier preComputeBarriers[7] = {};
-  for (std::size_t i = 0; i < 4; ++i) {
-    preComputeBarriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    preComputeBarriers[i].srcAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    preComputeBarriers[i].dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    preComputeBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    preComputeBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    preComputeBarriers[i].buffer = m_taaHistBuffer[i];
-    preComputeBarriers[i].offset = 0;
-    preComputeBarriers[i].size = VK_WHOLE_SIZE;
-  }
+  VkBufferMemoryBarrier preComputeBarriers[3] = {};
+  preComputeBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[0].srcAccessMask = 0;
+  preComputeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  preComputeBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[0].buffer = m_voxelResources.voxelBuffer();
+  preComputeBarriers[0].offset = 0;
+  preComputeBarriers[0].size = VK_WHOLE_SIZE;
 
-  preComputeBarriers[4].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-  preComputeBarriers[4].srcAccessMask = 0;
-  preComputeBarriers[4].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  preComputeBarriers[4].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[4].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[4].buffer = m_voxelResources.voxelBuffer();
-  preComputeBarriers[4].offset = 0;
-  preComputeBarriers[4].size = VK_WHOLE_SIZE;
+  preComputeBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[1].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  preComputeBarriers[1].dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+  preComputeBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[1].buffer = m_sceneUniform.buffer();
+  preComputeBarriers[1].offset = 0;
+  preComputeBarriers[1].size = VK_WHOLE_SIZE;
 
-  preComputeBarriers[5].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-  preComputeBarriers[5].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-  preComputeBarriers[5].dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
-  preComputeBarriers[5].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[5].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[5].buffer = m_sceneUniform.buffer();
-  preComputeBarriers[5].offset = 0;
-  preComputeBarriers[5].size = VK_WHOLE_SIZE;
-
-  preComputeBarriers[6].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-  preComputeBarriers[6].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-  preComputeBarriers[6].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  preComputeBarriers[6].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[6].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  preComputeBarriers[6].buffer = m_outputBuffer;
-  preComputeBarriers[6].offset = 0;
-  preComputeBarriers[6].size = VK_WHOLE_SIZE;
+  preComputeBarriers[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[2].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  preComputeBarriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  preComputeBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[2].buffer = m_outputBuffer;
+  preComputeBarriers[2].offset = 0;
+  preComputeBarriers[2].size = VK_WHOLE_SIZE;
 
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                            VK_PIPELINE_STAGE_TRANSFER_BIT |
-                           VK_PIPELINE_STAGE_HOST_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 7,
+                           VK_PIPELINE_STAGE_HOST_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 3,
                        preComputeBarriers, 0, nullptr);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
@@ -1949,12 +1753,12 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   } else {
     push.far = glm::ivec4(0, 0, 0, 0);  // z = 0: far LOD off in the shader
   }
-  // farParams: x = far cell footprint (0 = far off), y/z = TAA history
-  // ring indices (read = the frame two back, write = this frame's slot).
-  push.farParams = glm::vec4(
-      m_farFieldActive ? static_cast<float>(m_farCell) : 0.0f,
-      static_cast<float>((m_frameCounter + 2u) % 4u),
-      static_cast<float>(m_frameCounter % 4u), 0.0f);
+  if (m_farFieldActive) {
+    push.farParams = glm::vec4(static_cast<float>(m_farCell), 0.0f, 0.0f,
+                               0.0f);
+  } else {
+    push.farParams = glm::vec4(0.0f);
+  }
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(push), &push);
 

@@ -801,6 +801,53 @@ the snapped origin + relative thresholds); full build warning-free;
 offscreen smoke clean in both modes (after the 6th /tmp wipe forced a
 toolchain rebuild via scripts/build-linux-toolchain.sh).
 
+### Pass 9: revert to pass-6 behavior minus TAA, keep the terrain gains (owner decision)
+
+Owner verdict on pass 8: "much worse, there are now missing chunks and
+none of the issues have been fixed. i suggest reverting all the way
+down to pass 6, just without TAA and with better terrain." Executed
+exactly that.
+
+**The missing chunks were a real design flaw** in pass 8's early-swap:
+un-streamed chunks became empty cells that only re-entered the pending
+set on the NEXT border crossing - stop flying and the holes persist
+indefinitely. Reverted (the synchronous fallbacks are back).
+
+**TAA: fully removed, not just disabled.** Shader (Scene block fields,
+history bindings 7-10, histLoad/histStore/histSampleBilinear/applyTaa,
+jittered main path), renderer (history ring buffers + creation/cleanup,
+descriptor bindings/pool/writes, barriers, Halton jitter, VV_TAA env,
+debugStats field), SceneUBO/TaaData + SceneUniform plumbing. The
+default is now no AA; VV_SSAA=1 (4 rays/pixel) remains the opt-in.
+
+**Streaming: pass-6 behavior restored** - 1 chunk/frame through the
+synchronous upload path, >2-chunk catch-up fallback, teleport fallback.
+KNOWN CONSEQUENCES (owner-accepted for now, first candidates when the
+stutter hunt resumes): the per-frame vkDeviceWaitIdle + vkQueueWaitIdle
+in the sync upload remains a prime suspect for the remaining
+twitch/vibration, and the >2-chunk catch-up is the sprint freeze.
+The pass-8 fence-scoped upload (WITHOUT the early-swap) is in the git
+history (08fd680) and can be reintroduced alone if the owner wants.
+
+**Kept from passes 7-8 (all terrain/far-field, all pure + tested):**
+- Terrain tuning: mountain mask window (0.92, 0.995) as config
+  (mountainMaskLow/High), snowLine 82, lift 36, surfaceCeiling 100,
+  warpAmpMountains 4.6 (gentler folds), warpVerticalSquash.
+- FarField::build world-aligned 512-voxel snap (recenters shift the
+  window; no re-quantized morphing) + cheaper mountain estimate
+  (mask-gated seeds, +2 bias) + builder yields.
+- Far seam patch from real chunk heightmaps
+  (FarField::patchRegion + patchFarFieldWithRegion on activation and
+  region swap).
+- Far-LOD hits are shadowed again (the "fully lit faces" seam band fix;
+  the march self-selects the cheap far-cell path from out there).
+- Sun/sky split (no sun through voxels), shadow-skip on ndl<=0,
+  ambient sky-occlusion in shadow, spawn via topSolidVoxels, and all
+  pass-6..8 tests.
+
+**Verified**: shader compiles; Release + Debug warning-free; all tests
+pass; offscreen smoke clean (default + VV_SSAA=1).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -822,7 +869,15 @@ toolchain rebuild via scripts/build-linux-toolchain.sh).
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 8 — done (pending user verification):**
+**Pass 9 — done (pending user verification):**
+- [x] Revert to pass-6 streaming behavior (sync fallbacks; no
+      early-swap holes)
+- [x] TAA fully removed (no AA by default; VV_SSAA=1 opt-in)
+- [x] Terrain gains kept: rare ranges, summit-only snow, gentler
+      folds, world-aligned far field, seam patch, far shadows
+
+**Pass 8 — done (user-rejected: missing chunks [early-swap design
+flaw], twitch/ghost/freeze unfixed; reverted in pass 9):**
 - [x] Vibration: streaming uploads are fence-scoped, no per-frame
       device/queue stalls (fps sawtooth eliminated)
 - [x] Freeze: sprint overrun early-swaps the region table (holes

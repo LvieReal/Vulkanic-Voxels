@@ -61,8 +61,6 @@ class VulkanRenderer final {
   void rebuildStreamPending();
   void pumpRegionStreaming(double budgetMs);
   void finishRegionMove();
-  // Spare-ring overflow while streaming (see VulkanRenderer.cpp).
-  void handleStreamOverflow(int32_t chunkX, int32_t chunkZ);
 
   // Rewrites the far-LOD cells covered by the loaded chunk region with
   // the REAL per-column tops from the chunk heightmaps (exact for fully
@@ -222,29 +220,6 @@ class VulkanRenderer final {
   bool m_debugTerminators = false;
   bool m_debugSuperSample = false;
 
-  // --- Temporal antialiasing (pass 6) ---
-  // The compute shader traces ONE jittered ray per pixel and blends it
-  // with a reprojected history sample. History lives in a 4-deep ring of
-  // RGBA16F-ish buffers (rgb = linear color, a = ray distance, sky = -1):
-  // frame N writes ring[N % 4] and reads ring[(N - 2) % 4] - two frames
-  // old, which the frame-in-flight fence guarantees has fully retired.
-  // VV_TAA=0 disables (back to 1 un-jittered ray per pixel).
-  bool m_taaEnabled = true;
-  struct TaaRingEntry {
-    glm::vec3 pos{};
-    glm::vec3 forward{};
-    glm::vec3 right{};
-    glm::vec3 up{};
-    glm::vec2 jitter{};
-  };
-  TaaRingEntry m_taaRing[4];
-  // Frames remaining after a (re)allocation before history may be read
-  // (the whole ring must be rewritten first).
-  std::uint32_t m_taaResetCountdown = 4;
-  VkBuffer m_taaHistBuffer[4] = {VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                 VK_NULL_HANDLE, VK_NULL_HANDLE};
-  VkDeviceMemory m_taaHistMemory[4] = {VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                       VK_NULL_HANDLE, VK_NULL_HANDLE};
 
   // --- Far-LOD field (background build + upload state) ---
   // The builder thread only touches m_farPending (sole ownership until
