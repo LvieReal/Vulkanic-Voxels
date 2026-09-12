@@ -418,17 +418,15 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       } else if (m_streamPending.empty()) {
         finishRegionMove();
       }
-    } else if (std::abs(chunkX - m_regionCenter.x) > 2 ||
-               std::abs(chunkZ - m_regionCenter.z) > 2) {
-      // Streaming cannot keep up with a fast camera: catch up synchronously.
-      m_streamActive = false;
-      m_streamPending.clear();
-      std::string error;
-      if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-        std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                     error.c_str());
-      }
-    } else {
+    }
+    // Fast cameras no longer trigger a synchronous catch-up: the old
+    // fallback (rebuild the whole region at once when the camera ran more
+    // than 2 chunks ahead of the active center) was the multi-second
+    // stutter - at ~3 ms/chunk it generated dozens of chunks in one frame.
+    // Streaming now ALWAYS proceeds at the per-frame cap and re-aims as
+    // the target moves; the trailing edge of the old region is covered by
+    // the far-LOD field until the table swaps.
+    if (m_streamActive) {
       pumpRegionStreaming(kStreamBudgetMs);
     }
     ensureFarField(chunkX, chunkZ);
@@ -623,6 +621,18 @@ void VulkanRenderer::finishRegionMove() {
   m_regionCenter = m_streamTarget;
   m_streamActive = false;
   m_streamPending.clear();
+
+  // The region boundary moved: re-derive the far field's seam band from
+  // the now-active chunks so the far surface continues the exact terrain.
+  if (patchFarFieldWithRegion()) {
+    std::string error;
+    if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
+                                         m_commandPool, m_graphicsQueue,
+                                         m_farCells, error)) {
+      std::fprintf(stderr, "[vulkan] far LOD seam patch upload failed: %s\n",
+                   error.c_str());
+    }
+  }
 }
 
 void VulkanRenderer::launchFarFieldBuild(int32_t centerChunkX,
@@ -665,13 +675,10 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
     m_farBuildRunning = false;
 
     const auto& cfg = m_voxelConfig;
-    std::string error;
     if (m_farPending.dim != 0 &&
         m_farPending.dim == cfg.farLodDim() &&
-        m_farPending.cellVoxels == cfg.farLodCellVoxels &&
-        m_voxelResources.uploadFarField(m_device, m_physicalDevice,
-                                        m_commandPool, m_graphicsQueue,
-                                        m_farPending.cells, error)) {
+        m_farPending.cellVoxels == cfg.farLodCellVoxels) {
+      m_farCells = m_farPending.cells;
       m_farOriginVoxX = m_farPending.originVoxX;
       m_farOriginVoxZ = m_farPending.originVoxZ;
       m_farDim = m_farPending.dim;
@@ -679,14 +686,29 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       m_farFieldActive = true;
       m_farCenterChunkX = m_farPendingCenterX;
       m_farCenterChunkZ = m_farPendingCenterZ;
+      // The freshly estimated field would show its coarse seams exactly
+      // where the near region ends - rewrite that band from the real
+      // chunk data before the (always-required) first upload.
+      patchFarFieldWithRegion();
+      std::string uploadError;
+      if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
+                                           m_commandPool, m_graphicsQueue,
+                                           m_farCells, uploadError)) {
+        std::fprintf(stderr, "[vulkan] far LOD upload failed: %s\n",
+                     uploadError.c_str());
+        m_farFieldActive = false;
+      }
       std::fprintf(stderr,
                    "[vulkan] far LOD field active: %ux%u cells of %u voxels "
-                   "at (%d,%d)\n",
+                   "at (%d,%d) (seam band patched from %zu chunks)\n",
                    m_farDim, m_farDim, m_farCell, m_farOriginVoxX,
-                   m_farOriginVoxZ);
+                   m_farOriginVoxZ, m_slotOf.size());
     } else {
-      std::fprintf(stderr, "[vulkan] far LOD upload failed: %s\n",
-                   error.c_str());
+      std::fprintf(stderr,
+                   "[vulkan] far LOD build rejected (dim %u vs %u, cell %u vs "
+                   "%u)\n",
+                   m_farPending.dim, cfg.farLodDim(), m_farPending.cellVoxels,
+                   cfg.farLodCellVoxels);
     }
     m_farPendingReady = false;
     return;
@@ -707,6 +729,29 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       launchFarFieldBuild(centerChunkX, centerChunkZ);
     }
   }
+}
+
+bool VulkanRenderer::patchFarFieldWithRegion() {
+  if (!m_farFieldActive || m_farDim == 0 || !m_world || m_farCells.empty()) {
+    return false;
+  }
+  const auto& cfg = m_voxelConfig;
+  std::vector<vv::terrain::FarField::RegionChunkHeights> chunks;
+  chunks.reserve(m_slotOf.size());
+  for (const auto& [coord, slot] : m_slotOf) {
+    (void)slot;
+    const vv::voxel::Chunk* chunk = m_world->findChunk(coord);
+    if (chunk == nullptr) {
+      continue;
+    }
+    chunks.push_back({coord.x * static_cast<std::int32_t>(cfg.chunkSizeX),
+                      coord.z * static_cast<std::int32_t>(cfg.chunkSizeZ),
+                      cfg.chunkSizeX, cfg.chunkSizeZ,
+                      chunk->heightMap().data()});
+  }
+  return vv::terrain::FarField::patchRegion(
+             m_farCells, m_farDim, m_farCell, m_farOriginVoxX, m_farOriginVoxZ,
+             chunks, m_world->terrain()) > 0;
 }
 
 glm::vec3 VulkanRenderer::spawnPosition() const {

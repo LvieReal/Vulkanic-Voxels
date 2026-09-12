@@ -62,6 +62,16 @@ class VulkanRenderer final {
   void pumpRegionStreaming(double budgetMs);
   void finishRegionMove();
 
+  // Rewrites the far-LOD cells covered by the loaded chunk region with
+  // the REAL per-column tops from the chunk heightmaps (exact for fully
+  // covered cells, max-with-estimate on the partial edge). Returns whether
+  // anything changed; the caller decides whether to re-upload the field.
+  // Called when a fresh far build is activated and whenever the region
+  // table swaps: the near/far seam then continues the exact terrain by
+  // construction instead of the coarse estimate (which folded mountains
+  // can under-estimate by 20+ voxels -> holes at the seam).
+  bool patchFarFieldWithRegion();
+
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
 
@@ -247,12 +257,15 @@ class VulkanRenderer final {
   std::int32_t m_farPendingCenterX = 0;
   std::int32_t m_farPendingCenterZ = 0;
   // Active (uploaded) field geometry: origin in voxels, cell count and
-  // footprint; valid only while m_farFieldActive.
+  // footprint; valid only while m_farFieldActive. m_farCells mirrors the
+  // uploaded field on the CPU so patchFarFieldWithRegion can rewrite the
+  // seam band incrementally.
   std::int32_t m_farOriginVoxX = 0;
   std::int32_t m_farOriginVoxZ = 0;
   std::uint32_t m_farDim = 0;
   std::uint32_t m_farCell = 0;
   bool m_farFieldActive = false;
+  std::vector<std::uint32_t> m_farCells;
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
   std::int32_t m_farCenterChunkZ = 0;

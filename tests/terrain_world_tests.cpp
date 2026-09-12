@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 #include "terrain/FarField.hpp"
@@ -945,8 +946,10 @@ void testTerrainOverhangs() {
 		}
 	}
 	check(bestMask > 0.7f, "terrain: a mountain core exists near the origin");
-	check(gen.surfaceTargetF(float(bx), float(bz)) >= 80.0f,
-				"terrain: mountain core target is high");
+	check(gen.surfaceTargetF(float(bx), float(bz)) >=
+					gen.heightAtF(float(bx), float(bz)) + 0.8f *
+							float(gen.config().mountainLift),
+				"terrain: mountain core target is lifted");
 
 	// Generate the chunk at the core (snapped to chunk-local coordinates:
 	// pass absolute voxel coordinates; the generator is coordinate-absolute).
@@ -1010,6 +1013,132 @@ void testTerrainOverhangs() {
 	check(boundOk, "terrain: no solid above maxHeightVoxels()");
 	check(overhangColumns > 0,
 				"terrain: overhangs exist in the mountain chunk");
+}
+
+
+// ---------------------------------------------------------------------------
+// Far seam patch: the far-LOD cells covered by loaded chunks must take the
+// REAL per-column tops (exact max on full coverage, estimate as a floor on
+// the partial edge), so the near/far seam continues the exact terrain.
+// ---------------------------------------------------------------------------
+
+void testFarPatchRegion() {
+	const vv::terrain::TerrainGenerator gen(vv::terrain::TerrainConfig{});
+	const std::uint32_t chunk = 32;
+	const std::uint32_t cell = 4;
+	// radius 2 -> dim 32, origin (-48, -48) (negative: exercises the
+	// floor-division in the cell mapping).
+	auto field = vv::terrain::FarField::build(gen, 0, 0, 2, cell, chunk);
+	check(field.dim == 32 && field.originVoxX == -48,
+				"far patch: field geometry");
+	const std::vector<std::uint32_t> before = field.cells;
+
+	// Fabricate 3x3 chunks of synthetic column tops covering voxels
+	// [-32, 64) on both axes (a 96x96 block inside the field).
+	std::vector<std::vector<std::uint16_t>> heights(9);
+	std::vector<vv::terrain::FarField::RegionChunkHeights> chunks;
+	for (int cz = -1; cz <= 1; ++cz) {
+		for (int cx = -1; cx <= 1; ++cx) {
+			auto& h = heights[static_cast<std::size_t>((cz + 1) * 3 + cx + 1)];
+			h.resize(chunk * chunk);
+			for (std::uint32_t z = 0; z < chunk; ++z) {
+				for (std::uint32_t x = 0; x < chunk; ++x) {
+					const std::int32_t vx = cx * 32 + static_cast<std::int32_t>(x);
+					const std::int32_t vz = cz * 32 + static_cast<std::int32_t>(z);
+					// Deterministic pattern with air columns and tall spikes.
+					std::uint16_t top1;
+					if ((vx * 31 + vz * 17) % 11 == 0) {
+						top1 = 0;  // air column
+					} else if ((vx % 7) == 3 && (vz % 5) == 2) {
+						top1 = 90;  // spike
+					} else {
+						top1 = static_cast<std::uint16_t>(30 + (vx * vz) % 23);
+					}
+					h[x + z * chunk] = top1;
+				}
+			}
+			chunks.push_back({cx * 32, cz * 32, chunk, chunk, h.data()});
+		}
+	}
+
+	const std::size_t changed = vv::terrain::FarField::patchRegion(
+				field.cells, field.dim, field.cellVoxels, field.originVoxX,
+				field.originVoxZ, chunks, gen);
+	check(changed > 0, "far patch: something changed");
+
+	// Independent recomputation: per-cell (max covered column top, covered
+	// column count) over the fabricated chunk block.
+	const int dim = int(field.dim);
+	const int blockMin = -32, blockMax = 64;  // covered voxel range (X and Z)
+	auto cellStats = [&](int ci, int cj) {
+		std::uint32_t m = 0;
+		int inside = 0;
+		for (int z = 0; z < int(cell); ++z) {
+			for (int x = 0; x < int(cell); ++x) {
+				const int vx = field.originVoxX + ci * int(cell) + x;
+				const int vz = field.originVoxZ + cj * int(cell) + z;
+				if (vx < blockMin || vx >= blockMax || vz < blockMin ||
+						vz >= blockMax) {
+					continue;
+				}
+				++inside;
+				const int lcx = vx < 0 ? (vx - 31) / 32 : vx / 32;
+				const int lcz = vz < 0 ? (vz - 31) / 32 : vz / 32;
+				const auto& h =
+						heights[static_cast<std::size_t>((lcz + 1) * 3 + lcx + 1)];
+				m = std::max(m, std::uint32_t(h[(vx - lcx * 32) +
+																	 (vz - lcz * 32) * 32]));
+			}
+		}
+		return std::pair(m, inside);
+	};
+
+	bool fullOk = true;   // fully covered: exact max (or untouched if air)
+	bool partialOk = true;  // partial edge: max(exact, estimate)
+	bool floorOk = true;
+	bool typeOk = true;
+	bool outsideOk = true;
+	for (int cj = 0; cj < dim; ++cj) {
+		for (int ci = 0; ci < dim; ++ci) {
+			const std::size_t idx = std::size_t(ci) + std::size_t(cj) * dim;
+			const auto [expect, inside] = cellStats(ci, cj);
+			const std::uint32_t got = field.cells[idx] & 0xFFFFu;
+			const std::uint32_t est = before[idx] & 0xFFFFu;
+			if (inside == 0) {
+				if (field.cells[idx] != before[idx]) {
+					outsideOk = false;
+				}
+				continue;
+			}
+			if (expect > 0 && got < expect) {
+				floorOk = false;  // never below the covered columns' max
+			}
+			if (inside == int(cell) * int(cell)) {
+				// Fully covered: exact value (all-air cells stay untouched).
+				if (expect > 0 && got != expect) {
+					fullOk = false;
+				}
+				if (expect == 0 && field.cells[idx] != before[idx]) {
+					fullOk = false;
+				}
+			} else {
+				if (got != std::max(expect, est)) {
+					partialOk = false;
+				}
+			}
+			if (expect > 0) {
+				const auto type = gen.typeForDepth(int(got) - 1, int(got) - 1);
+				if ((field.cells[idx] >> 16u) != std::uint32_t(type)) {
+					typeOk = false;
+				}
+			}
+		}
+	}
+	check(fullOk, "far patch: fully covered cells take the exact max");
+	check(partialOk, "far patch: partial edge cells = max(exact, estimate)");
+	check(floorOk, "far patch: never below the real column tops");
+	check(typeOk, "far patch: surface type from the layering rule");
+	check(outsideOk, "far patch: cells outside the region untouched");
 }
 
 // ---------------------------------------------------------------------------
@@ -1509,6 +1638,7 @@ int main() {
 	testChunkHeightMap();
 	testTraversalParity();
 	testFarField();
+	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
 

@@ -684,6 +684,61 @@ parity rays, far march, shadow march, heightmaps, SIMD bit-exactness);
 offscreen smoke clean in all three modes (TAA default, VV_TAA=0,
 VV_SSAA=1).
 
+### Pass 7: pass-6 issue fixes (TAA twitch/ghost, mountain frequency/snow, 4s stutter, LOD seams)
+
+**TAA twitching** (user: "everything is now twitching"): the history
+validation compared the stored hit distance (measured from the HISTORY
+camera) against the current frame's distance (from the CURRENT camera).
+Those differ by exactly the camera's per-frame motion, so any camera
+movement faster than the 12% tolerance rejected nearly every pixel and
+the image degenerated to raw jittered samples. Now validated against
+distance(hit, prevCamera) - the like-for-like value. Tolerance tightened
+to 5% + 1.5 voxels (exact reprojection makes this safe; edge pixels that
+fail simply re-converge).
+
+**Ghosting / motion blur**: blend alpha 0.1 -> 0.15 (~6.7 frames of
+history instead of ~10) on top of the now-correct validation.
+
+**Mountains too frequent**: the ridged mask value 1-|fbm| clusters near
+1 (measured: median 0.87, p85 0.97), so the (0.58, 0.74) window put
+mask>0.5 over 93% of the world. New defaults (0.92, 0.995) give ~19%
+foothills / ~9% ranges / ~3% full-lift mountains. Window is config
+(mountainMaskLow/High).
+
+**Snowy too early**: snowLine 68 -> 82 (only mountain summits; plains
+max out ~70).
+
+**4-second stutter on chunk load**: two causes, both removed.
+1. The >2-chunk synchronous catch-up: flying faster than the 1-chunk-
+   per-frame stream (i.e. always) tripped a full synchronous region
+   rebuild - dozens of ~3 ms generations in one frame. Removed; the
+   stream now re-aims at the moving target and the far LOD covers the
+   trailing edge until the swap. (Teleport fallback kept.)
+2. The far-LOD rebuild thread: pass 6's always-3-seed estimate tripled
+   the build cost (~3 s on one core), and fast flight triggers a rebuild
+   every ~16 chunks - a permanently saturated core starving the main
+   thread. Now: plains use a single seed (they never fold), mountains
+   probe 3 seeds x 2 fixed-point iterations spread across the measured
+   warp reach + a +2 voxels upward bias (under-estimates carve holes in
+   distant silhouettes; over-estimates just fill them slightly). Full
+   build back to ~0.9 s, and the builder sleeps 300us every 4 rows so it
+   yields the core.
+
+**LOD seams/holes on mountains**: the estimate alone can under-shoot a
+folded column's top by 20+ voxels (measured min -21..-27 vs real chunk
+tops; the surface varies +-5 across one 4-voxel far cell in fold zones).
+Fix: patchFarFieldWithRegion - the far cells covered by loaded chunks
+are rewritten from the REAL chunk heightmaps (pure
+FarField::patchRegion, unit tested incl. negative origins): fully
+covered cells take the exact per-cell max (the far surface continues
+the near terrain 1:1 across the seam), partial edge cells keep the
+estimate as a floor. Applied when a fresh far build activates AND on
+every region table swap (re-upload only when something changed). The
+CPU keeps a mirror of the far cells (m_farCells, ~4 MB) for this.
+
+**Verified**: shader compiles; Release + Debug warning-free; all tests
+pass (incl. new testFarPatchRegion); offscreen smoke clean.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -705,7 +760,16 @@ VV_SSAA=1).
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 6 — done (pending user verification):**
+**Pass 7 — done (pending user verification):**
+- [x] TAA: cross-camera distance validation bug fixed (the twitch),
+      alpha 0.15, tighter tolerance
+- [x] Mountains: (0.92, 0.995) window (~9% ranges), snowLine 82
+- [x] Stutter: sync catch-up removed; far build 3x cheaper + yields
+- [x] Seam holes: far field patched from real chunk heightmaps
+      (exact continuation across the near/far seam)
+
+**Pass 6 — done (user-verified: "rendering looks decent" with issues,
+all addressed in pass 7):**
 - [x] TAA: 1 jittered ray/pixel + 4-ring history reprojection
       (VV_TAA=0 off; auto-off under VV_DEBUG_TERM / VV_SSAA)
 - [x] Sun-through-voxels fixed (sky/sun split, reference-faithful)

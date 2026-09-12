@@ -1,8 +1,79 @@
 #include "terrain/FarField.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <thread>
 
 namespace vv::terrain {
+
+std::size_t FarField::patchRegion(std::vector<std::uint32_t>& cells,
+																		std::uint32_t dim,
+																		std::uint32_t cellVoxels,
+																		std::int32_t originVoxX,
+																		std::int32_t originVoxZ,
+																		const std::vector<RegionChunkHeights>& chunks,
+																		const TerrainGenerator& gen) {
+	const std::int64_t dim64 = static_cast<std::int64_t>(dim);
+	const std::int64_t cell64 = static_cast<std::int64_t>(cellVoxels);
+	const std::int64_t originX = originVoxX;
+	const std::int64_t originZ = originVoxZ;
+	if (cells.size() != static_cast<std::size_t>(dim) * dim || cellVoxels == 0) {
+		return 0;
+	}
+
+	std::vector<std::uint32_t> best(cells.size(), 0u);
+	std::vector<std::uint32_t> cover(cells.size(), 0u);
+	for (const RegionChunkHeights& chunk : chunks) {
+		if (chunk.heights == nullptr || chunk.sizeX == 0 || chunk.sizeZ == 0) {
+			continue;
+		}
+		const std::int64_t baseX = chunk.minVoxX;
+		const std::int64_t baseZ = chunk.minVoxZ;
+		for (std::uint32_t z = 0; z < chunk.sizeZ; ++z) {
+			const std::int64_t fj = (baseZ + z - originZ) / cell64;
+			if (fj < 0 || fj >= dim64) {
+				continue;
+			}
+			for (std::uint32_t x = 0; x < chunk.sizeX; ++x) {
+				const std::int64_t fi = (baseX + x - originX) / cell64;
+				if (fi < 0 || fi >= dim64) {
+					continue;
+				}
+				const std::uint16_t h =
+						chunk.heights[x + z * chunk.sizeX];  // top + 1 (0 = air)
+				const std::size_t ci = static_cast<std::size_t>(fi) +
+																static_cast<std::size_t>(fj) *
+																		static_cast<std::size_t>(dim);
+				if (h > best[ci]) {
+					best[ci] = h;
+				}
+				++cover[ci];
+			}
+		}
+	}
+
+	const std::uint32_t full = cellVoxels * cellVoxels;
+	std::size_t changed = 0;
+	for (std::size_t i = 0; i < cells.size(); ++i) {
+		const std::uint32_t exact = best[i];
+		if (exact == 0u) {
+			continue;
+		}
+		const std::uint32_t current = cells[i] & 0xFFFFu;
+		const std::uint32_t height = (cover[i] >= full)
+																		 ? exact
+																		 : std::max(exact, current);
+		if (height == current) {
+			continue;
+		}
+		const std::int32_t top = static_cast<std::int32_t>(height) - 1;
+		const auto type = gen.typeForDepth(top, top);
+		cells[i] = packColumn(static_cast<std::uint16_t>(height),
+													static_cast<std::uint8_t>(type));
+		++changed;
+	}
+	return changed;
+}
 
 FarField FarField::build(const TerrainGenerator& gen,
 												 std::int32_t centerChunkX,
@@ -39,6 +110,13 @@ FarField FarField::build(const TerrainGenerator& gen,
 	// thread-safe.
 	field.cells.assign(static_cast<std::size_t>(field.dim) * field.dim, 0u);
 	for (std::uint32_t j = 0; j < field.dim; ++j) {
+		// Cooperative yield: this runs on a background thread and takes
+		// seconds at the default radius; without pauses it starves the
+		// main thread (and thus the frame rate) on low-core-count
+		// machines - one of the pass-6 "stutter when chunks load" causes.
+		if ((j & 3u) == 0u && j != 0) {
+			std::this_thread::sleep_for(std::chrono::microseconds(300));
+		}
 		const float wz = static_cast<float>(
 				static_cast<std::int64_t>(field.originVoxZ) +
 				static_cast<std::int64_t>(j) * cellVoxels + cellVoxels / 2);

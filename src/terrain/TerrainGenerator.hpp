@@ -37,6 +37,13 @@ struct TerrainConfig final {
 	// those folds are the overhangs.
 	double mountainScale = 340.0;  // wavelength of the mountain-range mask
 	double mountainLift = 42.0;    // extra height at mountain-range cores
+	// Ridged-noise threshold window for the mountain mask: 0 below Low, 1
+	// above High (smoothstep between). The ridged value 1-|fbm| clusters
+	// near 1 (median ~0.87, p85 ~0.97), so the window must sit very high:
+	// (0.58, 0.74) put mask>0.5 over 93% of the world. (0.92, 0.995)
+	// gives ~19% foothills, ~9% ranges, ~3% full-lift mountains.
+	double mountainMaskLow = 0.92;
+	double mountainMaskHigh = 0.995;
 	double surfaceCeiling = 96.0;  // target clamp (summits; keeps target +
 	                               // the warp band under the world height)
 	double warpWavelength = 48.0;  // 3D noise wavelength (voxels, XZ)
@@ -54,7 +61,7 @@ struct TerrainConfig final {
 
 	// Surface layering.
 	double dirtDepth = 4.0;  // dirt (or sand) thickness below the surface
-	double snowLine = 68.0;  // surfaces at/above become snow
+	double snowLine = 82.0;  // surfaces at/above become snow
 	double sandLine = 26.0;  // surfaces at/below become sand
 };
 
@@ -154,6 +161,9 @@ class TerrainGenerator final {
 	const TerrainConfig& config() const { return m_config; }
 
  private:
+	// 3D warp noise value at (x, y, z) with the config's squash applied.
+	float n3Seed(float x, float z, float y) const;
+
 	TerrainConfig m_config;
 	Noise2D m_noise;
 	Noise2D m_hillNoise;

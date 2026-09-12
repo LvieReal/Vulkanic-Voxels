@@ -38,6 +38,30 @@ struct FarField final {
 					 (static_cast<std::uint32_t>(type) << 16u);
 	}
 
+	// One loaded chunk's per-column heights for patchRegion (see below).
+	struct RegionChunkHeights {
+		std::int32_t minVoxX = 0;   // chunk min corner in voxel space
+		std::int32_t minVoxZ = 0;
+		std::uint32_t sizeX = 0;    // chunk footprint (voxels)
+		std::uint32_t sizeZ = 0;
+		const std::uint16_t* heights = nullptr;  // top+1 per column (0 = air),
+																							// row-major x + z*sizeX
+	};
+
+	// Rewrites the cells covered by the given chunks with the REAL column
+	// tops: fully covered cells take the exact per-cell max (so the far
+	// surface continues the near terrain 1:1 across the seam), partially
+	// covered edge cells keep the existing estimate as a floor. Surface
+	// types come from the generator's layering rule. Pure; returns the
+	// number of changed cells. This is what kills near/far seam holes in
+	// folded mountains (the estimate alone can under-shoot by 20+ voxels).
+	static std::size_t patchRegion(std::vector<std::uint32_t>& cells,
+																 std::uint32_t dim, std::uint32_t cellVoxels,
+																 std::int32_t originVoxX,
+																 std::int32_t originVoxZ,
+																 const std::vector<RegionChunkHeights>& chunks,
+																 const TerrainGenerator& gen);
+
 	// Builds the field centered on the given chunk (the box is centered on
 	// that chunk's center voxel so it always contains the full near region
 	// plus recenter hysteresis). Pure and thread-safe: only reads the

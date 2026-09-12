@@ -989,10 +989,23 @@ vec3 applyTaa(uvec2 p, vec3 cur, float dist)
             if (h.x >= 0.0 && h.y >= 0.0 &&
                 h.x < float(size.x) - 1.0 && h.y < float(size.y) - 1.0) {
                 hist = histSampleBilinear(histRead, h, size);
+                // Validate the HISTORY distance against the distance from
+                // the HISTORY camera to this frame's hit point - NOT the
+                // current-frame distance. The stored value is measured
+                // from the previous camera; comparing across cameras
+                // rejected nearly every pixel while the camera moved and
+                // the image degenerated into raw jittered samples (the
+                // "everything twitches" bug).
                 const bool histSky = hist.a < 0.0;
-                if (curSky != histSky ||
-                    (!curSky && abs(hist.a - dist) > 0.12 * dist + 2.0)) {
+                if (curSky != histSky) {
                     valid = false;  // disocclusion / geometry change
+                } else if (!curSky) {
+                    const float expectPrevDist =
+                        distance(hitW, scene.prevCamPos.xyz);
+                    if (abs(hist.a - expectPrevDist) >
+                        0.05 * expectPrevDist + 1.5) {
+                        valid = false;  // different surface
+                    }
                 }
             } else {
                 valid = false;  // reprojected off-screen
@@ -1010,7 +1023,10 @@ vec3 applyTaa(uvec2 p, vec3 cur, float dist)
                                 cur * 1.25 + vec3(0.02));
     }
 
-    const vec3 blended = valid ? mix(hist.rgb, cur, 0.1) : cur;
+    // Blend factor 0.15 (~6.7 frames of history): 0.1 trailed visibly
+    // during motion (user-reported ghosting); with exact reprojection and
+    // distance validation the higher factor keeps edges crisp.
+    const vec3 blended = valid ? mix(hist.rgb, cur, 0.15) : cur;
     histStore(histWrite, idx, blended, dist);
     return blended;
 }

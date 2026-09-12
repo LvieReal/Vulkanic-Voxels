@@ -76,9 +76,12 @@ float TerrainGenerator::mountainMaskF(float x, float z) const {
 	// Ridged: crests run along the fbm's zero crossings, so ranges form
 	// connected lines rather than blobs.
 	const float ridge = 1.0f - std::abs(r);
-	// smoothstep(0.58, 0.74, ridge): ~20-25% of the world is mountainous,
-	// with rolling foothills at the range edges.
-	const float t = std::min(std::max((ridge - 0.58f) / 0.16f, 0.0f), 1.0f);
+	// The threshold window comes from the config (defaults tuned so only a
+	// small fraction of the world is mountainous - the first pass used
+	// hardcoded (0.58, 0.74), which made ranges far too frequent).
+	const float lo = static_cast<float>(m_config.mountainMaskLow);
+	const float hi = static_cast<float>(m_config.mountainMaskHigh);
+	const float t = std::min(std::max((ridge - lo) / (hi - lo), 0.0f), 1.0f);
 	return t * t * (3.0f - 2.0f * t);
 }
 
@@ -198,6 +201,13 @@ vv::voxel::VoxelType TerrainGenerator::typeForDepth(std::int32_t y,
 	return vv::voxel::VoxelType::Stone;
 }
 
+float TerrainGenerator::n3Seed(float x, float z, float y) const {
+	const float wl = static_cast<float>(m_config.warpWavelength);
+	const float sq = static_cast<float>(m_config.warpVerticalSquash);
+	return m_warpNoise.fbmF(x / wl, y * sq / wl, z / wl,
+												 m_config.warpOctaves);
+}
+
 std::int32_t TerrainGenerator::estimatedTopSolid(float x, float z,
 																								 float target,
 																								 float mask) const {
@@ -214,12 +224,28 @@ std::int32_t TerrainGenerator::estimatedTopSolid(float x, float z,
 	// keeps the far silhouette from dipping below the near-region terrain
 	// at the seam.
 	const float g = static_cast<float>(m_config.warpGradient);
-	float surface = target;
-	for (int k = -1; k <= 1; ++k) {
-		const float y0 = target + float(k) * 6.0f;
-		const float n3 = m_warpNoise.fbmF(x / wl, y0 * sq / wl, z / wl,
-																			m_config.warpOctaves);
-		surface = std::max(surface, target + n3 * amp / g);
+	// Fixed-point iteration of y = target + n3(x, y, z) * amp / g. In
+	// MOUNTAINS the isosurface folds, so the surface is probed at three
+	// seeds spread across the warp's physical reach (amp * 0.5 / g; the
+	// 0.5 is the measured |fbm3| bound), each iterated twice toward its
+	// local root, and the highest result wins - a single seed converges to
+	// a lower fold and the far silhouette would dip below the near terrain
+	// at the seam (holes). Plains never fold (measured; small amp), so the
+	// extra evaluations are skipped there.
+	const float reach = amp * 0.5f / g;
+	float surface = target + n3Seed(x, z, target) * amp / g;
+	if (mask > 0.25f) {
+		for (int k = 1; k <= 2; ++k) {
+			float y = target + float(k) * 0.5f * reach;
+			for (int it = 0; it < 2; ++it) {
+				y = target + n3Seed(x, z, y) * amp / g;
+			}
+			surface = std::max(surface, y);
+		}
+		// Slight upward bias: an under-estimate carves holes into distant
+		// mountain silhouettes, an over-estimate just fills them slightly
+		// full (and the near seam is patched from real chunk data anyway).
+		surface += 2.0f;
 	}
 	const std::int32_t bound = maxHeightVoxels();
 	std::int32_t top = static_cast<std::int32_t>(std::floor(surface));
