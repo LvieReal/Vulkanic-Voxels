@@ -61,6 +61,8 @@ class VulkanRenderer final {
   void rebuildStreamPending();
   void pumpRegionStreaming(double budgetMs);
   void finishRegionMove();
+  // Spare-ring overflow while streaming (see VulkanRenderer.cpp).
+  void handleStreamOverflow(int32_t chunkX, int32_t chunkZ);
 
   // Rewrites the far-LOD cells covered by the loaded chunk region with
   // the REAL per-column tops from the chunk heightmaps (exact for fully

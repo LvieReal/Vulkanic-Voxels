@@ -878,9 +878,11 @@ void testFarField() {
 	check(field.dim == 32, "far: dim = 2*radius*chunk/cell");
 	check(field.cellVoxels == cell, "far: cell size stored");
 	check(field.cells.size() == 32u * 32u, "far: cell count = dim^2");
-	// Box centered on chunk (0,0)'s center voxel (16,16).
-	check(field.originVoxX == 16 - 64 && field.originVoxZ == 16 - 64,
-				"far: origin = center - dim*cell/2");
+	// Box centered on the world-aligned snap of chunk (0,0)'s center
+	// voxel (16,16 -> 0,0; cells keep their world alignment across
+	// recenters - see FarField::build).
+	check(field.originVoxX == 0 - 64 && field.originVoxZ == 0 - 64,
+				"far: origin = snapped center - dim*cell/2");
 
 	bool heightsOk = true;
 	bool typesOk = true;
@@ -955,6 +957,11 @@ void testTerrainOverhangs() {
 	// pass absolute voxel coordinates; the generator is coordinate-absolute).
 	const std::int32_t baseX = bx & ~31;
 	const std::int32_t baseZ = bz & ~31;
+	// "Tall" = clearly lifted above the rolling base at the core (the
+	// absolute threshold from the first pass assumed the old lift/ceiling).
+	const int tallThreshold = static_cast<int>(
+			gen.heightAtF(float(bx), float(bz)) +
+			0.5f * float(gen.config().mountainLift));
 	std::vector<std::uint8_t> types;
 	gen.generateChunkVoxels(baseX, baseZ, 32, 32, 128, types);
 	const auto solidAt = [&](std::uint32_t x, std::uint32_t y,
@@ -978,7 +985,7 @@ void testTerrainOverhangs() {
 					break;
 				}
 			}
-			if (top > 80) {
+			if (top > tallThreshold) {
 				++tallColumns;
 			}
 			if (top > gen.maxHeightVoxels()) {
@@ -1026,10 +1033,11 @@ void testFarPatchRegion() {
 	const vv::terrain::TerrainGenerator gen(vv::terrain::TerrainConfig{});
 	const std::uint32_t chunk = 32;
 	const std::uint32_t cell = 4;
-	// radius 2 -> dim 32, origin (-48, -48) (negative: exercises the
+	// radius 2 -> dim 32; center (16,16) snaps to the world-aligned grid
+	// (0,0), so origin = (-64, -64) (negative: exercises the
 	// floor-division in the cell mapping).
 	auto field = vv::terrain::FarField::build(gen, 0, 0, 2, cell, chunk);
-	check(field.dim == 32 && field.originVoxX == -48,
+	check(field.dim == 32 && field.originVoxX == -64,
 				"far patch: field geometry");
 	const std::vector<std::uint32_t> before = field.cells;
 

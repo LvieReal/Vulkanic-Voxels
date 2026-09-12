@@ -36,7 +36,7 @@ struct TerrainConfig final {
 	// roughly +-warpAmp/warpGradient of the target the isosurface folds -
 	// those folds are the overhangs.
 	double mountainScale = 340.0;  // wavelength of the mountain-range mask
-	double mountainLift = 42.0;    // extra height at mountain-range cores
+	double mountainLift = 36.0;    // extra height at mountain-range cores
 	// Ridged-noise threshold window for the mountain mask: 0 below Low, 1
 	// above High (smoothstep between). The ridged value 1-|fbm| clusters
 	// near 1 (median ~0.87, p85 ~0.97), so the window must sit very high:
@@ -44,8 +44,12 @@ struct TerrainConfig final {
 	// gives ~19% foothills, ~9% ranges, ~3% full-lift mountains.
 	double mountainMaskLow = 0.92;
 	double mountainMaskHigh = 0.995;
-	double surfaceCeiling = 96.0;  // target clamp (summits; keeps target +
-	                               // the warp band under the world height)
+	double surfaceCeiling = 100.0; // target clamp (summits). Keep LOW
+	                               // enough that ceiling + the warp band stays
+	                               // under the world height (128); where it
+	                               // binds, summits become flat plateaus, so
+	                               // it should bind rarely (lift 36 + base
+	                               // peaks rarely exceed it).
 	double warpWavelength = 48.0;  // 3D noise wavelength (voxels, XZ)
 	std::uint32_t warpOctaves = 3;
 	// Vertical squash of the 3D noise: the y coordinate is sampled at
@@ -57,7 +61,7 @@ struct TerrainConfig final {
 	double warpVerticalSquash = 2.0;
 	double warpGradient = 0.10;      // density units per voxel of height
 	double warpAmpPlains = 1.2;      // 3D noise weight in density units
-	double warpAmpMountains = 5.5;   // 3D noise weight inside ranges
+	double warpAmpMountains = 4.6;   // 3D noise weight inside ranges
 
 	// Surface layering.
 	double dirtDepth = 4.0;  // dirt (or sand) thickness below the surface

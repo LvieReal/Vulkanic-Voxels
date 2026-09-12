@@ -30,6 +30,10 @@ struct FarField final {
 	std::int32_t originVoxZ = 0;
 	std::uint32_t dim = 0;         // cells per side (square grid)
 	std::uint32_t cellVoxels = 0;  // cell footprint in voxels (X and Z)
+	// Actual (snapped) field center in voxels - see build; the renderer
+	// uses it for the recenter-hysteresis check.
+	std::int32_t centerVoxX = 0;
+	std::int32_t centerVoxZ = 0;
 
 	std::vector<std::uint32_t> cells;
 

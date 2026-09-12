@@ -89,16 +89,32 @@ FarField FarField::build(const TerrainGenerator& gen,
 		return field;
 	}
 
-	// Center the box on the center chunk's center voxel; the min corner
-	// lands on a cell boundary because dim * cellVoxels is even.
-	const std::int64_t centerX =
+	// Center the box near the requested chunk, SNAPPED to a world-aligned
+	// 512-voxel grid (a multiple of both the chunk size and the cell
+	// footprint). The field is a pure function of world position, so with
+	// a fixed grid alignment every recenter only shifts the WINDOW: cells
+	// keep their world coordinates and values. Before the snap, each
+	// recenter re-quantized the whole distant terrain against a grid that
+	// had moved with the camera - visible popping/morphing at every
+	// rebuild, which TAA then blended with the old silhouette ("ghosting"
+	// during fast flight). Snap offset <= 256 voxels (8 chunks), well
+	// inside the recenter hysteresis margins.
+	constexpr std::int64_t kSnap = 512;
+	const std::int64_t reqX =
 			static_cast<std::int64_t>(centerChunkX) * chunkSize + chunkSize / 2;
-	const std::int64_t centerZ =
+	const std::int64_t reqZ =
 			static_cast<std::int64_t>(centerChunkZ) * chunkSize + chunkSize / 2;
+	const auto snapDown = [](std::int64_t v, std::int64_t grid) {
+		return v - ((v % grid) + grid) % grid;
+	};
+	const std::int64_t centerX = snapDown(reqX, kSnap);
+	const std::int64_t centerZ = snapDown(reqZ, kSnap);
 	const std::int64_t half = (static_cast<std::int64_t>(field.dim) *
-														 field.cellVoxels) / 2;
+															 field.cellVoxels) / 2;
 	field.originVoxX = static_cast<std::int32_t>(centerX - half);
 	field.originVoxZ = static_cast<std::int32_t>(centerZ - half);
+	field.centerVoxX = static_cast<std::int32_t>(centerX);
+	field.centerVoxZ = static_cast<std::int32_t>(centerZ);
 
 	// One column evaluation per cell, at the cell center (see header comment
 	// for the sampling trade-off). With the 3D density terrain the stored

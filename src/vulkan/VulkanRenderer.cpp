@@ -406,15 +406,7 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       rebuildStreamPending();
       const std::size_t needed = m_streamPending.size();
       if (needed > m_freeSlots.size()) {
-        // Too far for the spare ring (teleport-scale): fall back to the
-        // synchronous rebuild.
-        m_streamActive = false;
-        m_streamPending.clear();
-        std::string error;
-        if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-          std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                       error.c_str());
-        }
+        handleStreamOverflow(chunkX, chunkZ);
       } else if (m_streamPending.empty()) {
         finishRegionMove();
       }
@@ -453,13 +445,7 @@ void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
     return;
   }
   if (m_streamPending.size() > m_freeSlots.size()) {
-    // Not enough spare slots (teleport-scale move): synchronous rebuild.
-    m_streamPending.clear();
-    std::string error;
-    if (!rebuildChunkRegion(targetChunkX, targetChunkZ, error)) {
-      std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                   error.c_str());
-    }
+    handleStreamOverflow(targetChunkX, targetChunkZ);
     return;
   }
   m_streamActive = true;
@@ -511,37 +497,48 @@ void VulkanRenderer::rebuildStreamPending() {
             });
 }
 
+// The camera outran the 1-chunk-per-frame stream and the spare ring cannot
+// hold both region edges. A full synchronous rebuild here was the
+// multi-second sprint freeze (hundreds of ~3 ms generations in one frame).
+// Instead: a TRUE teleport (most of the region missing) still rebuilds
+// synchronously - it beats tens of seconds of far-LOD-only world - but an
+// ordinary overrun EARLY-SWAPS the table to the target with the
+// not-yet-streamed chunks as empty cells. Those were the lowest-priority
+// pending items (behind/beside the camera); the far LOD renders the same
+// terrain through the holes, and they re-enter the pending set on the next
+// border crossing, so they self-heal.
+void VulkanRenderer::handleStreamOverflow(int32_t chunkX, int32_t chunkZ) {
+  const auto& cfg = m_voxelConfig;
+  const std::size_t regionChunks =
+      static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight();
+  if (m_streamPending.size() > regionChunks / 2) {
+    m_streamActive = false;
+    m_streamPending.clear();
+    std::string error;
+    if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+      std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                   error.c_str());
+    }
+    return;
+  }
+  std::fprintf(stderr,
+               "[vulkan] streaming overrun: swapping region table early "
+               "(%zu chunks pending as holes)\n",
+               m_streamPending.size());
+  finishRegionMove();
+}
+
 void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
   if (!m_streamActive) {
     return;
   }
   const auto start = std::chrono::steady_clock::now();
-  std::vector<vv::vulkan::VoxelResources::ChunkUpload> batch;
-  const auto flushBatch = [this, &batch]() -> bool {
-    if (batch.empty()) {
-      return true;
-    }
-    std::string error;
-    if (!m_voxelResources.uploadChunks(m_device, m_physicalDevice,
-                                       m_commandPool, m_graphicsQueue, batch,
-                                       error)) {
-      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
-                   error.c_str());
-      // Roll back the slot assignments; the coords return to pending.
-      for (const auto& upload : batch) {
-        m_slotOf.erase(vv::voxel::ChunkCoord{upload.chunk->chunkX(),
-                                             upload.chunk->chunkZ()});
-        m_freeSlots.push_back(upload.slot);
-      }
-      batch.clear();
-      return false;
-    }
-    batch.clear();
-    return true;
-  };
-
   // Hard cap per frame (see kStreamChunksPerFrame): one generation + one
-  // upload flush. The budget below is a secondary guard for slow machines.
+  // NON-BLOCKING upload (uploadChunksStreaming waits only its own fence
+  // from the previous frame - the old synchronous path did a
+  // vkDeviceWaitIdle + vkQueueWaitIdle per frame, serializing CPU and GPU
+  // whenever the camera moved: the fps sawtooth read as "twitching").
+  // The budget below is a secondary guard for slow machines.
   std::size_t streamed = 0;
   while (!m_streamPending.empty() && streamed < kStreamChunksPerFrame) {
     const std::chrono::duration<double> elapsed =
@@ -559,15 +556,18 @@ void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
     m_slotOf[coord] = slot;
-    batch.push_back({slot, chunk});
-    ++streamed;
-    if (!flushBatch()) {
+    std::string error;
+    if (!m_voxelResources.uploadChunksStreaming(
+            m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+            {slot, chunk}, error)) {
+      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
+                   error.c_str());
+      m_slotOf.erase(coord);
+      m_freeSlots.push_back(slot);
       m_streamPending.push_back(coord);
       break;
     }
-  }
-  if (!flushBatch()) {
-    return;  // retried next frame
+    ++streamed;
   }
   if (m_streamPending.empty()) {
     finishRegionMove();
@@ -606,7 +606,10 @@ void VulkanRenderer::finishRegionMove() {
                                         m_streamTarget.z + dz};
       const auto it = m_slotOf.find(coord);
       if (it == m_slotOf.end()) {
-        continue;  // cannot happen: streaming completes before finish
+        // Legal since the streaming-overrun early swap: un-streamed
+        // trailing chunks stay empty cells; the far LOD covers them and
+        // the next border crossing re-requests them.
+        continue;
       }
       const std::size_t cell =
           static_cast<std::size_t>(dx + r) +
@@ -684,8 +687,15 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       m_farDim = m_farPending.dim;
       m_farCell = m_farPending.cellVoxels;
       m_farFieldActive = true;
-      m_farCenterChunkX = m_farPendingCenterX;
-      m_farCenterChunkZ = m_farPendingCenterZ;
+      // Recenter hysteresis is measured against the SNAPPED field center
+      // (the build snaps to a world-aligned grid; see FarField::build).
+      const std::int32_t chunkX32 =
+          static_cast<std::int32_t>(m_voxelConfig.chunkSizeX);
+      const auto voxToChunk = [&](std::int32_t v) {
+        return (v >= 0 ? v : v - chunkX32 + 1) / chunkX32;
+      };
+      m_farCenterChunkX = voxToChunk(m_farPending.centerVoxX);
+      m_farCenterChunkZ = voxToChunk(m_farPending.centerVoxZ);
       // The freshly estimated field would show its coarse seams exactly
       // where the near region ends - rewrite that band from the real
       // chunk data before the (always-required) first upload.

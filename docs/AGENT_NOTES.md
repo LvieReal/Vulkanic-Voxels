@@ -739,6 +739,68 @@ CPU keeps a mirror of the far cells (m_farCells, ~4 MB) for this.
 **Verified**: shader compiles; Release + Debug warning-free; all tests
 pass (incl. new testFarPatchRegion); offscreen smoke clean.
 
+### Pass 8: the real twitch/ghost/freeze fixes, lit-seam fix, gentler mountains
+
+The pass-7 TAA math fix was correct but attacked the wrong layer: the
+user's "twitching/vibration, ghosting, freezing" were largely NOT TAA
+pixel artifacts. Four root causes, all confirmed in code:
+
+**Vibration = fps sawtooth from per-frame GPU stalls.** The 1-chunk-per-
+frame pump still called the SYNCHRONOUS upload path, which does
+vkDeviceWaitIdle + staging alloc + submit + vkQueueWaitIdle every
+streaming frame. While flying (stream always active) the CPU and GPU
+fully serialized each frame; whenever the stream went idle the fps
+jumped back - the oscillation read as "everything twitches". Fix:
+uploadChunksStreaming - a persistent staging buffer + command buffer +
+fence; each pump waits ONLY the previous pump's fence (a frame old,
+normally already signaled). No device/queue waits. Safety: streaming
+only writes slots no uploaded table references; the table swap keeps
+its own (now rare) full device wait.
+
+**Freeze at sprint = spare-ring overflow.** At sprint speed the camera
+outruns the 1-per-frame stream; every re-aim accumulates pending
+chunks in slots, the spare ring (104 slots) exhausts after ~4-5 chunks
+of overshoot, and the old fallback REBUILT THE WHOLE REGION
+SYNCHRONOUSLY (625 chunks x ~3 ms = the multi-second freeze). Fix:
+handleStreamOverflow - a true teleport (most of the region missing)
+still rebuilds synchronously (it beats minutes of LOD-only world), but
+an ordinary overrun EARLY-SWAPS the table to the target with the
+un-streamed chunks as empty cells: those are the lowest-priority
+pending items (behind/beside the camera), the far LOD renders the same
+terrain through them, and they re-enter the pending set on the next
+border crossing, so they self-heal. finishRegionMove's table build
+already tolerated missing chunks; its "cannot happen" comment updated.
+
+**Ghosting = far-field morphing, blended by TAA.** The far grid was
+centered on the camera's chunk, so EVERY recenter (every ~16 chunks of
+fast flight) moved the sampling grid and re-quantized the entire
+distant terrain; TAA then blended the old and new silhouettes for ~8
+frames = ghost terrain. Fix: FarField::build snaps the field center to
+a world-aligned 512-voxel grid - the field is a pure function of world
+position, so recenters only shift the window (verified: all 1,048,576
+shared cells bit-identical across a recenter). Snap offset <= 256
+voxels, well inside the hysteresis margins; the recenter check now
+measures against the snapped center. TAA blend alpha 0.15 -> 0.12, and
+the reprojection clamps at the screen edge instead of invalidating
+(a raw 1-2 px border read as a vibrating frame edge).
+
+**Lit seam band = far hits skipped shadows (pass-6 perf cut).** The
+user identified it precisely: "fully lit faces between normal voxels
+and LOD voxels" - the far band got full sun while the near terrain
+next to it sat in shade. Reverted: far-LOD hits run sunShadow too
+(the march self-selects the cheap far-cell path from out there; the
+ndl<=0 skip stays).
+
+**Mountains gentler**: lift 42 -> 36 and surfaceCeiling 96 -> 100
+(fewer flat summit plateaus where the ceiling bound), warpAmpMountains
+5.5 -> 4.6 (overhangs measured 16% of core columns -> 5.7%, still
+clearly present; maxHeightVoxels 126 <= 127). Solid bound re-verified.
+
+**Verified**: all tests pass (far-patch and overhang tests updated for
+the snapped origin + relative thresholds); full build warning-free;
+offscreen smoke clean in both modes (after the 6th /tmp wipe forced a
+toolchain rebuild via scripts/build-linux-toolchain.sh).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -760,7 +822,19 @@ pass (incl. new testFarPatchRegion); offscreen smoke clean.
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 7 — done (pending user verification):**
+**Pass 8 — done (pending user verification):**
+- [x] Vibration: streaming uploads are fence-scoped, no per-frame
+      device/queue stalls (fps sawtooth eliminated)
+- [x] Freeze: sprint overrun early-swaps the region table (holes
+      self-heal) instead of a synchronous full rebuild
+- [x] Ghosting: far-LOD grid world-aligned (recenters no longer
+      re-quantize terrain); TAA alpha 0.12; edge-clamped reprojection
+- [x] Lit seam: far hits shadowed again (self-selecting cheap march)
+- [x] Mountains: lift 36 / ceiling 100 / warp 4.6 (fewer plateaus,
+      gentler overhangs; coverage ~19% foothills / ~9% ranges)
+
+**Pass 7 — done (user-verified: terrain fixed; twitch/ghost/freeze
+persisted - root causes found in pass 8):**
 - [x] TAA: cross-camera distance validation bug fixed (the twitch),
       alpha 0.15, tighter tolerance
 - [x] Mountains: (0.92, 0.995) window (~9% ranges), snowLine 82

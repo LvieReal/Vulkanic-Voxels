@@ -839,13 +839,15 @@ vec3 traceRay(vec2 uv, bool debugTerm, out float outDist)
             ao = calculateAO(ivec3(cell.x, hitY, cell.z), normal, hitPos);
         }
 
-        // Sun shadows: one cheap ascending ray toward the sun (near-exact
-        // via the height atlas). Skipped when the direct term is zero
-        // anyway (sun-facing test first) and on far-LOD hits - beyond the
-        // near region the coarse test is barely visible under the fog but
-        // the march is not free.
+        // Sun shadows: one cheap ascending ray toward the sun. Skipped
+        // only when the direct term is zero anyway (ndl <= 0). Far-LOD
+        // hits MUST be shadowed too: from beyond the region the march
+        // self-selects the cheap far-cell path, and skipping it here lit
+        // the whole far band at full sun while the near terrain right
+        // next to it sat in shade - a bright "fully lit face" band along
+        // the near/far seam (pass-6 perf cut, reverted).
         float shadow = 1.0;
-        if (!farHit && ndl > 0.0) {
+        if (ndl > 0.0) {
             shadow = sunShadow(hitPos, n);
         }
 
@@ -982,10 +984,13 @@ vec3 applyTaa(uvec2 p, vec3 cur, float dist)
             const float py =
                 dot(dP, normalize(scene.prevCamUp.xyz)) / (z * tanF);
             // Undo the forward mapping (aspect scale on x, y flip) and the
-            // history frame's jitter to land in sample space.
+            // history frame's jitter to land in sample space. Clamped at
+            // the screen edges (a 1-2 px raw border reads as a vibrating
+            // frame edge; clamping just reuses the edge texel).
             vec2 h = vec2((px / aspect + 1.0) * 0.5 * float(size.x),
                           (1.0 - py) * 0.5 * float(size.y)) -
                      vec2(0.5) - scene.taaJitter.zw;
+            h = clamp(h, vec2(0.0), vec2(size) - vec2(1.0));
             if (h.x >= 0.0 && h.y >= 0.0 &&
                 h.x < float(size.x) - 1.0 && h.y < float(size.y) - 1.0) {
                 hist = histSampleBilinear(histRead, h, size);
@@ -1023,10 +1028,10 @@ vec3 applyTaa(uvec2 p, vec3 cur, float dist)
                                 cur * 1.25 + vec3(0.02));
     }
 
-    // Blend factor 0.15 (~6.7 frames of history): 0.1 trailed visibly
-    // during motion (user-reported ghosting); with exact reprojection and
-    // distance validation the higher factor keeps edges crisp.
-    const vec3 blended = valid ? mix(hist.rgb, cur, 0.15) : cur;
+    // Blend factor 0.12 (~8 frames of history): balances trails vs
+    // stability; with exact reprojection + distance validation most
+    // pixels validate, so this converges quickly when still.
+    const vec3 blended = valid ? mix(hist.rgb, cur, 0.12) : cur;
     histStore(histWrite, idx, blended, dist);
     return blended;
 }
