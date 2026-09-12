@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -1096,6 +1097,258 @@ void testWorldEnsureChunk() {
 				"evictOutside: chunk beyond the ring is evicted");
 }
 
+
+// ---------------------------------------------------------------------------
+// Sun-shadow march: CPU mirror of the shader's sunShadow (near-column walk
+// via the height bound + coarse far cells) vs dense sampling along the sun
+// ray over the same two-tier world. Must agree on lit/shadowed exactly.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ShadowWorld {
+	// Near: full voxels in [0,64)^2 x [0,48). Far: coarse heights over
+	// [-64,128)^2 in 4-unit cells.
+	TestWorld near;
+	std::vector<std::uint32_t> farCells;  // dim^2, u16 height | type<<16
+	int farOrigin = -64;
+	unsigned farDim = 48;
+	float farCell = 4.0f;
+	float maxTerr = 150.0f;  // shared ascend bound (mirror + brute)
+
+	unsigned farAt(int cx, int cz) const {
+		if (cx < 0 || cz < 0 || cx >= int(farDim) || cz >= int(farDim)) {
+			return 0u;
+		}
+		return farCells[std::size_t(cx) + std::size_t(cz) * farDim];
+	}
+};
+
+// Mirror of the shader's sunShadow (same offsets, clamps, tie-breaks, cap).
+bool sunLitMirror(const ShadowWorld& w, const double origin[3],
+									const double n[3], const double sun[3]) {
+	if (sun[1] <= 0.05) {
+		return true;
+	}
+	const double EPS = 1e-6;
+	double o[3];
+	for (int a = 0; a < 3; ++a) {
+		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+	}
+	int stepX = (sun[0] > 0.0) ? 1 : -1;
+	int stepZ = (sun[2] > 0.0) ? 1 : -1;
+	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
+	int colX = int(std::floor(o[0]));
+	int colZ = int(std::floor(o[2]));
+	if (std::abs(sun[0]) > EPS) {
+		tMaxX = (double(colX + ((stepX > 0) ? 1 : 0)) - o[0]) / sun[0];
+		dX = std::abs(1.0 / sun[0]);
+	} else {
+		stepX = 0;
+	}
+	if (std::abs(sun[2]) > EPS) {
+		tMaxZ = (double(colZ + ((stepZ > 0) ? 1 : 0)) - o[2]) / sun[2];
+		dZ = std::abs(1.0 / sun[2]);
+	} else {
+		stepZ = 0;
+	}
+
+	double s = 0.0;
+	for (int i = 0; i < 256; ++i) {
+		const double sExit = std::min(tMaxX, tMaxZ);
+		const double y0 = o[1] + sun[1] * s;
+		if (y0 >= w.maxTerr) {
+			return true;
+		}
+		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
+												colZ < w.near.wz;
+		if (inNear) {
+			const unsigned bound = w.near.boundAt(colX, colZ);
+			if (bound != 0xFFFFu && double(bound) > y0) {
+				const double y1 = o[1] + sun[1] * sExit;
+				const int yTop = std::min(
+						int(std::floor(std::min(y1, double(bound) - 1.0))),
+						w.near.wh - 1);
+				for (int y = std::max(int(std::floor(y0)), 0); y <= yTop; ++y) {
+					if (w.near.at(colX, y, colZ) != 0) {
+						return false;
+					}
+				}
+			}
+		} else {
+			const int fcX = int(std::floor((double(colX) + 0.5 - w.farOrigin) /
+																		w.farCell));
+			const int fcZ = int(std::floor((double(colZ) + 0.5 - w.farOrigin) /
+																		w.farCell));
+			const unsigned packed = w.farAt(fcX, fcZ);
+			const double h = double(packed & 0xFFFFu);
+			if (h > 0.0 && y0 < h) {
+				return false;
+			}
+		}
+		s = std::min(tMaxX, tMaxZ);
+		const bool takeX = tMaxX < tMaxZ;
+		tMaxX += takeX ? dX : 0.0;
+		tMaxZ += takeX ? 0.0 : dZ;
+		colX += takeX ? stepX : 0;
+		colZ += takeX ? 0 : stepZ;
+	}
+	return true;
+}
+
+// Brute force: dense sampling along the sun ray with identical semantics
+// (near voxels; far column tops; shared ascend bound).
+bool sunLitBrute(const ShadowWorld& w, const double origin[3],
+								 const double n[3], const double sun[3],
+								 double dt = 0.05) {
+	if (sun[1] <= 0.05) {
+		return true;
+	}
+	double o[3];
+	for (int a = 0; a < 3; ++a) {
+		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+	}
+	for (double s = 0.0; s < 2000.0; s += dt) {
+		const double x = o[0] + sun[0] * s;
+		const double y = o[1] + sun[1] * s;
+		const double z = o[2] + sun[2] * s;
+		if (y >= w.maxTerr) {
+			return true;
+		}
+		const int cx = int(std::floor(x));
+		const int cz = int(std::floor(z));
+		if (cx >= 0 && cx < w.near.wx && cz >= 0 && cz < w.near.wz &&
+				y < double(w.near.wh)) {
+			if (w.near.at(cx, int(std::floor(y)), cz) != 0) {
+				return false;
+			}
+		} else {
+			const int fcX =
+					int(std::floor((double(cx) + 0.5 - w.farOrigin) / w.farCell));
+			const int fcZ =
+					int(std::floor((double(cz) + 0.5 - w.farOrigin) / w.farCell));
+			const unsigned packed = w.farAt(fcX, fcZ);
+			const double h = double(packed & 0xFFFFu);
+			if (h > 0.0 && y < h) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+void testSunShadowMarch() {
+	ShadowWorld w;
+	w.near.cells.assign(std::size_t(w.near.wx) * w.near.wh * w.near.wz, 0);
+	for (int z = 0; z < w.near.wz; ++z) {
+		for (int x = 0; x < w.near.wx; ++x) {
+			const double h = 18.0 + 7.0 * std::sin(x * 0.29) +
+											 5.0 * std::cos(z * 0.21);
+			const int top = int(std::floor(h));
+			for (int y = 0; y <= top; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+										 std::size_t(z) * w.near.wx * w.near.wh] = 1;
+			}
+		}
+	}
+	// A tall wall and a tower to cast clear shadows.
+	for (int y = 0; y < 40; ++y) {
+		for (int z = 0; z < w.near.wz; ++z) {
+			w.near.cells[std::size_t(20) + std::size_t(y) * w.near.wx +
+									 std::size_t(z) * w.near.wx * w.near.wh] = 2;
+		}
+	}
+	for (int z = 30; z < 36; ++z) {
+		for (int x = 40; x < 46; ++x) {
+			for (int y = 0; y < 44; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+										 std::size_t(z) * w.near.wx * w.near.wh] = 3;
+			}
+		}
+	}
+	w.near.recomputeHeights();
+
+	// Far field: rolling hills + a ridge taller than the near terrain (so
+	// far terrain can shadow near terrain).
+	w.farCells.assign(std::size_t(w.farDim) * w.farDim, 0u);
+	for (unsigned j = 0; j < w.farDim; ++j) {
+		for (unsigned i = 0; i < w.farDim; ++i) {
+			double h = 30.0 + 10.0 * std::sin(i * 0.19) + 8.0 * std::cos(j * 0.27);
+			if (i >= 34 && i <= 38) {
+				h = 120.0 + 10.0 * std::sin(j * 0.3);  // ridge east of the near box
+			}
+			w.farCells[std::size_t(i) + std::size_t(j) * w.farDim] =
+					std::uint32_t(std::max(1.0, h)) | (1u << 16u);
+		}
+	}
+
+	// Sun: normalize(0.5, 1.0, 0.5) - same shape as the game default.
+	const double len = std::sqrt(0.25 + 1.0 + 0.25);
+	const double sun[3] = {0.5 / len, 1.0 / len, 0.5 / len};
+
+	std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int lit = 0, shadowed = 0, mismatches = 0;
+	for (int i = 0; i < 3000; ++i) {
+		double origin[3], n[3] = {0.0, 1.0, 0.0};
+		if (i % 3 == 0) {
+			// Surface point on near terrain (top face).
+			origin[0] = next01() * 64.0;
+			origin[2] = next01() * 64.0;
+			const unsigned bound =
+					w.near.boundAt(int(std::floor(origin[0])),
+												 int(std::floor(origin[2])));
+			origin[1] = bound == 0xFFFFu ? 10.0 : double(bound);
+		} else if (i % 3 == 1) {
+			// Side face at the wall (normal -x).
+			origin[0] = 20.0;
+			origin[1] = next01() * 40.0;
+			origin[2] = next01() * 64.0;
+			n[0] = -1.0;
+			n[1] = 0.0;
+		} else {
+			// Point on far terrain (far hits shadow too).
+			origin[0] = -60.0 + next01() * 180.0;
+			origin[2] = -60.0 + next01() * 180.0;
+			const int fcX = int(std::floor(origin[0] + 64.0) / 4.0);
+			const int fcZ = int(std::floor(origin[2] + 64.0) / 4.0);
+			const unsigned packed =
+					w.farAt(fcX < 0 ? -1 : fcX, fcZ < 0 ? -1 : fcZ);
+			origin[1] = double(packed & 0xFFFFu);
+			if (origin[1] == 0.0) {
+				continue;
+			}
+		}
+		bool m = sunLitMirror(w, origin, n, sun);
+		bool b = sunLitBrute(w, origin, n, sun);
+		if (m != b) {
+			// The brute sampler can miss grazes shallower than sun.y * dt
+			// (the mirror is exact); refine once before calling it a bug.
+			b = sunLitBrute(w, origin, n, sun, 0.0005);
+		}
+		m ? ++lit : ++shadowed;
+		if (m != b) {
+			if (++mismatches <= 3) {
+				std::printf("FAIL shadow ray %d at (%.2f,%.2f,%.2f): mirror "
+										"lit=%d brute lit=%d\n",
+										i, origin[0], origin[1], origin[2], int(m),
+										int(b));
+			}
+		}
+	}
+	check(mismatches == 0, "shadow march: column DDA matches dense sampling");
+	check(lit > 400 && shadowed > 400,
+				"shadow march: both outcomes well exercised");
+	std::printf("shadow march: %d lit / %d shadowed agree\n", lit, shadowed);
+}
+
+}  // namespace
 }  // namespace
 
 int main() {
@@ -1114,6 +1367,7 @@ int main() {
 	testTraversalParity();
 	testFarField();
 	testFarMarch();
+	testSunShadowMarch();
 
 	if (g_failures == 0) {
 		std::printf("all tests passed\n");

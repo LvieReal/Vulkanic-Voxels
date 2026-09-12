@@ -529,6 +529,63 @@ The renderer streaming logic is Vulkan-wiring (headless-untestable),
 kept small and reviewed; the far march/parity tests still cover the
 traversal semantics.
 
+### Pass 5: out-of-bounds crop, branchless DDA, WGSL lighting, sun shadows, SSAA
+
+**The last altitude crop** ("still there exactly when I fly out of
+bounds"): with the camera above y=128, horizontal rays miss the near
+box entirely (tEndRegion = 0), and the fog-cut early return
+`if (tEnd <= 0) return sky` fired BEFORE the far march - one more
+pre-far-LOD return living on the box-miss path. Now it returns sky only
+when far LOD is off; otherwise the ray falls through to the far march.
+
+**Branchless DDA** (cf. shadertoy.com/view/4dX3zl, user-requested): the
+2D XZ steps in both marches (near columns + far cells) now advance via
+masked selects (takeX ? delta : 0) instead of divergent if/else. Tie
+rule preserved (X only on strictly-less) so the CPU parity mirrors are
+unchanged and still pass. The vertical cell walks keep their loops
+(short by construction).
+
+**Anti-aliasing** - why not cones (Amanatides): the far LOD already IS
+the cone approximation - 4-voxel cells match the pixel footprint at
+~500u, so distance does not shimmer; full per-voxel cone tracing costs
+the most exactly where it buys the least (near field, footprint < 1
+voxel). The practical near-field answer is supersampling: VV_SSAA=1
+(also VV_DEBUG_SSAA) enables the existing 4-rays-per-pixel path as a
+supported mode (~4x compute; at 200-1000 fps there is headroom). TAA
+(needs a history buffer) remains the future option if SSAA's cost ever
+matters.
+
+**Lighting** ported from the owner's WGSL reference (the last piece of
+it): hemispheric sky ambient (mix(sky*0.35, sky, n.y*0.5+0.5)), direct
+sun = lightColor * (0.2*lambert + 0.8*pow(lambert, 8)) (broad lobe),
+fresnel rim = sky * 0.12 * pow(1-view, 5); AO scales everything,
+shadows scale only the direct term. The ambient uses the sky in the
+VIEW direction, so lit terrain and its fog background always agree.
+Shadowed faces keep 35%+ sky ambient - no more pitch-black north faces.
+
+**Sun shadows** - one shadow ray per hit pixel toward the sun:
+- Near region: 2D column DDA (unit columns); per column ONE height-
+  atlas fetch decides whether a blocker can exist (bound > ray height);
+  only then a short exact-voxel walk (ascending ray, so the walk is
+  0-2 cells). Cheap because the default sun (0.408, 0.816, 0.408)
+  lifts the ray above all terrain (maxTerrainY+1) within ~20-40
+  columns; that ascend check ends the march lit.
+- Beyond the near region: coarse far-cell test (far height > ray
+  height at column entry -> blocked). Conservative in the blocker's
+  favor; fog hides the coarseness.
+- Cap 256 columns; sun elevations <= ~3 degrees skip shadows (no cheap
+  ascend bound). Acne guarded by normal + sun offsets off the surface.
+- Parity test: testSunShadowMarch - CPU mirror vs dense brute force
+  over a two-tier synthetic world (wall, tower, tall far ridge casting
+  shadows INTO the near region); 3000 origins agree. Writing it found
+  the usual reference-sampler trap: grazes shallower than sun.y*dt are
+  invisible to the brute - the mirror is exact, so disagreements are
+  re-sampled at dt/100 before counting.
+
+**Verified**: shader compiles; Release+Debug warning-free; all tests
+pass (12k traversal-parity rays, far march, shadow march, heightmaps,
+SIMD bit-exactness, world APIs).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -550,7 +607,17 @@ traversal semantics.
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 4.1 — done (pending user verification):**
+**Pass 5 — done (pending user verification):**
+- [x] Out-of-bounds altitude crop fixed (fog-cut early return bypassed
+      the far march on box-miss rays)
+- [x] Branchless DDA stepping in both marches (parity-preserved ties)
+- [x] AA: VV_SSAA=1 4x supersampling mode; far LOD doubles as the
+      distance cone filter (cones-vs-SSAA reasoning in the pass notes)
+- [x] WGSL ambient/direct/rim lighting model (shadow-aware ambient)
+- [x] Sun shadows (near-exact column march + coarse far test), parity
+      tested against dense sampling
+
+**Pass 4.1 — done (user-verified: "much better, no holes"):**
 - [x] Altitude crop fixed (early sky returns bypassed the far march
       from above y=128)
 - [x] Incremental chunk streaming: frustum-prioritized, 3 ms/frame

@@ -76,7 +76,8 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
   // colors each pixel by ray-termination cause; VV_DEBUG_SSAA traces four
   // jittered rays per pixel (aliasing differential; ~4x compute cost).
   m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
-  m_debugSuperSample = std::getenv("VV_DEBUG_SSAA") != nullptr;
+  m_debugSuperSample = std::getenv("VV_DEBUG_SSAA") != nullptr ||
+                       std::getenv("VV_SSAA") != nullptr;
   if (m_debugTerminators) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
