@@ -6,6 +6,7 @@ function(vv_add_tests)
         tests/terrain_world_tests.cpp
         src/terrain/FarField.cpp
         src/terrain/Noise.cpp
+        src/terrain/Noise3D.cpp
         src/terrain/TerrainGenerator.cpp
         src/voxel/Chunk.cpp
         src/voxel/VoxelTypes.cpp
@@ -22,6 +23,7 @@ function(vv_add_tests)
     if(NOT MSVC)
         set_source_files_properties(
             src/terrain/Noise.cpp
+            src/terrain/Noise3D.cpp
             src/terrain/TerrainGenerator.cpp
             PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     endif()

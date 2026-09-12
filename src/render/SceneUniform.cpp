@@ -85,7 +85,8 @@ void SceneUniform::cleanup(VkDevice device) {
 
 void SceneUniform::update(const vv::core::Camera& camera, float timeSeconds,
                           const LightingConfig& lighting,
-                          const glm::vec2& debugFlags) {
+                          const glm::vec2& debugFlags,
+                          const TaaData& taa) {
   if (!m_mapped) {
     return;
   }
@@ -104,6 +105,13 @@ void SceneUniform::update(const vv::core::Camera& camera, float timeSeconds,
   ubo.skyLow = glm::vec4(lighting.skyLow, 0.0f);
   ubo.skyHigh = glm::vec4(lighting.skyHigh, 0.0f);
   ubo.misc = glm::vec4(timeSeconds, debugFlags.x, debugFlags.y, 0.0f);
+
+  ubo.prevCamPos = taa.prevCamPos;
+  ubo.prevCamForward = taa.prevCamForward;
+  ubo.prevCamRight = taa.prevCamRight;
+  ubo.prevCamUp = taa.prevCamUp;
+  ubo.taa = taa.taa;
+  ubo.taaJitter = taa.taaJitter;
 
   std::memcpy(m_mapped, &ubo, sizeof(ubo));
 }

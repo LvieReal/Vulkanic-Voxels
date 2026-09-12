@@ -39,6 +39,14 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 skyLow;
     vec4 skyHigh;
     vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = VV_DEBUG_SSAA
+    // TAA (must match vv::render::SceneUBO in src/render/SceneData.hpp).
+    // prevCam* = the camera that rendered the history this frame reads.
+    vec4 prevCamPos;
+    vec4 prevCamForward;
+    vec4 prevCamRight;
+    vec4 prevCamUp;
+    vec4 taa;        // x = enabled, y = historyValid (0 = reset/first frames)
+    vec4 taaJitter;  // xy = current frame jitter (pixels), zw = history's
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -73,6 +81,17 @@ layout(set = 0, binding = 5) readonly buffer ColumnHeights {
 layout(set = 0, binding = 6) readonly buffer FarLod {
     uint cells[];
 } farLod;
+
+// TAA history ring (pass 6): four pixel buffers, one uvec2 per pixel =
+// (packHalf2x16(r, g), packHalf2x16(b, rayDistance); sky distance = -1).
+// Frame N writes ring[pc.farParams.z] at its own pixel and reads
+// ring[pc.farParams.y] (the frame two back - fence-retired on the CPU
+// side). Never read and written in the same frame, so plain `buffer`
+// qualifiers and no extra barriers beyond the cross-frame fence.
+layout(set = 0, binding = 7) buffer TaaHist0 { uvec2 texels[]; } taaHist0;
+layout(set = 0, binding = 8) buffer TaaHist1 { uvec2 texels[]; } taaHist1;
+layout(set = 0, binding = 9) buffer TaaHist2 { uvec2 texels[]; } taaHist2;
+layout(set = 0, binding = 10) buffer TaaHist3 { uvec2 texels[]; } taaHist3;
 
 const uint kEmptySlot = 0xFFFFFFFFu;
 // Heightmap sentinel: column not loaded -> no bound known, force the exact
@@ -219,24 +238,30 @@ bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out f
     return tmax >= max(tmin, 0.0);
 }
 
-vec3 skyColor(vec3 rd)
+// Sky WITHOUT the sun: horizon/zenith gradient + haze. This is what
+// terrain shading and fog use - ambient, rim and the fog target must never
+// show the sun disc/glow through voxels (the pass-5 port fused them and
+// the sun bled through mountains toward the sun; the WGSL reference keeps
+// them separate: compute_env returns .sky and .sun, and trace_voxel's
+// ambient/rim take only .sky).
+vec3 skyBaseColor(vec3 rd)
 {
-    // Ported from the user's WGSL reference renderer: horizon/zenith
-    // gradient + horizon haze + sun glow and core, using the configured
-    // sun direction/color. Also serves as the fog target, so terrain fades
-    // into the exact sky it occludes (including sun haze near the sun).
-    vec3 sunDir = normalize(scene.lightDir.xyz);
-    float sunAmount = max(dot(rd, sunDir), 0.0);
     float up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
     float horizon = pow(1.0 - abs(rd.y), 3.0);
 
     vec3 sky = mix(scene.skyLow.xyz, scene.skyHigh.xyz, smoothstep(0.0, 1.0, up));
     vec3 haze = vec3(1.0, 0.95, 0.9) * (0.12 * horizon + 0.04 * horizon * horizon);
+    return sky + haze;
+}
 
+// Full sky for TRUE sky pixels (miss rays) only: adds the sun glow + core.
+vec3 skyColor(vec3 rd)
+{
+    vec3 sunDir = normalize(scene.lightDir.xyz);
+    float sunAmount = max(dot(rd, sunDir), 0.0);
     float sunGlow = pow(sunAmount, 48.0) * 0.8;
     float sunCore = pow(sunAmount, 512.0) * 8.0;
-
-    return sky + haze + scene.lightColor.xyz * (sunGlow + sunCore);
+    return skyBaseColor(rd) + scene.lightColor.xyz * (sunGlow + sunCore);
 }
 
 vec3 voxelColor(uint type, vec3 normal)
@@ -433,9 +458,12 @@ float fogAmount(float dist)
 // Traces one ray through the sub-pixel sample position uv (final NDC-style
 // coordinates, already aspect-scaled and y-flipped) and returns the shaded
 // color. When debugTerm is set, miss pixels are false-colored by their
-// termination cause instead of showing sky.
-vec3 traceRay(vec2 uv, bool debugTerm)
+// termination cause instead of showing sky. outDist receives the world-space
+// distance from the camera to the hit (-1 for sky) - the TAA reprojection
+// and history validation key off it.
+vec3 traceRay(vec2 uv, bool debugTerm, out float outDist)
 {
+    outDist = -1.0;
     vec3 camPos = scene.camPos.xyz;
     vec3 forward = normalize(scene.camForward.xyz);
     vec3 right = normalize(scene.camRight.xyz);
@@ -799,6 +827,10 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         float ndl = max(dot(n, sunDir), 0.0);
         vec3 base = voxelColor(hitType, normal);
 
+        // World-space hit distance for the TAA reprojection.
+        const vec3 hitWorld = hitPos * voxelSize;
+        outDist = distance(hitWorld, roWorld);
+
         // Per-vertex simulated AO on the hit face (from the owner's WGSL
         // reference): darkens creases and corners. Far-LOD hits skip AO
         // (invisible at multi-hundred-unit distances).
@@ -808,29 +840,179 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         }
 
         // Sun shadows: one cheap ascending ray toward the sun (near-exact
-        // via the height atlas, coarse via the far field).
-        const float shadow = sunShadow(hitPos, n);
+        // via the height atlas). Skipped when the direct term is zero
+        // anyway (sun-facing test first) and on far-LOD hits - beyond the
+        // near region the coarse test is barely visible under the fog but
+        // the march is not free.
+        float shadow = 1.0;
+        if (!farHit && ndl > 0.0) {
+            shadow = sunShadow(hitPos, n);
+        }
 
         // Lighting model ported from the owner's WGSL reference renderer:
         // hemispheric sky ambient + direct sun (lambert floor + broad
         // pow-8 lobe) + fresnel rim, from the sky THIS ray sees (so lit
-        // terrain and its fog background always agree). Shadow scales only
-        // the direct term; AO scales everything.
-        vec3 skyAmb = skyColor(rdWorld);
+        // terrain and its fog background always agree) - WITHOUT the sun
+        // disc/glow (skyBaseColor; the reference passes only envColors.sky
+        // into shading). Shadow scales the direct term and dims the
+        // ambient like sky occlusion, so shadows read clearly without
+        // crushing anything to black. AO scales everything.
+        vec3 skyAmb = skyBaseColor(rdWorld);
         float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-        vec3 ambient = mix(skyAmb * 0.35, skyAmb, hemi);
-        vec3 direct = scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0));
+        vec3 ambient =
+            mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
+        vec3 direct =
+            scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0)) * shadow;
         float view = max(dot(n, -rdWorld), 0.0);
         vec3 rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
 
-        vec3 color = base * (ambient + direct * shadow + rim) * ao;
+        vec3 color = base * (ambient + direct + rim) * ao;
 
-        // Distance fog towards the sky in this direction; hides the region
-        // edge and gives the world aerial perspective.
+        // Distance fog towards the sunless sky in this direction; hides
+        // the region edge and gives the world aerial perspective.
         float fog = clamp(fogAmount(tEntryOffset + tHit), 0.0, 1.0);
-        return mix(color, skyColor(rdWorld), fog);
+        return mix(color, skyBaseColor(rdWorld), fog);
     }
     return debugTerm ? termColor(termCause) : skyColor(rdWorld);
+}
+
+// --- TAA ------------------------------------------------------------------
+
+// History texel load from ring buffer `buf` (uniform branch on a push
+// constant; the four bindings are static so the descriptor set never
+// changes per frame).
+vec4 histLoad(uint buf, uint idx)
+{
+    if (buf == 0u) {
+        vec2 rg = unpackHalf2x16(taaHist0.texels[idx].x);
+        vec2 bd = unpackHalf2x16(taaHist0.texels[idx].y);
+        return vec4(rg, bd.x, bd.y);
+    }
+    if (buf == 1u) {
+        vec2 rg = unpackHalf2x16(taaHist1.texels[idx].x);
+        vec2 bd = unpackHalf2x16(taaHist1.texels[idx].y);
+        return vec4(rg, bd.x, bd.y);
+    }
+    if (buf == 2u) {
+        vec2 rg = unpackHalf2x16(taaHist2.texels[idx].x);
+        vec2 bd = unpackHalf2x16(taaHist2.texels[idx].y);
+        return vec4(rg, bd.x, bd.y);
+    }
+    vec2 rg = unpackHalf2x16(taaHist3.texels[idx].x);
+    vec2 bd = unpackHalf2x16(taaHist3.texels[idx].y);
+    return vec4(rg, bd.x, bd.y);
+}
+
+void histStore(uint buf, uint idx, vec3 rgb, float dist)
+{
+    const uvec2 packed =
+        uvec2(packHalf2x16(vec2(rgb.r, rgb.g)),
+              packHalf2x16(vec2(rgb.b, dist)));
+    if (buf == 0u) {
+        taaHist0.texels[idx] = packed;
+    } else if (buf == 1u) {
+        taaHist1.texels[idx] = packed;
+    } else if (buf == 2u) {
+        taaHist2.texels[idx] = packed;
+    } else {
+        taaHist3.texels[idx] = packed;
+    }
+}
+
+// Bilinear history sample at continuous texel coordinate h (already in
+// "sample space": h = screenCoord - 0.5 - historyJitter, so history texel q
+// sits at integer q). h must lie inside [0, size - 1).
+vec4 histSampleBilinear(uint buf, vec2 h, uvec2 size)
+{
+    ivec2 i0 = ivec2(floor(h));
+    vec2 f = h - vec2(i0);
+    const uint w = size.x;
+    const vec4 v00 = histLoad(buf, uint(i0.y) * w + uint(i0.x));
+    const vec4 v10 = histLoad(buf, uint(i0.y) * w + uint(i0.x + 1));
+    const vec4 v01 = histLoad(buf, uint(i0.y + 1) * w + uint(i0.x));
+    const vec4 v11 = histLoad(buf, uint(i0.y + 1) * w + uint(i0.x + 1));
+    const vec4 a = mix(v00, v10, f.x);
+    const vec4 b = mix(v01, v11, f.x);
+    return mix(a, b, f.y);
+}
+
+// Temporal antialiasing: blend the current (jittered) sample with the
+// reprojected history sample, validate by hit distance (rejects
+// disocclusions, streaming chunk pops and far-field swaps), softly clamp
+// the history to a current-centered box (the world is static and the
+// reprojection exact, so this only guards residual shading lag), and write
+// the blended result as the new history. Returns the resolved color.
+vec3 applyTaa(uvec2 p, vec3 cur, float dist)
+{
+    const uvec2 size = pc.screen.xy;
+    const uint idx = p.y * size.x + p.x;
+    const uint histRead = uint(pc.farParams.y);
+    const uint histWrite = uint(pc.farParams.z);
+
+    bool valid = scene.taa.y > 0.5;  // history exists (post-reset)
+    vec4 hist = vec4(0.0);
+
+    if (valid) {
+        // Reconstruct this pixel's world ray (exactly the one traceRay
+        // used: pixel center + this frame's jitter).
+        const vec3 camPos = scene.camPos.xyz;
+        const vec3 fwd = normalize(scene.camForward.xyz);
+        const vec3 rgt = normalize(scene.camRight.xyz);
+        const vec3 up = normalize(scene.camUp.xyz);
+        const float tanF = pc.camera.x;
+        vec2 uv = (vec2(p) + vec2(0.5) + scene.taaJitter.xy) *
+                      (2.0 / vec2(size)) - 1.0;
+        uv.y = -uv.y;
+        uv.x *= float(size.x) / float(size.y);
+        const vec3 rd =
+            normalize(fwd + rgt * (uv.x * tanF) + up * (uv.y * tanF));
+
+        // Project the hit into the HISTORY camera (the one that rendered
+        // the buffer being read). Sky pixels use a point far along the ray
+        // so sky validates against sky.
+        const bool curSky = dist < 0.0;
+        const vec3 hitW = camPos + rd * (curSky ? 250000.0 : dist);
+        const vec3 dP = hitW - scene.prevCamPos.xyz;
+        const vec3 pF = normalize(scene.prevCamForward.xyz);
+        const float z = dot(dP, pF);
+        if (z > 1e-3) {
+            const float aspect = float(size.x) / float(size.y);
+            const float px =
+                dot(dP, normalize(scene.prevCamRight.xyz)) / (z * tanF);
+            const float py =
+                dot(dP, normalize(scene.prevCamUp.xyz)) / (z * tanF);
+            // Undo the forward mapping (aspect scale on x, y flip) and the
+            // history frame's jitter to land in sample space.
+            vec2 h = vec2((px / aspect + 1.0) * 0.5 * float(size.x),
+                          (1.0 - py) * 0.5 * float(size.y)) -
+                     vec2(0.5) - scene.taaJitter.zw;
+            if (h.x >= 0.0 && h.y >= 0.0 &&
+                h.x < float(size.x) - 1.0 && h.y < float(size.y) - 1.0) {
+                hist = histSampleBilinear(histRead, h, size);
+                const bool histSky = hist.a < 0.0;
+                if (curSky != histSky ||
+                    (!curSky && abs(hist.a - dist) > 0.12 * dist + 2.0)) {
+                    valid = false;  // disocclusion / geometry change
+                }
+            } else {
+                valid = false;  // reprojected off-screen
+            }
+        } else {
+            valid = false;  // behind the history camera
+        }
+    }
+
+    if (valid) {
+        // Soft clamp: keep the history inside a box around the current
+        // sample (25% + floor). Cheaper than a 3x3 neighborhood clamp and
+        // enough for a static world with exact reprojection.
+        hist.rgb = clamp(hist.rgb, cur * 0.75 - vec3(0.02),
+                                cur * 1.25 + vec3(0.02));
+    }
+
+    const vec3 blended = valid ? mix(hist.rgb, cur, 0.1) : cur;
+    histStore(histWrite, idx, blended, dist);
+    return blended;
 }
 
 uint packColor(vec3 rgb01)
@@ -868,6 +1050,7 @@ void main()
 
     const bool debugTerm = scene.misc.y > 0.5;
     const bool superSample = scene.misc.z > 0.5;
+    const bool taaOn = scene.taa.x > 0.5;
 
     // Aspect handling: vertical FOV; the horizontal axis is scaled by the
     // aspect ratio. uv spans [-1, 1] with y flipped (screen y grows down).
@@ -875,10 +1058,12 @@ void main()
     vec2 uvStep = 2.0 / vec2(size);  // NDC units per pixel
 
     vec3 color = vec3(0.0);
+    float dist = -1.0;
     if (superSample) {
-        // VV_DEBUG_SSAA: 4 jittered samples per pixel (rotated grid). A
-        // diagnostic for aliasing/moire: if the "noisy pattern" disappears
-        // here, it is sub-pixel aliasing, not a logic bug.
+        // VV_DEBUG_SSAA: 4 samples per pixel (rotated grid), no TAA
+        // (supersampling already antialiases; TAA would just smear the
+        // extra detail). A diagnostic for aliasing/moire: if the "noisy
+        // pattern" disappears here, it is sub-pixel aliasing, not a bug.
         const vec2 offsets[4] = vec2[4](
             vec2(-0.25, -0.25), vec2(0.25, -0.25),
             vec2(-0.25, 0.25), vec2(0.25, 0.25));
@@ -886,14 +1071,22 @@ void main()
             vec2 uv = (vec2(p) + vec2(0.5) + offsets[s]) * uvStep - 1.0;
             uv.y = -uv.y;
             uv.x *= float(size.x) / float(size.y);
-            color += traceRay(uv, debugTerm);
+            color += traceRay(uv, debugTerm, dist);
         }
         color *= 0.25;
+    } else if (taaOn) {
+        // TAA: one ray per pixel through a Halton-jittered sub-pixel
+        // position, blended with the reprojected history (see applyTaa).
+        vec2 uv = (vec2(p) + vec2(0.5) + scene.taaJitter.xy) * uvStep - 1.0;
+        uv.y = -uv.y;
+        uv.x *= float(size.x) / float(size.y);
+        const vec3 cur = traceRay(uv, debugTerm, dist);
+        color = debugTerm ? cur : applyTaa(p, cur, dist);
     } else {
         vec2 uv = (vec2(p) + vec2(0.5)) * uvStep - 1.0;
         uv.y = -uv.y;
         uv.x *= float(size.x) / float(size.y);
-        color = traceRay(uv, debugTerm);
+        color = traceRay(uv, debugTerm, dist);
     }
 
     outPixels.outData[idx] = packColor(color);

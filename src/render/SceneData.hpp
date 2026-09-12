@@ -32,7 +32,28 @@ struct SceneUBO final {
 	glm::vec4 lightColor{};
 	glm::vec4 skyLow{};
 	glm::vec4 skyHigh{};
-	glm::vec4 misc{}; // x = timeSeconds
+	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = VV_DEBUG_SSAA
+	// TAA (pass 6). prevCam* is the camera that rendered the history the
+	// current frame reads (2 frames old with 2 frames in flight - see the
+	// renderer's 4-deep history ring). Layout must match the Scene block
+	// in pixels_rgba.comp.
+	glm::vec4 prevCamPos{};
+	glm::vec4 prevCamForward{};
+	glm::vec4 prevCamRight{};
+	glm::vec4 prevCamUp{};
+	glm::vec4 taa{};       // x = enabled, y = historyValid (0 = reset/first frames)
+	glm::vec4 taaJitter{}; // xy = current frame jitter (pixels), zw = history frame jitter
+};
+
+// TAA inputs the renderer derives from its history ring each frame
+// (defaults: TAA off). Consumed by SceneUniform::update.
+struct TaaData final {
+	glm::vec4 prevCamPos{};
+	glm::vec4 prevCamForward{};
+	glm::vec4 prevCamRight{};
+	glm::vec4 prevCamUp{};
+	glm::vec4 taa{};       // x = enabled, y = historyValid
+	glm::vec4 taaJitter{}; // xy = current, zw = history jitter
 };
 
 }  // namespace vv::render

@@ -160,43 +160,52 @@ void testTerrainHeightBounds() {
 }
 
 void testTerrainLayering() {
+	// Density-model invariants (the exact 2D heightmap semantics are gone:
+	// the 3D warp can push solids above heightAt's surface and carve air
+	// below it; what MUST hold are the structural guarantees the renderer
+	// and the far LOD rely on).
 	const vv::terrain::TerrainGenerator gen(testTerrainConfig());
-	const auto& cfg = gen.config();
-	const double dirtDepth = std::floor(cfg.dirtDepth);
+	const std::int32_t warp = gen.maxWarpVoxels();
 	bool ok = true;
 	for (int i = 0; i < 500; ++i) {
-		// Integer columns: typeAt() re-evaluates heightAt at the exact column,
-		// so the test must not mix fractional and truncated coordinates.
 		const std::int32_t x = i * 3 - 700;
 		const std::int32_t z = -i * 2 + 400;
-		const double h = gen.heightAt(double(x), double(z));
-		const std::int32_t surface = static_cast<std::int32_t>(std::floor(h));
+		const float target =
+				gen.surfaceTargetF(float(x), float(z));
+		const std::int32_t above =
+				static_cast<std::int32_t>(std::ceil(target)) + warp;
+		const std::int32_t deep =
+				static_cast<std::int32_t>(std::floor(target)) - 60;
 
-		// Above the surface: air.
-		if (gen.typeAt(x, surface + 1, z) != vv::voxel::VoxelType::Air) {
+		// Above the warp band: provably air (the sky-skip/ceiling contract).
+		if (gen.typeAt(x, above, z) != vv::voxel::VoxelType::Air) {
 			ok = false;
 		}
-		// Surface voxel: a top-layer type.
-		const auto top = gen.typeAt(x, surface, z);
-		if (top != vv::voxel::VoxelType::Grass &&
-				top != vv::voxel::VoxelType::Sand &&
-				top != vv::voxel::VoxelType::Snow) {
+		// Deep below the target: provably stone (or bedrock at the floor).
+		const auto deepType = gen.typeAt(x, std::max(deep, 1), z);
+		if (deepType != vv::voxel::VoxelType::Stone &&
+			deepType != vv::voxel::VoxelType::Bedrock) {
 			ok = false;
 		}
 		// Bottom of the world: bedrock.
 		if (gen.typeAt(x, 0, z) != vv::voxel::VoxelType::Bedrock) {
 			ok = false;
 		}
-		// Below the dirt layer (when such a layer exists at all): stone.
-		if (surface > dirtDepth + 1) {
-			const std::int32_t deepY =
-					surface - static_cast<std::int32_t>(dirtDepth) - 1;
-			if (gen.typeAt(x, deepY, z) != vv::voxel::VoxelType::Stone) {
-				ok = false;
-			}
+		// The topmost solid voxel carries a top-layer type (this is what the
+		// far LOD stores as its surface type) and stays under the bound.
+		const std::int32_t top = gen.topSolidVoxels(x, z);
+		if (top < 0 || top > gen.maxHeightVoxels()) {
+			ok = false;
+			continue;
+		}
+		const auto topType = gen.typeAt(x, top, z);
+		if (topType != vv::voxel::VoxelType::Grass &&
+			topType != vv::voxel::VoxelType::Sand &&
+			topType != vv::voxel::VoxelType::Snow) {
+			ok = false;
 		}
 	}
-	check(ok, "terrain: layering rules (air/top/bedrock/stone)");
+	check(ok, "terrain: density layering rules (air/stone/bedrock/top)");
 }
 
 void testWorldRegion() {
@@ -340,21 +349,52 @@ void testChunkMatchesGenerator() {
 					chunk->paddedByteSize() >= chunk->voxelCount(),
 				"chunk: padded byte size is 4-aligned and >= voxel count");
 
+	// Canonical comparison: the chunk must equal a fresh
+	// generateChunkVoxels fill (that path IS the generator now - exact
+	// per-voxel typeAt walks cannot match the chunk by construction because
+	// chunks sample the 3D noise on a coarse lattice).
+	std::vector<std::uint8_t> expected;
+	world.terrain().generateChunkVoxels(0, 0, 32, 32, 128, expected);
+	check(expected.size() == chunk->voxelCount(),
+				"chunk: generator fill covers the whole chunk");
 	bool matches = true;
-	for (std::uint32_t z = 0; z < 32; z += 7) {
-		for (std::uint32_t y = 0; y < 128; y += 13) {
-			for (std::uint32_t x = 0; x < 32; x += 5) {
-				const auto expected = world.terrain().typeAt(
-						static_cast<std::int32_t>(x),
-						static_cast<std::int32_t>(y),
-						static_cast<std::int32_t>(z));
-				if (chunk->get(x, y, z) != expected) {
+	for (std::uint32_t z = 0; z < 32 && matches; ++z) {
+		for (std::uint32_t y = 0; y < 128 && matches; ++y) {
+			for (std::uint32_t x = 0; x < 32 && matches; ++x) {
+				if (chunk->get(x, y, z) !=
+						static_cast<vv::voxel::VoxelType>(
+								expected[std::size_t(x) + std::size_t(y) * 32 +
+												 std::size_t(z) * 32 * 128])) {
 					matches = false;
 				}
 			}
 		}
 	}
 	check(matches, "chunk: contents match the terrain generator");
+
+	// Structural zones must also agree with the exact typeAt (air above the
+	// warp band, bedrock at the floor) - see testTerrainLayering.
+	bool zonesOk = true;
+	for (std::uint32_t z = 0; z < 32; z += 3) {
+		for (std::uint32_t x = 0; x < 32; x += 3) {
+			const std::int32_t xi = static_cast<std::int32_t>(x);
+			const std::int32_t zi = static_cast<std::int32_t>(z);
+			const float target =
+					world.terrain().surfaceTargetF(float(xi), float(zi));
+			const std::int32_t above =
+					static_cast<std::int32_t>(std::ceil(target)) +
+					world.terrain().maxWarpVoxels();
+			if (above >= 0 && above < 128 &&
+				chunk->get(x, static_cast<std::uint32_t>(above), z) !=
+						vv::voxel::VoxelType::Air) {
+				zonesOk = false;
+			}
+			if (chunk->get(x, 0, z) != vv::voxel::VoxelType::Bedrock) {
+				zonesOk = false;
+			}
+		}
+	}
+	check(zonesOk, "chunk: structural zones match the generator guarantees");
 }
 
 void testChunkHeightMap() {
@@ -851,23 +891,125 @@ void testFarField() {
 					float(field.originVoxX + int(i * cell) + int(cell / 2));
 			const float wz =
 					float(field.originVoxZ + int(j * cell) + int(cell / 2));
-			const float h = gen.heightAtF(wx, wz);
-			const std::int32_t surface = std::int32_t(std::floor(h));
-			if (int(packed & 0xFFFFu) != surface + 1) {
+			const float target = gen.surfaceTargetF(wx, wz);
+			const float mask = gen.mountainMaskF(wx, wz);
+			const std::int32_t top =
+					gen.estimatedTopSolid(wx, wz, target, mask);
+			if (int(packed & 0xFFFFu) != top + 1) {
 				heightsOk = false;
 			}
-			if ((packed >> 16u) != std::uint32_t(gen.typeForColumn(surface, h))) {
+			if ((packed >> 16u) !=
+				std::uint32_t(gen.typeForDepth(top, top))) {
 				typesOk = false;
+			}
+			// The estimate must stay within the warp band of the target and
+			// under the solid bound (seam consistency with the near region).
+			if (top > gen.maxHeightVoxels() ||
+				float(top) > target + float(gen.maxWarpVoxels()) || top < 0) {
+				heightsOk = false;
 			}
 		}
 	}
-	check(heightsOk, "far: height = floor(heightAtF(center)) + 1 per cell");
+	check(heightsOk, "far: height = estimated top solid + 1 per cell");
 	check(typesOk, "far: type = surface type at cell center");
 
 	const auto again = vv::terrain::FarField::build(gen, 0, 0, radius, cell,
 																										chunk);
 	check(again.cells == field.cells && again.originVoxX == field.originVoxX,
 				"far: deterministic rebuild");
+}
+
+
+// ---------------------------------------------------------------------------
+// Density terrain: mountains and overhangs. The 3D warp must actually fold
+// the surface (air gaps under solids) inside mountain ranges, every column
+// must keep ground (no floating islands - the saturating height term), and
+// the solid bound must hold everywhere sampled.
+// ---------------------------------------------------------------------------
+
+void testTerrainOverhangs() {
+	const vv::terrain::TerrainGenerator gen(testTerrainConfig());
+
+	// Find a mountain core deterministically (seed 1337): scan a broad area
+	// for a strong mask, then examine a chunk around it.
+	float bestMask = 0.0f;
+	std::int32_t bx = 0, bz = 0;
+	for (std::int32_t z = -1024; z <= 1024; z += 16) {
+		for (std::int32_t x = -1024; x <= 1024; x += 16) {
+			const float m = gen.mountainMaskF(float(x), float(z));
+			if (m > bestMask) {
+				bestMask = m;
+				bx = x;
+				bz = z;
+			}
+		}
+	}
+	check(bestMask > 0.7f, "terrain: a mountain core exists near the origin");
+	check(gen.surfaceTargetF(float(bx), float(bz)) >= 80.0f,
+				"terrain: mountain core target is high");
+
+	// Generate the chunk at the core (snapped to chunk-local coordinates:
+	// pass absolute voxel coordinates; the generator is coordinate-absolute).
+	const std::int32_t baseX = bx & ~31;
+	const std::int32_t baseZ = bz & ~31;
+	std::vector<std::uint8_t> types;
+	gen.generateChunkVoxels(baseX, baseZ, 32, 32, 128, types);
+	const auto solidAt = [&](std::uint32_t x, std::uint32_t y,
+													 std::uint32_t z) {
+		return types[std::size_t(x) + std::size_t(y) * 32 +
+							 std::size_t(z) * 32 * 128] !=
+					 static_cast<std::uint8_t>(vv::voxel::VoxelType::Air);
+	};
+
+	std::size_t overhangColumns = 0;
+	std::size_t tallColumns = 0;
+	bool groundEverywhere = true;
+	bool boundOk = true;
+	for (std::uint32_t z = 0; z < 32; ++z) {
+		for (std::uint32_t x = 0; x < 32; ++x) {
+			// Topmost solid in the chunk column.
+			std::int32_t top = -1;
+			for (std::int32_t y = 127; y >= 0; --y) {
+				if (solidAt(x, static_cast<std::uint32_t>(y), z)) {
+					top = y;
+					break;
+				}
+			}
+			if (top > 80) {
+				++tallColumns;
+			}
+			if (top > gen.maxHeightVoxels()) {
+				boundOk = false;
+			}
+			// Ground continuity: solid deep below the target.
+			const float target = gen.surfaceTargetF(
+					float(baseX + static_cast<std::int32_t>(x)),
+					float(baseZ + static_cast<std::int32_t>(z)));
+			const std::int32_t ground =
+					std::max<std::int32_t>(
+							static_cast<std::int32_t>(std::floor(target)) - 60, 1);
+			if (!solidAt(x, static_cast<std::uint32_t>(ground), z)) {
+				groundEverywhere = false;
+			}
+			// Overhang: a gap strictly between two solids in the column.
+			if (top >= 2) {
+				bool inGap = false;
+				for (std::int32_t y = top - 1; y >= 1; --y) {
+					if (!solidAt(x, static_cast<std::uint32_t>(y), z)) {
+					inGap = true;
+				} else if (inGap) {
+					++overhangColumns;
+					break;
+				}
+			}
+			}
+		}
+	}
+	check(tallColumns > 0, "terrain: mountain chunk has tall columns");
+	check(groundEverywhere, "terrain: every column keeps ground (no floats)");
+	check(boundOk, "terrain: no solid above maxHeightVoxels()");
+	check(overhangColumns > 0,
+				"terrain: overhangs exist in the mountain chunk");
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,6 +1500,7 @@ int main() {
 	testNoiseSimdParity();
 	testTerrainHeightBounds();
 	testTerrainLayering();
+	testTerrainOverhangs();
 	testWorldRegion();
 	testWorldWalk();
 	testWorldDeterminism();

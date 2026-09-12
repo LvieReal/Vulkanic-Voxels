@@ -29,61 +29,37 @@ World::World(const vv::terrain::TerrainConfig& terrainConfig,
 
 namespace {
 
-// Writes the solid range [0, min(surface, topBound)] of one column; cells
-// above the surface stay Air (Chunk initializes to Air).
-void fillColumn(const vv::terrain::TerrainGenerator& terrain,
-												vv::voxel::Chunk& chunk, std::uint32_t x, std::uint32_t z,
-											float height, std::int32_t topBound) {
-	const std::int32_t surface = static_cast<std::int32_t>(std::floor(height));
-	const std::int32_t top = std::min(std::max(surface, 0), topBound);
-	for (std::int32_t y = 0; y <= top; ++y) {
-		chunk.set(x, static_cast<std::uint32_t>(y), z,
-						 terrain.typeForColumn(y, height));
-	}
-}
+// (The old heightmap fill lived here; generation now goes through
+// TerrainGenerator::generateChunkVoxels - the 3D density field that also
+// produces mountains and overhangs.)
 
 }  // namespace
 
 Chunk* World::generateChunk(const ChunkCoord& coord) {
 	auto chunk = std::make_unique<Chunk>(coord.x, coord.z, m_chunkSizeX,
-																			 m_worldHeight, m_chunkSizeZ);
+																				m_worldHeight, m_chunkSizeZ);
 
-	// Column-major fill, vectorized 4 columns at a time (heightAt4 uses the
-	// SSE2 fBm; bit-identical to heightAt, so chunks match the generator
-	// exactly - see the parity tests). Only the solid range of each column
-	// is written; cells above the surface stay Air from the constructor.
+	// Canonical fill via the terrain generator: 2D targets + coarse-lattice
+	// 3D noise -> density -> layered voxel types (deterministic; the
+	// world-determinism test exercises the same path).
 	const std::int64_t baseX =
 			static_cast<std::int64_t>(coord.x) * m_chunkSizeX;
 	const std::int64_t baseZ =
 			static_cast<std::int64_t>(coord.z) * m_chunkSizeZ;
-	const std::int32_t topBound =
-			static_cast<std::int32_t>(m_worldHeight) - 1;
-
-	float heights[4];
+	std::vector<std::uint8_t> types;
+	m_terrain.generateChunkVoxels(static_cast<std::int32_t>(baseX),
+																static_cast<std::int32_t>(baseZ),
+																m_chunkSizeX, m_chunkSizeZ, m_worldHeight,
+																types);
 	for (std::uint32_t z = 0; z < m_chunkSizeZ; ++z) {
-		const float wz =
-				static_cast<float>(baseZ + static_cast<std::int64_t>(z));
-		const float zs[4] = {wz, wz, wz, wz};
-		for (std::uint32_t x = 0; x < m_chunkSizeX; x += 4) {
-			const std::uint32_t count =
-					std::min<std::uint32_t>(4, m_chunkSizeX - x);
-			if (count == 4) {
-				const float xs[4] = {
-						static_cast<float>(baseX + static_cast<std::int64_t>(x)),
-						static_cast<float>(baseX + static_cast<std::int64_t>(x) + 1),
-						static_cast<float>(baseX + static_cast<std::int64_t>(x) + 2),
-						static_cast<float>(baseX + static_cast<std::int64_t>(x) + 3)};
-				m_terrain.heightAt4(xs, zs, heights);
-				for (std::uint32_t k = 0; k < 4; ++k) {
-					fillColumn(m_terrain, *chunk, x + k, z, heights[k], topBound);
-				}
-			} else {
-				// Tail (< 4 columns left; not hit by the default 32-wide chunks).
-				for (std::uint32_t k = 0; k < count; ++k) {
-					const float height = m_terrain.heightAtF(
-							static_cast<float>(baseX + static_cast<std::int64_t>(x + k)),
-						wz);
-					fillColumn(m_terrain, *chunk, x + k, z, height, topBound);
+		for (std::uint32_t y = 0; y < m_worldHeight; ++y) {
+			const std::size_t base = (static_cast<std::size_t>(z) *
+																m_chunkSizeX * m_worldHeight) +
+															 static_cast<std::size_t>(y) * m_chunkSizeX;
+			for (std::uint32_t x = 0; x < m_chunkSizeX; ++x) {
+				const auto type = static_cast<vv::voxel::VoxelType>(types[base + x]);
+				if (type != vv::voxel::VoxelType::Air) {
+					chunk->set(x, y, z, type);
 				}
 			}
 		}

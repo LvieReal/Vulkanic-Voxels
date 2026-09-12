@@ -29,10 +29,14 @@ FarField FarField::build(const TerrainGenerator& gen,
 	field.originVoxX = static_cast<std::int32_t>(centerX - half);
 	field.originVoxZ = static_cast<std::int32_t>(centerZ - half);
 
-	// One noise evaluation per cell, at the cell center (see header comment
-	// for the sampling trade-off). heightAtF is const and thread-safe; the
-	// 4-wide path would help here but lanes share no state, so the scalar
-	// call is fine on the background thread.
+	// One column evaluation per cell, at the cell center (see header comment
+	// for the sampling trade-off). With the 3D density terrain the stored
+	// height is the ESTIMATED topmost solid voxel (one fixed-point iteration
+	// of the isosurface: 3D noise sampled at the target height) - within a
+	// couple of voxels of the true surface, far below the 4-voxel cell
+	// footprint, and consistent with the near-region silhouette at the seam
+	// to within the existing far quantization. heightAtF is const and
+	// thread-safe.
 	field.cells.assign(static_cast<std::size_t>(field.dim) * field.dim, 0u);
 	for (std::uint32_t j = 0; j < field.dim; ++j) {
 		const float wz = static_cast<float>(
@@ -42,14 +46,14 @@ FarField FarField::build(const TerrainGenerator& gen,
 			const float wx = static_cast<float>(
 					static_cast<std::int64_t>(field.originVoxX) +
 					static_cast<std::int64_t>(i) * cellVoxels + cellVoxels / 2);
-			const float height = gen.heightAtF(wx, wz);
-			const std::int32_t surface =
-					static_cast<std::int32_t>(std::floor(height));
-			const auto type =
-					gen.typeForColumn(surface, height);
+			const float target = gen.surfaceTargetF(wx, wz);
+			const float mask = gen.mountainMaskF(wx, wz);
+			const std::int32_t topSolid =
+					gen.estimatedTopSolid(wx, wz, target, mask);
+			const auto type = gen.typeForDepth(topSolid, topSolid);
 			field.cells[static_cast<std::size_t>(i) +
 									static_cast<std::size_t>(j) * field.dim] =
-					packColumn(static_cast<std::uint16_t>(surface + 1),
+					packColumn(static_cast<std::uint16_t>(topSolid + 1),
 										 static_cast<std::uint8_t>(type));
 		}
 	}

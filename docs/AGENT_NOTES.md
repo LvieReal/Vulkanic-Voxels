@@ -586,6 +586,104 @@ Shadowed faces keep 35%+ sky ambient - no more pitch-black north faces.
 pass (12k traversal-parity rays, far march, shadow march, heightmaps,
 SIMD bit-exactness, world APIs).
 
+### Pass 6: TAA, sun-through-voxels fix, cheaper+stronger shadows, 1-chunk streaming, 3D terrain (mountains + overhangs)
+
+**TAA** (user request, replacing SSAA as the everyday AA): the compute
+shader now traces ONE ray per pixel through a Halton(2,3)-jittered
+sub-pixel position (8-point sequence, 0.75px amplitude) and blends it
+with the reprojected history sample (alpha 0.1). History lives in a
+4-deep ring of pixel buffers (uvec2 per pixel = two packed half2s:
+rgb + ray distance, sky = -1); frame N writes ring[N%4] and reads
+ring[(N-2)%4] - the frame-in-flight fence guarantees the writer has
+fully retired, so no extra sync exists beyond the existing fence +
+pre-compute barriers. Reprojection reconstructs the pixel's world ray,
+projects the hit into the HISTORY camera (2 frames old; ring slot
+remembers that frame's camera + jitter), and bilinearly samples.
+Validation by hit distance (12% + 2 voxels; sky sentinel -1) rejects
+disocclusions, streaming chunk pops and far-field swaps. A soft clamp
+keeps history within 25% of the current sample (the world is static and
+the reprojection exact, so no 3x3 neighborhood clamp is needed - kept
+in reserve if ghosting is ever reported). History resets for 4 frames
+after any swapchain (re)creation. ~33 MB at 1080p (4 x 8 bytes/pixel).
+VV_TAA=0 disables (plain un-jittered path); VV_DEBUG_TERM and VV_SSAA
+force it off (false colors / 4-sample supersampling respectively).
+
+**Sun visible through voxels** (user bug report): the pass-5 lighting
+port FUSED the sky and the sun into one skyColor() and used it for
+ambient, rim AND the fog target - so terrain toward the sun got the
+sun disc/glow blended and added straight through it. The WGSL
+reference is clean on this (compute_env returns .sky and .sun
+separately; trace_voxel's ambient/rim take only .sky). Fixed the same
+way: skyBaseColor() (gradient + haze) drives ambient/rim/fog;
+sunColor is added only on true sky pixels.
+
+**Shadows: cheaper and stronger** (user: "subtle and they do hit on
+performance"): the shadow march is now skipped entirely when the
+direct term is zero anyway (ndl <= 0 - the pow-8 lobe is clamped) and
+on far-LOD hits (beyond the near region the coarse test was barely
+visible under the fog but not free). To make the surviving shadows
+read clearly, shadowed ground now also sees less sky: the ambient dims
+with the shadow (0.55 + 0.45*shadow, soft sky occlusion) instead of
+staying full-bright - visible shadows without crushing anything to
+black.
+
+**Chunk streaming capped to 1 per frame** (user request, "completely
+get rid of stutter"): each pump generates at most one chunk and does
+at most one upload flush (the flush contains a vkDeviceWaitIdle - the
+real stutter source; the old batch-4 loop could flush several times
+per frame). A border crossing (49 chunks at r=12) now streams over
+~49 frames (~0.8 s at 60 fps) while the old region keeps rendering.
+The 3 ms generation budget stays as a secondary guard; the >2-chunk
+catch-up fallback is unchanged.
+
+**Terrain generation upgrade: mountains + overhangs via 3D noise**
+(user request). New Noise3D (Perlin-style, float32, fixed op order,
+same contract as Noise2D; scalar only - the chunk path samples it on
+a lattice). The world is now a density field:
+  density = clamp(g * (target(x,z) - y), -3, +3) + fbm3(x, y*sq, z) * amp(mask)
+- target = the old 2D heightAtF + mountain lift (ridged-fBm range
+  mask, ~25% coverage, smoothstep 0.58-0.74; lift up to +42, targets
+  clamped at 96 = flat snow summits where it binds).
+- The saturating height term bounds the warp: solids cannot exist
+  above target + amp*0.5/g and cannot be missing below target -
+  (3+amp)/g, so no floating islands and every column has ground.
+- Folds (overhangs) need the warp's vertical slope to exceed 1.
+  Gradient noise is far too smooth for that at terrain wavelengths
+  (measured: |fbm3| < 0.5, vertical slope ~0.05/voxel at wl=48), so
+  the noise is vertically squashed (y * 2) and g dropped to 0.10 with
+  amp 1.2 (plains) / 5.5 (mountains): measured ~16% of mountain
+  columns fold, plains stay a heightfield, displacement +-9 voxels.
+- Chunks sample fbm3 on a coarse lattice (stride 4 in XZ, 2 in Y -
+  Y must stay fine or the fold slope aliases away) and trilinearly
+  interpolate: ~2.8 ms/chunk (was ~0.8; still fine at 1/frame).
+- Two bugs found on the way, both worth remembering: (1) the lattice
+  lookup used ABSOLUTE x/z as lattice indices - every chunk not at
+  the origin sampled the clamped edge and got constant noise (the
+  overhang test caught it; heightmap/generator tests could not, since
+  chunk (0,0) straddles the valid range by luck); (2) the lattice
+  forgot the vertical squash while densityAtF applied it - chunks
+  silently diverged from typeAt and folds vanished.
+- Far LOD stores the estimated top solid: fixed-point iteration of
+  the isosurface seeded at THREE heights (target-6, target, target+6),
+  reduced to the max (folds make a single seed converge to a lower
+  lobe; the max keeps the far silhouette from dipping below the near
+  terrain at the seam).
+- heightAt/heightAt4 (2D) unchanged - the old bounds tests stand.
+  New test testTerrainOverhangs: finds a mountain core
+  deterministically, asserts tall columns exist, ground continuity,
+  the solid bound, and overhangs present. Layering/chunk/far tests
+  rewritten for density semantics (chunk vs generateChunkVoxels is
+  now the canonical comparison; typeAt is the exact-eval reference
+  for the structural zones).
+- Spawn now uses topSolidVoxels (the density surface can sit a
+  mountain + warp above the old 2D heightAt).
+
+**Verified**: shader compiles (glslangValidator); Release + Debug
+warning-free; all tests pass (incl. new overhang test, 12k traversal
+parity rays, far march, shadow march, heightmaps, SIMD bit-exactness);
+offscreen smoke clean in all three modes (TAA default, VV_TAA=0,
+VV_SSAA=1).
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -607,7 +705,17 @@ SIMD bit-exactness, world APIs).
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 5 — done (pending user verification):**
+**Pass 6 — done (pending user verification):**
+- [x] TAA: 1 jittered ray/pixel + 4-ring history reprojection
+      (VV_TAA=0 off; auto-off under VV_DEBUG_TERM / VV_SSAA)
+- [x] Sun-through-voxels fixed (sky/sun split, reference-faithful)
+- [x] Shadows: skip ndl<=0 + far hits; ambient sky-occlusion in
+      shadow (visible, cheaper)
+- [x] Streaming: 1 chunk/frame hard cap (one gen + one flush)
+- [x] 3D density terrain: mountain ranges, overhangs, far-LOD top
+      solid; VV_TAA documented here
+
+**Pass 5 — done (user-verified: crop gone at any altitude):**
 - [x] Out-of-bounds altitude crop fixed (fog-cut early return bypassed
       the far march on box-miss rays)
 - [x] Branchless DDA stepping in both marches (parity-preserved ties)

@@ -13,8 +13,10 @@ namespace vv::terrain {
 // and the surface voxel type (u8), packed as height | type << 16 into one
 // u32, row-major over X + Z * dim.
 //
-// Sampling: one heightAtF evaluation at the cell CENTER (the same terrain
-// function the chunks use). This quantizes distant silhouettes by roughly
+// Sampling: one column evaluation at the cell CENTER - the terrain
+// generator's estimated topmost solid voxel (see TerrainGenerator::
+// estimatedTopSolid), matching the near-region silhouette to within the
+// existing far quantization. This quantizes distant silhouettes by roughly
 // +-cellVoxels/2 of terrain height - the accepted far-LOD trade-off (see
 // AGENT_NOTES pass 4); a conservative max-of-samples seam band is a future
 // refinement if the seam is ever objectionable.

@@ -27,9 +27,12 @@ class SceneUniform final {
   // debugFlags: x = termination-cause visualization (VV_DEBUG_TERM),
   // y = 4x supersampling (VV_DEBUG_SSAA); both land in SceneUBO.misc.yz,
   // which the shader consumes. Defaults keep the plain path.
+  // taa: temporal-antialiasing inputs (history camera + jitter + flags)
+  // from the renderer's ring; defaults disable TAA.
   void update(const vv::core::Camera& camera, float timeSeconds,
               const LightingConfig& lighting,
-              const glm::vec2& debugFlags = glm::vec2(0.0f));
+              const glm::vec2& debugFlags = glm::vec2(0.0f),
+              const TaaData& taa = TaaData{});
 
   VkBuffer buffer() const { return m_buffer; }
   void* mapped() const { return m_mapped; }
