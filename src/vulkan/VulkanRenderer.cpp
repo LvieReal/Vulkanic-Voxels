@@ -35,6 +35,15 @@ using namespace vv::vulkan::utils;
 // fully swap, invisible because the old region keeps rendering meanwhile.
 constexpr double kStreamBudgetMs = 3.0;
 constexpr std::size_t kStreamChunksPerFrame = 1;
+// Sprint mode: when the camera outruns the base rate (more than 2 chunks
+// ahead of the ACTIVE region center), the pump raises its per-frame cap and
+// budget - the CPU is mostly idle while the GPU traces, so spending up to
+// 10 ms/frame on generation is nearly free and drains the deficit in a few
+// frames. This REPLACES the old >2-chunk synchronous catch-up, which
+// generated everything at once (25 chunks per crossed row x 2.8 ms = 70 ms+
+// hitches every couple of frames - the sprint stutter).
+constexpr std::size_t kStreamSprintChunks = 4;
+constexpr double kStreamSprintBudgetMs = 10.0;
 
 // Fog tail attenuation used ONLY inside the shader's fog curve
 // (fog = 1 - exp(-kFogTail * (d/cut)^4)); the C++ side never needs the value,
@@ -344,20 +353,12 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       } else if (m_streamPending.empty()) {
         finishRegionMove();
       }
-    } else if (std::abs(chunkX - m_regionCenter.x) > 2 ||
-               std::abs(chunkZ - m_regionCenter.z) > 2) {
-      // Streaming cannot keep up with a fast camera: catch up
-      // synchronously (pass-6 behavior, restored by the pass-9 revert).
-      m_streamActive = false;
-      m_streamPending.clear();
-      std::string error;
-      if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-        std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                     error.c_str());
-      }
-    } else {
-      pumpRegionStreaming(kStreamBudgetMs);
     }
+    // No synchronous catch-up anymore: a fast camera just flips the pump
+    // into sprint mode (see kStreamSprintChunks), which drains the deficit
+    // within a few frames instead of hitching. Teleports still take the
+    // fallback above.
+    pumpRegionStreaming(kStreamBudgetMs);
     ensureFarField(chunkX, chunkZ);
     return;
   }
@@ -446,17 +447,27 @@ void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
   }
   const auto start = std::chrono::steady_clock::now();
 
-  // One chunk per frame (kStreamChunksPerFrame) through the FENCE-SCOPED
-  // upload path: no vkDeviceWaitIdle / vkQueueWaitIdle / per-frame staging
-  // allocation (those were the streaming stutter). The upload only touches
-  // spare-ring slots no uploaded table references; finishRegionMove drains
-  // everything with its own device wait before the table swap. The
-  // remaining per-frame cost is the chunk generation itself (~2.8 ms).
+  // Through the FENCE-SCOPED upload path: no vkDeviceWaitIdle /
+  // vkQueueWaitIdle / per-frame staging allocation (those were the
+  // streaming stutter). The upload only touches spare-ring slots no
+  // uploaded table references; finishRegionMove drains everything with its
+  // own device wait before the table swap.
+  //
+  // Deficit-adaptive rate: normally one chunk within budgetMs; when the
+  // camera runs more than 2 chunks ahead of the ACTIVE region (sprint),
+  // raise both (see kStreamSprintChunks) so the deficit drains within a
+  // few frames instead of growing into the teleport fallback.
+  const std::size_t deficit = static_cast<std::size_t>(std::max(
+      std::abs(m_streamTarget.x - m_regionCenter.x),
+      std::abs(m_streamTarget.z - m_regionCenter.z)));
+  const std::size_t cap =
+      deficit > 2 ? kStreamSprintChunks : kStreamChunksPerFrame;
+  const double effectiveBudget = deficit > 2 ? kStreamSprintBudgetMs : budgetMs;
   std::size_t streamed = 0;
-  while (!m_streamPending.empty() && streamed < kStreamChunksPerFrame) {
+  while (!m_streamPending.empty() && streamed < cap) {
     const std::chrono::duration<double> elapsed =
         std::chrono::steady_clock::now() - start;
-    if (elapsed.count() * 1000.0 >= budgetMs) {
+    if (elapsed.count() * 1000.0 >= effectiveBudget) {
       break;
     }
     const vv::voxel::ChunkCoord coord = m_streamPending.back();
@@ -1321,6 +1332,21 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   if (!m_voxelResources.writeChunkTable(table)) {
     outError = "Failed to update the chunk table.";
     return false;
+  }
+
+  // The region boundary moved: re-derive the far-LOD seam band from the
+  // now-active chunks (same as finishRegionMove). Without this, every
+  // synchronous path (initial region, teleport fallback, catch-up-era
+  // rebuilds) left the new seam on unpatched estimates, which under-shoot
+  // folded mountain terrain -> rare "missing chunks" holes at the seam.
+  if (patchFarFieldWithRegion()) {
+    std::string patchError;
+    if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
+                                         m_commandPool, m_graphicsQueue,
+                                         m_farCells, patchError)) {
+      std::fprintf(stderr, "[vulkan] far LOD seam patch upload failed: %s\n",
+                   patchError.c_str());
+    }
   }
 
   return true;

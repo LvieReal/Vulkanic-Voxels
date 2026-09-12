@@ -879,6 +879,43 @@ the renderer's m_debugSuperSample are gone. VV_DEBUG_TERM remains.
 **Verified**: shader compiles; Release + Debug warning-free; all tests
 pass; offscreen smoke clean (VV_SSAA now silently ignored).
 
+### Pass 11: sprint stutter (adaptive pump replaces the sync catch-up) + rare seam holes
+
+Pass 10 report (owner): "stutter persists during sprint and missing
+chunks are back (just much more rare now)." Both symptoms pointed at
+the one streaming-adjacent function never audited in depth:
+rebuildChunkRegion - exactly what sprint triggers.
+
+**Sprint stutter - the >2-chunk synchronous catch-up.** At sprint the
+camera outruns the 1-chunk/frame pump; every ~2 frames the >2-chunk
+check fired the catch-up, a SYNCHRONOUS rebuild that generates all
+accumulated chunks in one frame (each crossed row = 25 chunks x
+~2.8 ms = 70 ms+ hitches, back to back). The pass-10 fence-scoped
+upload fixed the pump, but the pump barely ran at sprint - the
+catch-up was the stutter. Fix: the catch-up is GONE. The pump is now
+deficit-adaptive: while the camera runs more than 2 chunks ahead of
+the ACTIVE region center, the per-frame cap rises to 4 chunks within a
+10 ms budget (the CPU is mostly idle while the GPU traces, so this is
+nearly free); otherwise 1 chunk within the usual 3 ms. The deficit
+drains within a few frames; region swaps only happen on complete
+regions (no early-swap holes by construction). The teleport fallback
+(pending > spare ring) keeps the synchronous rebuild - teleport-scale
+moves genuinely need it.
+
+**Rare missing chunks - stale far seam after synchronous rebuilds.**
+rebuildChunkRegion (initial region, teleport fallback, and every
+catch-up) moved the region boundary WITHOUT re-patching the far-LOD
+seam band - patchFarFieldWithRegion only ran in finishRegionMove. The
+new seam then sat on unpatched estimates, which under-shoot folded
+mountain terrain by up to ~20 voxels -> holes right where the LOD
+begins. Rare because it needs a catch-up swap plus a fold at the seam.
+Fix: rebuildChunkRegion now re-derives the seam band from the active
+chunks and re-uploads when anything changed (same call as
+finishRegionMove; upload only on change).
+
+**Verified**: Release + Debug warning-free; all tests pass; offscreen
+smoke clean.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -900,7 +937,14 @@ pass; offscreen smoke clean (VV_SSAA now silently ignored).
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 10 — done (pending user verification):**
+**Pass 11 — done (pending user verification):**
+- [x] Sprint stutter: sync catch-up removed; deficit-adaptive pump
+      (4 chunks / 10 ms while behind, 1 / 3 ms otherwise)
+- [x] Rare seam holes: far seam re-patched after every synchronous
+      region rebuild, not just streaming swaps
+
+**Pass 10 — done (user-verified: pump stalls fixed, but sprint
+catch-up stutter and rare seam holes remained -> pass 11):**
 - [x] Streaming stutter: fence-scoped per-chunk uploads (no per-frame
       device/queue stalls, no staging alloc churn)
 - [x] SSAA removed (VV_SSAA / VV_DEBUG_SSAA gone; 1 ray/pixel)
