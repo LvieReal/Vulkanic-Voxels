@@ -108,14 +108,27 @@ void World::ensureRegion(std::int32_t centerX, std::int32_t centerZ,
 			if (m_chunks.find(coord) != m_chunks.end()) {
 				continue;
 			}
-			outNew.push_back(generateChunk(coord));
+			outNew.push_back(ensureChunk(coord));
 		}
 	}
 
-	const std::int32_t evictRadius = r + 1;
+	evictOutside(centerX, centerZ, radius + 1, outEvicted);
+}
+
+const Chunk* World::ensureChunk(const ChunkCoord& coord) {
+	if (const Chunk* existing = findChunk(coord)) {
+		return existing;
+	}
+	return generateChunk(coord);
+}
+
+void World::evictOutside(std::int32_t centerX, std::int32_t centerZ,
+												 std::uint32_t evictRadius,
+												 std::vector<ChunkCoord>& outEvicted) {
+	const std::int32_t r = static_cast<std::int32_t>(evictRadius);
 	for (auto it = m_chunks.begin(); it != m_chunks.end();) {
-		if (std::abs(it->first.x - centerX) > evictRadius ||
-				std::abs(it->first.z - centerZ) > evictRadius) {
+		if (std::abs(it->first.x - centerX) > r ||
+				std::abs(it->first.z - centerZ) > r) {
 			outEvicted.push_back(it->first);
 			it = m_chunks.erase(it);
 		} else {

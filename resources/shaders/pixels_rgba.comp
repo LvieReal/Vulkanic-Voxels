@@ -357,17 +357,25 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     float tEnter = 0.0;
     float tExit = 0.0;
     vec3 enterNormal = vec3(0.0);
-    if (!intersectAABB(ro, rd, bmin, bmax, tEnter, tExit, enterNormal)) {
-        return debugTerm ? termColor(TERM_NO_REGION) : skyColor(rdWorld);
+    // A ray can miss the near region entirely only from above the world
+    // (the camera's XZ is always inside it), and a ray can stay above all
+    // terrain while crossing it. Both used to early-return sky - correct
+    // before far LOD, wrong now: they must still run the far march (that
+    // was the "terrain crops away the higher I fly" bug). They now skip
+    // only the NEAR march.
+    const bool nearIntersect =
+        intersectAABB(ro, rd, bmin, bmax, tEnter, tExit, enterNormal);
+
+    vec3 start = ro + rd * 1e-4;
+    const float tEntryOffset = nearIntersect ? max(tEnter, 0.0) : 0.0;
+    float tEndRegion = 0.0;
+    if (nearIntersect) {
+        start = ro + rd * max(tEnter, 0.0);
+        start = min(start, bmax - vec3(1e-4));
+        start += rd * 1e-4;
+        tEndRegion = tExit - tEntryOffset;
     }
-
-    vec3 start = ro + rd * max(tEnter, 0.0);
-    start = min(start, bmax - vec3(1e-4));
-    start += rd * 1e-4;
-
     ivec3 cell = ivec3(floor(start));
-    const float tEntryOffset = max(tEnter, 0.0);
-    const float tEndRegion = tExit - tEntryOffset;
     // Primary ray terminator: the fog cut (99.8% opaque at 1 / fogDensity).
     const float tEndFog = (1.0 / max(pc.camera.y, 1e-6)) - tEntryOffset;
     float tEnd = min(tEndRegion, tEndFog);
@@ -375,12 +383,36 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         return debugTerm ? termColor(TERM_FOG_CUT) : skyColor(rdWorld);
     }
 
-    // Sky-skip: terrain never rises above pc.grid.w, so a ray whose whole
-    // region segment stays above that line can only see sky. y is linear in
-    // the ray parameter, so its minimum over the segment is at an endpoint.
+    // Sky-skip (near region only): terrain never rises above pc.grid.w, so
+    // a ray whose whole region segment stays above that line can only see
+    // sky - WITHIN the region. Beyond it the far march takes over. y is
+    // linear in the ray parameter, so the segment minimum is at an
+    // endpoint.
     const float maxTerrainY = float(pc.grid.w);
-    if (min(start.y, (ro + rd * tExit).y) > maxTerrainY) {
-        return debugTerm ? termColor(TERM_SKY_SKIP) : skyColor(rdWorld);
+    bool nearSkip = true;
+    if (nearIntersect) {
+        nearSkip = min(start.y, (ro + rd * tExit).y) > maxTerrainY;
+    }
+    const bool nearMarch = nearIntersect && !nearSkip;
+
+    bool hit = false;
+    vec3 normal = vec3(0.0);
+    uint hitType = 0u;
+    // Y of the hit cell (kept for the AO sample at shading time).
+    int hitY = 0;
+    // Ray parameter (same units as the old tracer: t multiplies rd, and the
+    // distance from the camera is tEntryOffset + t) at the hit, relative to
+    // the region entry point.
+    float tHit = 0.0;
+    // Why the ray ended, for the VV_DEBUG_TERM view. Defaults to the budget
+    // (loop exhausted); every break overwrites it.
+    int termCause = nearMarch
+        ? TERM_BUDGET
+        : (nearIntersect ? TERM_SKY_SKIP : TERM_NO_REGION);
+
+    if (!nearMarch && pc.far.z == 0) {
+        // Nothing to trace near, and no far LOD to fall through to.
+        return debugTerm ? termColor(termCause) : skyColor(rdWorld);
     }
 
     const float EPS = 1e-6;
@@ -421,19 +453,6 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         stepZ = 0;
     }
 
-    bool hit = false;
-    vec3 normal = vec3(0.0);
-    uint hitType = 0u;
-    // Y of the hit cell (kept for the AO sample at shading time).
-    int hitY = 0;
-    // Ray parameter (same units as the old tracer: t multiplies rd, and the
-    // distance from the camera is tEntryOffset + t) at the hit, relative to
-    // the region entry point.
-    float tHit = 0.0;
-    // Why the ray ended, for the VV_DEBUG_TERM view. Defaults to the budget
-    // (loop exhausted); every break overwrites it.
-    int termCause = TERM_BUDGET;
-
     // Axis of the XZ boundary crossed to enter the current column (-1 for
     // the segment's first column -> use the region entry normal).
     int lastAxis = -1;
@@ -441,6 +460,7 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     float t = 0.0;
     const int worldTop = int(pc.chunkSize.y) - 1;
 
+    if (nearMarch) {
     for (int i = 0; i < int(pc.chunkSize.w); ++i) {
         if (t >= tEnd) {
             termCause = (tEndFog < tEndRegion) ? TERM_FOG_CUT : TERM_REGION_EXIT;
@@ -558,6 +578,7 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             lastAxis = 2;
         }
     }
+    }  // near march
 
     // --- Far-LOD march ------------------------------------------------
     // Runs only when the ray left the full-detail region without a hit and

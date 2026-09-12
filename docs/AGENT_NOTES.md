@@ -473,6 +473,62 @@ Known trade-offs (first test, by design):
   up/down steps where coarse hands off to fine.
 - No shadows/AO in the far field; the sun lights it flat.
 
+### Pass 4.1: altitude crop fix + incremental (frustum-prioritized) streaming
+
+Two user reports on pass 4: terrain crops away when flying high, and
+border crossings stutter (~50 ms).
+
+**The altitude crop** was a far-LOD integration bug, found by reading
+("the higher I am" => camera above y=128 => outside the near-region
+box, the only situation where these fire): two pre-far-LOD early sky
+returns - the near-region AABB MISS return and the sky-skip return -
+never reached the far march. From high altitude, shallow downward rays
+either miss the near box entirely or stay above maxTerrainY while
+crossing it, and both returned sky even though the far field continues
+the terrain beyond. Fix: both conditions now skip only the NEAR march
+(nearMarch = intersect && !skySkip) and fall through to the far march;
+with far LOD off they still return sky immediately (unchanged
+behavior). The near march's tEndRegion is 0 for missed-box rays, so
+its loop no-ops cleanly.
+
+**Incremental streaming** removes the border-crossing hitch. Design
+(main-thread time-slicing, no new threads - deliberate after this
+codebase's history of edit/threading races):
+
+- The chunk atlas gains ONE SPARE RING of slots ((2r+3)^2 = 729 at
+  r=12; region table stays (2r+1)^2). Streamed chunks upload into
+  spare slots the ACTIVE table never references, so in-flight frames
+  cannot tear and the uploads need no full-device stall.
+- updateWorld: on a border crossing, beginRegionMove() computes the
+  pending coords (new-region coords not already in slots), sorted by
+  frustum priority (camera-facing first, then distance; the sort key
+  is a small static function). The OLD region keeps rendering
+  untouched while pumpRegionStreaming(3 ms/frame) generates
+  (World::ensureChunk, new idempotent primitive) and uploads in
+  batches of 4 (each uploadChunks does its own queue idle - ~1 ms at
+  these sizes).
+- finishRegionMove() (pending empty): release out-of-region slots,
+  evict the CPU cache beyond the usual +1 ring
+  (World::evictOutside, new primitive), one deviceWaitIdle (table
+  swap safety), rewrite the region table, move the center.
+- Fallbacks: if pending > free slots (teleport-scale move) or the
+  camera outruns the stream by > 2 chunks, fall back to the
+  synchronous rebuildChunkRegion (unchanged legacy path, also used at
+  init). Mid-stream target changes re-aim the pending list; already-
+  streamed chunks keep their slots.
+- Why the streaming edge is invisible: the gap between old and new
+  regions renders as FAR terrain (the coarse field continues the same
+  heightmap), so the swap is a coarse-to-fine refinement at ~350-400 u
+  where fog is a few percent - not a hole.
+- Steady-state costs unchanged: same 625 resident slots + 104 spare
+  (atlas 96 MB), same CPU cache hysteresis ((2r+2)(2r+1) chunks).
+
+Tests: testWorldEnsureChunk (ensureChunk idempotence, evictOutside
+hysteresis parity with ensureRegion); all existing suites unchanged.
+The renderer streaming logic is Vulkan-wiring (headless-untestable),
+kept small and reviewed; the far march/parity tests still cover the
+traversal semantics.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -494,7 +550,14 @@ Known trade-offs (first test, by design):
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 4 — done (pending user verification):**
+**Pass 4.1 — done (pending user verification):**
+- [x] Altitude crop fixed (early sky returns bypassed the far march
+      from above y=128)
+- [x] Incremental chunk streaming: frustum-prioritized, 3 ms/frame
+      time-sliced generation + batched tear-free uploads into a spare
+      atlas ring; sync fallback for teleports
+
+**Pass 4 — done (user-verified: "working seamlessly"):**
 - [x] Far-LOD height field: 2k-unit view distance (radius 64 chunks,
       4x4-voxel cells, 4 MB) on top of the unchanged near region;
       background-thread build + upload, automatic recentering, fog cut

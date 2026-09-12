@@ -1059,6 +1059,43 @@ void testFarMarch() {
 }
 
 
+// Incremental-loading primitives: ensureChunk (idempotent generation) and
+// evictOutside (Chebyshev radius eviction).
+void testWorldEnsureChunk() {
+	vv::voxel::World world(vv::terrain::TerrainConfig{}, 32, 128, 32);
+	const vv::voxel::ChunkCoord coord{5, -3};
+	const vv::voxel::Chunk* a = world.ensureChunk(coord);
+	check(a != nullptr, "ensureChunk: generates and returns a chunk");
+	check(world.cachedChunkCount() == 1, "ensureChunk: one cached chunk");
+	const vv::voxel::Chunk* b = world.ensureChunk(coord);
+	check(a == b, "ensureChunk: idempotent (same pointer, no regeneration)");
+	check(world.cachedChunkCount() == 1,
+				"ensureChunk: no duplicate cache entries");
+
+	std::vector<vv::voxel::ChunkCoord> evicted;
+	world.evictOutside(0, 0, 4, evicted);  // |5| > 4
+	check(world.cachedChunkCount() == 0, "evictOutside: drops far chunks");
+	check(evicted.size() == 1 && evicted[0] == coord,
+				"evictOutside: reports the evicted coord");
+
+	// Hysteresis parity with ensureRegion (whose steady state is checked in
+	// testWorldRegion): evictOutside with r+1 keeps the +1 ring.
+	std::vector<const vv::voxel::Chunk*> created;
+	world.ensureRegion(0, 0, 2, created, evicted);
+	check(world.cachedChunkCount() == 25, "region: 5x5 resident at r=2");
+	world.evictOutside(0, 0, 3, evicted);  // r+1 hysteresis
+	check(world.cachedChunkCount() == 25,
+				"evictOutside: keeps everything within r+1");
+	const vv::voxel::ChunkCoord inside{2, -2};
+	world.ensureChunk(inside);
+	world.ensureChunk(vv::voxel::ChunkCoord{6, 0});  // outside r+1
+	world.evictOutside(0, 0, 3, evicted);
+	check(world.findChunk(inside) != nullptr,
+				"evictOutside: chunk at the ring edge survives");
+	check(world.findChunk(vv::voxel::ChunkCoord{6, 0}) == nullptr,
+				"evictOutside: chunk beyond the ring is evicted");
+}
+
 }  // namespace
 
 int main() {
@@ -1071,6 +1108,7 @@ int main() {
 	testWorldRegion();
 	testWorldWalk();
 	testWorldDeterminism();
+	testWorldEnsureChunk();
 	testChunkMatchesGenerator();
 	testChunkHeightMap();
 	testTraversalParity();

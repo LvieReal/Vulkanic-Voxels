@@ -41,6 +41,18 @@ class World final {
 										std::vector<const Chunk*>& outNew,
 										std::vector<ChunkCoord>& outEvicted);
 
+	// Incremental-loading primitives (used by the renderer's streaming
+	// path; ensureRegion above is the batch form). ensureChunk returns the
+	// chunk at coord, generating it first if missing (pointer owned by the
+	// world, valid until the next eviction). evictOutside drops cached
+	// chunks whose Chebyshev distance from (centerX, centerZ) exceeds
+	// evictRadius (pass radius+1 for the usual hysteresis) and appends
+	// their coordinates to outEvicted.
+	const Chunk* ensureChunk(const ChunkCoord& coord);
+	void evictOutside(std::int32_t centerX, std::int32_t centerZ,
+										std::uint32_t evictRadius,
+										std::vector<ChunkCoord>& outEvicted);
+
 	const Chunk* findChunk(const ChunkCoord& coord) const;
 
 	const vv::terrain::TerrainGenerator& terrain() const { return m_terrain; }

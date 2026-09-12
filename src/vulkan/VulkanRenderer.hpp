@@ -45,6 +45,9 @@ class VulkanRenderer final {
 
   // Keeps the GPU chunk region centered on the camera. Cheap no-op unless the
   // camera crossed a chunk boundary; call every frame before drawFrame().
+  // Border crossings stream the new region in incrementally (time-sliced
+  // generation + small tear-free uploads into spare atlas slots); the old
+  // region keeps rendering until the new one is complete.
   void updateWorld(const glm::vec3& cameraPosition);
 
   // Far-LOD field lifecycle: launches background builds when the camera
@@ -52,6 +55,12 @@ class VulkanRenderer final {
   // Called from updateWorld; needs the queue for uploads.
   void ensureFarField(int32_t centerChunkX, int32_t centerChunkZ);
   void launchFarFieldBuild(int32_t centerChunkX, int32_t centerChunkZ);
+
+  // Incremental region streaming (all main-thread, time-sliced).
+  void beginRegionMove(int32_t targetChunkX, int32_t targetChunkZ);
+  void rebuildStreamPending();
+  void pumpRegionStreaming(double budgetMs);
+  void finishRegionMove();
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
@@ -182,7 +191,17 @@ class VulkanRenderer final {
       m_slotOf;
   std::vector<uint32_t> m_freeSlots;
   vv::voxel::ChunkCoord m_regionCenter{};
-  // 1 / fogCutDistance(); recomputed every frame in drawFrame().
+
+  // --- Incremental region streaming state ---
+  // While streaming, the ACTIVE region (m_regionCenter + table) keeps
+  // rendering; chunks for the TARGET region generate time-sliced and upload
+  // into spare slots the active table never references. The table swaps once
+  // when the target region is complete.
+  bool m_streamActive = false;
+  vv::voxel::ChunkCoord m_streamTarget{};
+  // Pending coords, sorted WORST-first (pop_back() = highest priority:
+  // frustum-facing, near). Coords already in m_slotOf are excluded.
+  std::vector<vv::voxel::ChunkCoord> m_streamPending;
   float m_fogDensity = 0.01f;
 
   // Debug visualizations (see AGENT_NOTES): VV_DEBUG_TERM colors each pixel

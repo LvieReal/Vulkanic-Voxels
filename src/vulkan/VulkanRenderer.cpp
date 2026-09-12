@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,14 @@ namespace vv::vulkan {
 namespace {
 using namespace vv::render;
 using namespace vv::vulkan::utils;
+
+// Incremental region streaming: per-frame generation budget (ms) and the
+// chunk-upload batch size. At ~0.8 ms/chunk these keep a border crossing
+// (2(2r+1)-1 = 49 chunks at r=12) spread over ~13 frames instead of one
+// ~50 ms hitch, while the old region (and the far field beyond it) keeps
+// rendering.
+constexpr double kStreamBudgetMs = 3.0;
+constexpr std::size_t kStreamUploadBatch = 4;
 
 // Fog tail attenuation used ONLY inside the shader's fog curve
 // (fog = 1 - exp(-kFogTail * (d/cut)^4)); the C++ side never needs the value,
@@ -316,19 +325,229 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
   const int32_t chunkZ = static_cast<int32_t>(
       std::floor(cameraPosition.z / chunkWorldZ));
 
+  if (m_streamActive) {
+    if (chunkX != m_streamTarget.x || chunkZ != m_streamTarget.z) {
+      // The target moved again mid-stream: re-aim (coords already streamed
+      // stay in their slots; pending is recomputed against the new target).
+      m_streamTarget = vv::voxel::ChunkCoord{chunkX, chunkZ};
+      rebuildStreamPending();
+      const std::size_t needed = m_streamPending.size();
+      if (needed > m_freeSlots.size()) {
+        // Too far for the spare ring (teleport-scale): fall back to the
+        // synchronous rebuild.
+        m_streamActive = false;
+        m_streamPending.clear();
+        std::string error;
+        if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+          std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                       error.c_str());
+        }
+      } else if (m_streamPending.empty()) {
+        finishRegionMove();
+      }
+    } else if (std::abs(chunkX - m_regionCenter.x) > 2 ||
+               std::abs(chunkZ - m_regionCenter.z) > 2) {
+      // Streaming cannot keep up with a fast camera: catch up synchronously.
+      m_streamActive = false;
+      m_streamPending.clear();
+      std::string error;
+      if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+        std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                     error.c_str());
+      }
+    } else {
+      pumpRegionStreaming(kStreamBudgetMs);
+    }
+    ensureFarField(chunkX, chunkZ);
+    return;
+  }
+
   if (chunkX == m_regionCenter.x && chunkZ == m_regionCenter.z) {
     ensureFarField(chunkX, chunkZ);
     return;
   }
 
-  std::string error;
-  if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-    // Region stays where it was; the next frame retries. Not fatal: rendering
-    // continues with the previous (fully consistent) region state.
-    std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                 error.c_str());
-  }
+  beginRegionMove(chunkX, chunkZ);
   ensureFarField(chunkX, chunkZ);
+}
+
+void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
+                                     int32_t targetChunkZ) {
+  m_streamTarget = vv::voxel::ChunkCoord{targetChunkX, targetChunkZ};
+  rebuildStreamPending();
+
+  if (m_streamPending.empty()) {
+    // Everything already resident in slots: just swap.
+    finishRegionMove();
+    return;
+  }
+  if (m_streamPending.size() > m_freeSlots.size()) {
+    // Not enough spare slots (teleport-scale move): synchronous rebuild.
+    m_streamPending.clear();
+    std::string error;
+    if (!rebuildChunkRegion(targetChunkX, targetChunkZ, error)) {
+      std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
+                   error.c_str());
+    }
+    return;
+  }
+  m_streamActive = true;
+}
+
+// Priority: chunks in front of the camera (frustum) first, then near ones.
+// Sorted ascending (worst first) so pop_back() serves the best chunk.
+static float streamPriority(const vv::voxel::ChunkCoord& coord,
+                            const glm::vec3& cameraPos,
+                            const glm::vec3& cameraForward, uint32_t chunkSize,
+                            float voxelSize) {
+  const glm::vec3 center(
+      (static_cast<float>(coord.x) + 0.5f) * static_cast<float>(chunkSize) *
+          voxelSize,
+      0.0f,
+      (static_cast<float>(coord.z) + 0.5f) * static_cast<float>(chunkSize) *
+          voxelSize);
+  glm::vec3 dir = center - cameraPos;
+  dir.y = 0.0f;
+  const float dist = std::max(glm::length(dir), 1.0f);
+  const glm::vec3 f(cameraForward.x, 0.0f, cameraForward.z);
+  const float facing =
+      glm::length(f) > 1e-6f ? glm::dot(dir / dist, glm::normalize(f)) : 0.0f;
+  return facing - dist * 0.0005f;
+}
+
+void VulkanRenderer::rebuildStreamPending() {
+  const auto& cfg = m_voxelConfig;
+  const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
+  m_streamPending.clear();
+  for (int32_t dz = -r; dz <= r; ++dz) {
+    for (int32_t dx = -r; dx <= r; ++dx) {
+      const vv::voxel::ChunkCoord coord{m_streamTarget.x + dx,
+                                        m_streamTarget.z + dz};
+      if (m_slotOf.find(coord) == m_slotOf.end()) {
+        m_streamPending.push_back(coord);
+      }
+    }
+  }
+  const glm::vec3 pos = m_camera.position();
+  const glm::vec3 fwd = m_camera.forward();
+  std::sort(m_streamPending.begin(), m_streamPending.end(),
+            [this, &pos, &fwd](const vv::voxel::ChunkCoord& a,
+                               const vv::voxel::ChunkCoord& b) {
+              return streamPriority(a, pos, fwd, m_voxelConfig.chunkSizeX,
+                                    m_voxelConfig.voxelSize.x) <
+                     streamPriority(b, pos, fwd, m_voxelConfig.chunkSizeX,
+                                    m_voxelConfig.voxelSize.x);
+            });
+}
+
+void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
+  if (!m_streamActive) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<vv::vulkan::VoxelResources::ChunkUpload> batch;
+  const auto flushBatch = [this, &batch]() -> bool {
+    if (batch.empty()) {
+      return true;
+    }
+    std::string error;
+    if (!m_voxelResources.uploadChunks(m_device, m_physicalDevice,
+                                       m_commandPool, m_graphicsQueue, batch,
+                                       error)) {
+      std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
+                   error.c_str());
+      // Roll back the slot assignments; the coords return to pending.
+      for (const auto& upload : batch) {
+        m_slotOf.erase(vv::voxel::ChunkCoord{upload.chunk->chunkX(),
+                                             upload.chunk->chunkZ()});
+        m_freeSlots.push_back(upload.slot);
+      }
+      batch.clear();
+      return false;
+    }
+    batch.clear();
+    return true;
+  };
+
+  while (!m_streamPending.empty()) {
+    const std::chrono::duration<double> elapsed =
+        std::chrono::steady_clock::now() - start;
+    if (elapsed.count() * 1000.0 >= budgetMs) {
+      break;
+    }
+    const vv::voxel::ChunkCoord coord = m_streamPending.back();
+    m_streamPending.pop_back();
+    const vv::voxel::Chunk* chunk = m_world->ensureChunk(coord);
+    if (m_freeSlots.empty()) {
+      m_streamPending.push_back(coord);
+      break;
+    }
+    const uint32_t slot = m_freeSlots.back();
+    m_freeSlots.pop_back();
+    m_slotOf[coord] = slot;
+    batch.push_back({slot, chunk});
+    if (batch.size() >= kStreamUploadBatch) {
+      if (!flushBatch()) {
+        m_streamPending.push_back(coord);
+        break;
+      }
+    }
+  }
+  if (!flushBatch()) {
+    return;  // retried next frame
+  }
+  if (m_streamPending.empty()) {
+    finishRegionMove();
+  }
+}
+
+void VulkanRenderer::finishRegionMove() {
+  const auto& cfg = m_voxelConfig;
+  const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
+
+  // Release slots of chunks that left the new region (trailing edge and any
+  // leftovers from abandoned stream targets).
+  for (auto it = m_slotOf.begin(); it != m_slotOf.end();) {
+    if (std::abs(it->first.x - m_streamTarget.x) > r ||
+        std::abs(it->first.z - m_streamTarget.z) > r) {
+      m_freeSlots.push_back(it->second);
+      it = m_slotOf.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Evict the CPU cache beyond the usual +1 hysteresis ring.
+  std::vector<vv::voxel::ChunkCoord> evicted;
+  m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
+                        cfg.renderRadiusChunks + 1, evicted);
+
+  // Build and swap the region table. The device wait guarantees no frame
+  // submitted since the last streaming upload still reads the old table.
+  std::vector<uint32_t> table(
+      static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight(),
+      vv::vulkan::VoxelResources::kEmptySlot);
+  for (int32_t dz = -r; dz <= r; ++dz) {
+    for (int32_t dx = -r; dx <= r; ++dx) {
+      const vv::voxel::ChunkCoord coord{m_streamTarget.x + dx,
+                                        m_streamTarget.z + dz};
+      const auto it = m_slotOf.find(coord);
+      if (it == m_slotOf.end()) {
+        continue;  // cannot happen: streaming completes before finish
+      }
+      const std::size_t cell =
+          static_cast<std::size_t>(dx + r) +
+          static_cast<std::size_t>(dz + r) * cfg.gridWidth();
+      table[cell] = it->second;
+    }
+  }
+  vkDeviceWaitIdle(m_device);
+  if (!m_voxelResources.writeChunkTable(table)) {
+    std::fprintf(stderr, "[vulkan] region table swap failed\n");
+  }
+  m_regionCenter = m_streamTarget;
+  m_streamActive = false;
+  m_streamPending.clear();
 }
 
 void VulkanRenderer::launchFarFieldBuild(int32_t centerChunkX,

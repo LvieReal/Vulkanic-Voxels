@@ -52,9 +52,16 @@ struct VoxelConfig final {
 	std::uint32_t gridWidth() const { return 2 * renderRadiusChunks + 1; }
 	std::uint32_t gridHeight() const { return 2 * renderRadiusChunks + 1; }
 
-	// Total number of chunk slots in the GPU atlas (= region grid cells).
+	// Atlas capacity: one ring LARGER than the region grid. The extra
+	// ring holds chunks streaming in for the next region position before
+	// the region table swaps (slots outside the active table are never
+	// read by in-flight frames, so streaming uploads need no full device
+	// stall); see VulkanRenderer's incremental region streaming.
+	std::uint32_t atlasGridWidth() const { return 2 * renderRadiusChunks + 3; }
+
+	// Total number of chunk slots in the GPU atlas (spare ring included).
 	std::uint64_t slotCount() const {
-		return static_cast<std::uint64_t>(gridWidth()) * gridHeight();
+		return static_cast<std::uint64_t>(atlasGridWidth()) * atlasGridWidth();
 	}
 
 	// Total far-LOD grid cells per side (0 when far LOD is disabled).
