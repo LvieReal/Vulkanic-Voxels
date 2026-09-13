@@ -62,15 +62,18 @@ class VulkanRenderer final {
   void pumpRegionStreaming(double budgetMs);
   void finishRegionMove();
 
-  // Rewrites the far-LOD cells covered by the loaded chunk region with
-  // the REAL per-column tops from the chunk heightmaps (exact for fully
-  // covered cells, max-with-estimate on the partial edge). Returns whether
-  // anything changed; the caller decides whether to re-upload the field.
-  // Called when a fresh far build is activated and whenever the region
-  // table swaps: the near/far seam then continues the exact terrain by
-  // construction instead of the coarse estimate (which folded mountains
-  // can under-estimate by 20+ voxels -> holes at the seam).
-  bool patchFarFieldWithRegion();
+  // Incremental far-LOD seam patch: rewrites the cells covered by
+  // NEWLY-loaded chunks with the real per-column tops (exact for fully
+  // covered cells, max-with-estimate on the partial edge) and returns the
+  // changed runs + values for a delta upload. Folded mountains can
+  // under-estimate by 20+ voxels -> holes at the seam without this.
+  bool patchFarFieldWithRegion(
+      std::vector<std::pair<uint32_t, uint32_t>>& runs,
+      std::vector<uint32_t>& values);
+  // Grows the patched-extent box to include the active region.
+  void extendFarPatchExtent();
+  // Applies an incremental seam patch as a small async delta upload.
+  void uploadFarPatchDelta();
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
@@ -234,14 +237,26 @@ class VulkanRenderer final {
   std::int32_t m_farPendingCenterZ = 0;
   // Active (uploaded) field geometry: origin in voxels, cell count and
   // footprint; valid only while m_farFieldActive. m_farCells mirrors the
-  // uploaded field on the CPU so patchFarFieldWithRegion can rewrite the
-  // seam band incrementally.
+  // ACTIVE half on the CPU so patchFarFieldWithRegion can rewrite the
+  // seam band incrementally. m_farHalf is the push-constant half index.
   std::int32_t m_farOriginVoxX = 0;
   std::int32_t m_farOriginVoxZ = 0;
   std::uint32_t m_farDim = 0;
   std::uint32_t m_farCell = 0;
   bool m_farFieldActive = false;
   std::vector<std::uint32_t> m_farCells;
+  std::uint32_t m_farHalf = 0;
+  // Chunk-coordinate box already patched into m_farCells (invalid when
+  // MaxX < MinX, e.g. after a far-field activation).
+  std::int32_t m_farPatchMinX = 0;
+  std::int32_t m_farPatchMinZ = 0;
+  std::int32_t m_farPatchMaxX = -1;
+  std::int32_t m_farPatchMaxZ = -1;
+  // Active chunk-table half (push-constant index; triple-buffered).
+  std::uint32_t m_tableHalf = 0;
+  // Slots released by a region swap, waiting until no in-flight frame can
+  // reference them (two frames) before rejoining the free list.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> m_slotCooldown;
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
   std::int32_t m_farCenterChunkZ = 0;

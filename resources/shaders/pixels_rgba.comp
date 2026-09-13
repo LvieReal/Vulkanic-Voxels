@@ -9,14 +9,16 @@ layout(push_constant) uniform Push {
     vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance)
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
-    ivec4 region;   // x,z = region origin (min corner) in chunk coords
+    ivec4 region;   // x,z = region origin (min corner) in chunk coords;
+                    // w = chunk-table half index (ping-pong upload buffer)
     uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words),
                     // w=max terrain voxel y (sky-skip ceiling; MUST be a true
                     // upper bound on solid terrain or the sky-skip early-out
                     // clips real terrain into noisy contour rings)
     ivec4 far;      // x,y = far-LOD min corner (voxel X/Z), z,w = cell dims;
                     // z = 0 means far LOD is off
-    vec4 farParams; // x = far cell footprint in voxels
+    vec4 farParams; // x = far cell footprint in voxels;
+                    // y = far-field half index (ping-pong upload buffer)
 } pc;
 
 // Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types
@@ -73,6 +75,13 @@ layout(set = 0, binding = 5) readonly buffer ColumnHeights {
 layout(set = 0, binding = 6) readonly buffer FarLod {
     uint cells[];
 } farLod;
+
+// The far field is double-buffered; farParams.y selects the half (see
+// the table comment above - same swap-without-waits scheme).
+uint farBase()
+{
+    return uint(pc.farParams.y) * (uint(pc.far.z) * uint(pc.far.w));
+}
 
 
 const uint kEmptySlot = 0xFFFFFFFFu;
@@ -147,7 +156,12 @@ bool resolveColumn(int voxX, int voxZ, out uint slot, out ivec2 local)
         return false;
     }
 
-    slot = chunkTable.slots[uint(gridLocal.x) + uint(gridLocal.y) * pc.grid.x];
+    // The chunk table is triple-buffered; region.w selects the half. A
+    // swap only writes the half no in-flight frame reads, then flips the
+    // index - no device wait needed (see VulkanRenderer::finishRegionMove).
+    const uint tableBase = uint(pc.region.w) * (pc.grid.x * pc.grid.y);
+    slot = chunkTable.slots[tableBase + uint(gridLocal.x) +
+                            uint(gridLocal.y) * pc.grid.x];
     if (slot == kEmptySlot) {
         return false;
     }
@@ -412,7 +426,8 @@ float sunShadow(vec3 hitPosVox, vec3 n)
             if (all(greaterThanEqual(fc, ivec2(0))) &&
                 all(lessThan(fc, farDim))) {
                 const uint packed =
-                    farLod.cells[uint(fc.x) + uint(fc.y) * uint(farDim.x)];
+                    farLod.cells[farBase() + uint(fc.x) +
+                                 uint(fc.y) * uint(farDim.x)];
                 const float h = float(packed & 0xFFFFu);
                 if (h > 0.0 && y0 < h) {
                     return 0.0;
@@ -759,7 +774,8 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             const bool inGrid = all(greaterThanEqual(c2, ivec2(0))) &&
                                 all(lessThan(c2, farDim));
             const uint packed = inGrid
-                ? farLod.cells[uint(c2.x) + uint(c2.y) * uint(farDim.x)]
+                ? farLod.cells[farBase() + uint(c2.x) +
+                               uint(c2.y) * uint(farDim.x)]
                 : 0u;
             const float fh = float(packed & 0xFFFFu);
 

@@ -57,14 +57,19 @@ struct FarField final {
 	// surface continues the near terrain 1:1 across the seam), partially
 	// covered edge cells keep the existing estimate as a floor. Surface
 	// types come from the generator's layering rule. Pure; returns the
-	// number of changed cells. This is what kills near/far seam holes in
-	// folded mountains (the estimate alone can under-shoot by 20+ voxels).
+	// number of changed cells; if outChangedIndices is non-null it receives
+	// the changed cell indices (row-major, ascending) for delta uploads.
+	// This is what kills near/far seam holes in folded mountains (the
+	// estimate alone can under-shoot by 20+ voxels). Pass only the NEWLY
+	// covered chunks for incremental patches: untouched cells keep their
+	// (already exact) values.
 	static std::size_t patchRegion(std::vector<std::uint32_t>& cells,
 																 std::uint32_t dim, std::uint32_t cellVoxels,
 																 std::int32_t originVoxX,
 																 std::int32_t originVoxZ,
 																 const std::vector<RegionChunkHeights>& chunks,
-																 const TerrainGenerator& gen);
+																 const TerrainGenerator& gen,
+																 std::vector<std::uint32_t>* outChangedIndices = nullptr);
 
 	// Builds the field centered on the given chunk (the box is centered on
 	// that chunk's center voxel so it always contains the full near region

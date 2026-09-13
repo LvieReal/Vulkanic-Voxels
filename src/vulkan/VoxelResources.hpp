@@ -70,17 +70,48 @@ class VoxelResources final {
 															VkCommandPool commandPool, VkQueue queue,
 															const ChunkUpload& upload,
 															std::string& outError);
-	// Uploads a freshly built far-LOD field (vv::terrain::FarField::cells)
-	// into the far buffer. Rare (far-field recenters), so a queue idle is
-	// acceptable.
-	bool uploadFarField(VkDevice device, VkPhysicalDevice physicalDevice,
-											VkCommandPool commandPool, VkQueue queue,
-											const std::vector<std::uint32_t>& cells,
-											std::string& outError);
+	// The chunk table is TABLE-HALVES-buffered and the far field is
+	// FAR-HALVES-buffered: writers always target the half no in-flight
+	// frame reads, then the renderer flips a push-constant half index.
+	// This removes every device/queue wait from the per-crossing region
+	// swap (the sprint hitch). Three table halves are needed because with
+	// kMaxFramesInFlight == 2 a half being rewritten must have been last
+	// read by a frame whose fence has since been waited; two halves cannot
+	// guarantee that when swaps happen on consecutive frames.
+	static constexpr std::uint32_t kTableHalves = 3;
+	static constexpr std::uint32_t kFarHalves = 2;
 
-	// Rewrites the whole chunk table (one u32 slot index per region grid
-	// cell, row-major over gridWidth x gridHeight).
-	bool writeChunkTable(const std::vector<std::uint32_t>& slotPerCell);
+	// Blocks until the last fence-scoped streaming chunk upload has fully
+	// landed (sub-millisecond; the publisher calls it before making a table
+	// that references freshly uploaded slots active).
+	void waitStreamingUploadIdle(VkDevice device);
+
+	// Uploads a complete far field into the given half of the far buffer.
+	// Uses a persistent staging buffer + fence (no device/queue waits);
+	// waits for its own copy to land before returning, so the caller can
+	// flip the far half index immediately.
+	bool uploadFarFieldHalf(VkDevice device, VkPhysicalDevice physicalDevice,
+													VkCommandPool commandPool, VkQueue queue,
+													const std::vector<std::uint32_t>& cells,
+													std::uint32_t half, std::string& outError);
+
+	// Async partial upload into the given half: cellRuns are (cellOffset,
+	// count) ranges whose values are concatenated in `values` (in run
+	// order). Fence-scoped (the next far upload waits it); returns without
+	// waiting. Used for far seam patches - a torn frame can only show a
+	// few seam cells with the previous few-voxels-lower estimate.
+	bool uploadFarFieldDelta(VkDevice device, VkPhysicalDevice physicalDevice,
+												 VkCommandPool commandPool, VkQueue queue,
+												 std::uint32_t half,
+												 const std::vector<std::pair<std::uint32_t, std::uint32_t>>& cellRuns,
+												 const std::vector<std::uint32_t>& values,
+												 std::string& outError);
+
+	// Rewrites one half of the chunk table (one u32 slot index per region
+	// grid cell, row-major over gridWidth x gridHeight). Plain mapped
+	// write to the inactive half - no GPU synchronization needed.
+	bool writeChunkTable(const std::vector<std::uint32_t>& slotPerCell,
+											std::uint32_t half);
 
 	void cleanup(VkDevice device);
 
@@ -110,6 +141,22 @@ class VoxelResources final {
 
 	VkBuffer m_farBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;
+	std::uint64_t m_farCellsPerHalf = 0;  // far dim * far dim
+
+	// --- Far upload path (persistent staging, one fence) ---
+	VkBuffer m_farStaging = VK_NULL_HANDLE;
+	VkDeviceMemory m_farStagingMemory = VK_NULL_HANDLE;
+	void* m_farStagingMapped = nullptr;
+	VkCommandPool m_farCommandPool = VK_NULL_HANDLE;
+	VkCommandBuffer m_farCmd = VK_NULL_HANDLE;
+	VkFence m_farFence = VK_NULL_HANDLE;
+	bool m_farFencePending = false;
+
+	bool ensureFarUploadResources(VkDevice device,
+																VkPhysicalDevice physicalDevice,
+																VkCommandPool commandPool,
+																std::string& outError);
+	void waitPreviousFarUpload(VkDevice device);
 
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;

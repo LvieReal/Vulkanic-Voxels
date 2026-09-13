@@ -321,6 +321,17 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
 }
 
 void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
+  // Recycle released atlas slots once no in-flight frame can still
+  // reference them (two frames after release; see finishRegionMove).
+  for (auto it = m_slotCooldown.begin(); it != m_slotCooldown.end();) {
+    if (m_frameCounter - it->second >= 2u) {
+      m_freeSlots.push_back(it->first);
+      it = m_slotCooldown.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   if (!m_initialized || !m_world) {
     return;
   }
@@ -502,12 +513,21 @@ void VulkanRenderer::finishRegionMove() {
   const auto& cfg = m_voxelConfig;
   const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
 
-  // Release slots of chunks that left the new region (trailing edge and any
-  // leftovers from abandoned stream targets).
+  // The last fence-scoped streaming upload must land before a table that
+  // references its slot goes live. Waiting the stream fence costs the
+  // tail of one ~130 KB copy (sub-millisecond) - NOT a device drain.
+  m_voxelResources.waitStreamingUploadIdle(m_device);
+
+  // Release slots of chunks that left the new region (trailing edge and
+  // any leftovers from abandoned stream targets). Into the COOLDOWN queue,
+  // not the free list: in-flight frames still read the previous table
+  // half, which references these slots. They are recycled two frames
+  // later, once every frame that could reference them has been fence-
+  // waited by the normal frame loop.
   for (auto it = m_slotOf.begin(); it != m_slotOf.end();) {
     if (std::abs(it->first.x - m_streamTarget.x) > r ||
         std::abs(it->first.z - m_streamTarget.z) > r) {
-      m_freeSlots.push_back(it->second);
+      m_slotCooldown.emplace_back(it->second, m_frameCounter);
       it = m_slotOf.erase(it);
     } else {
       ++it;
@@ -519,13 +539,14 @@ void VulkanRenderer::finishRegionMove() {
   m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
                         cfg.renderRadiusChunks + 1, evicted);
 
-  // Build and swap the region table. The device wait guarantees no frame
-  // submitted since the last streaming upload still reads the old table -
-  // AND that the final fence-scoped streaming upload has fully landed
-  // before the table that references its slot goes live.
+  // Build the new table and write it into the INACTIVE half, then flip.
+  // No device/queue wait: no in-flight frame reads that half (three
+  // halves; the one being rewritten was last read by a frame whose fence
+  // the loop has since waited).
   std::vector<uint32_t> table(
       static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight(),
       vv::vulkan::VoxelResources::kEmptySlot);
+  std::size_t holes = 0;
   for (int32_t dz = -r; dz <= r; ++dz) {
     for (int32_t dx = -r; dx <= r; ++dx) {
       const vv::voxel::ChunkCoord coord{m_streamTarget.x + dx,
@@ -540,25 +561,42 @@ void VulkanRenderer::finishRegionMove() {
       table[cell] = it->second;
     }
   }
-  vkDeviceWaitIdle(m_device);
-  if (!m_voxelResources.writeChunkTable(table)) {
+  const uint32_t nextHalf =
+      (m_tableHalf + 1u) % vv::vulkan::VoxelResources::kTableHalves;
+  if (!m_voxelResources.writeChunkTable(table, nextHalf)) {
     std::fprintf(stderr, "[vulkan] region table swap failed\n");
+  } else {
+    m_tableHalf = nextHalf;
   }
   m_regionCenter = m_streamTarget;
   m_streamActive = false;
   m_streamPending.clear();
 
-  // The region boundary moved: re-derive the far field's seam band from
-  // the now-active chunks so the far surface continues the exact terrain.
-  if (patchFarFieldWithRegion()) {
-    std::string error;
-    if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
-                                         m_commandPool, m_graphicsQueue,
-                                         m_farCells, error)) {
-      std::fprintf(stderr, "[vulkan] far LOD seam patch upload failed: %s\n",
-                   error.c_str());
+  // Diagnostic (rare missing-chunk hunt): log any empty cell in the table
+  // that was just published. Empty cells render as holes (rays skip the
+  // chunk and hit the far LOD or sky behind it).
+  for (std::size_t i = 0; i < table.size(); ++i) {
+    if (table[i] == vv::vulkan::VoxelResources::kEmptySlot) {
+      ++holes;
+      if (holes <= 5) {
+        const int32_t gx = static_cast<int32_t>(i % cfg.gridWidth()) - r;
+        const int32_t gz = static_cast<int32_t>(i / cfg.gridWidth()) - r;
+        std::fprintf(stderr,
+                     "[vulkan] TABLE HOLE at chunk (%d,%d) "
+                     "(region %d,%d)\n",
+                     m_streamTarget.x + gx, m_streamTarget.z + gz,
+                     m_streamTarget.x, m_streamTarget.z);
+      }
     }
   }
+  if (holes > 5) {
+    std::fprintf(stderr, "[vulkan] ... %zu more table holes\n", holes - 5);
+  }
+
+  // The region boundary moved: re-derive the far field's seam band from
+  // the now-active chunks (incrementally - only newly covered chunks are
+  // scanned) and push the changed cells as a small async delta upload.
+  uploadFarPatchDelta();
 }
 
 void VulkanRenderer::launchFarFieldBuild(int32_t centerChunkX,
@@ -619,17 +657,33 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       };
       m_farCenterChunkX = voxToChunk(m_farPending.centerVoxX);
       m_farCenterChunkZ = voxToChunk(m_farPending.centerVoxZ);
-      // The freshly estimated field would show its coarse seams exactly
-      // where the near region ends - rewrite that band from the real
-      // chunk data before the (always-required) first upload.
-      patchFarFieldWithRegion();
+      // New far grid: reset the seam-patch extent so the next patch scans
+      // the whole region, then patch the CPU mirror BEFORE uploading -
+      // the estimate alone under-shoots folded terrain at the seam.
+      m_farPatchMinX = 0;
+      m_farPatchMinZ = 0;
+      m_farPatchMaxX = -1;
+      m_farPatchMaxZ = -1;
+      {
+        std::vector<std::pair<uint32_t, uint32_t>> patchRuns;
+        std::vector<uint32_t> patchValues;
+        patchFarFieldWithRegion(patchRuns, patchValues);
+      }
+      // Upload the patched field into the INACTIVE half, then flip the
+      // half index. No in-flight frame reads that half; the fence-scoped
+      // upload waits only its own copy before the flip. No device wait.
+      const uint32_t nextFarHalf =
+          (m_farHalf + 1u) % vv::vulkan::VoxelResources::kFarHalves;
       std::string uploadError;
-      if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
-                                           m_commandPool, m_graphicsQueue,
-                                           m_farCells, uploadError)) {
+      if (!m_voxelResources.uploadFarFieldHalf(m_device, m_physicalDevice,
+                                               m_commandPool, m_graphicsQueue,
+                                               m_farCells, nextFarHalf,
+                                               uploadError)) {
         std::fprintf(stderr, "[vulkan] far LOD upload failed: %s\n",
                      uploadError.c_str());
         m_farFieldActive = false;
+      } else {
+        m_farHalf = nextFarHalf;
       }
       std::fprintf(stderr,
                    "[vulkan] far LOD field active: %ux%u cells of %u voxels "
@@ -664,27 +718,115 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
   }
 }
 
-bool VulkanRenderer::patchFarFieldWithRegion() {
+// Rewrites the far-LOD cells covered by the region's chunks with the REAL
+// per-column tops. INCREMENTAL: only chunks outside the already-patched
+// extent box are scanned (interior cells keep their exact values from
+// earlier patches), which keeps the per-swap cost to the newly entered
+// ring (~0.3 ms) instead of the whole region. Returns the changed cell
+// runs (offset,count) + values for a delta upload.
+bool VulkanRenderer::patchFarFieldWithRegion(
+    std::vector<std::pair<uint32_t, uint32_t>>& runs,
+    std::vector<uint32_t>& values) {
+  runs.clear();
+  values.clear();
   if (!m_farFieldActive || m_farDim == 0 || !m_world || m_farCells.empty()) {
     return false;
   }
   const auto& cfg = m_voxelConfig;
+  const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
+
+  // Chunks in the region that are outside the patched extent box.
   std::vector<vv::terrain::FarField::RegionChunkHeights> chunks;
-  chunks.reserve(m_slotOf.size());
-  for (const auto& [coord, slot] : m_slotOf) {
-    (void)slot;
-    const vv::voxel::Chunk* chunk = m_world->findChunk(coord);
-    if (chunk == nullptr) {
-      continue;
+  for (int32_t dz = -r; dz <= r; ++dz) {
+    for (int32_t dx = -r; dx <= r; ++dx) {
+      const int32_t cx = m_regionCenter.x + dx;
+      const int32_t cz = m_regionCenter.z + dz;
+      if (m_farPatchMaxX >= m_farPatchMinX && cx >= m_farPatchMinX &&
+          cx <= m_farPatchMaxX && cz >= m_farPatchMinZ &&
+          cz <= m_farPatchMaxZ) {
+        continue;  // already exact from an earlier patch
+      }
+      const vv::voxel::Chunk* chunk =
+          m_world->findChunk(vv::voxel::ChunkCoord{cx, cz});
+      if (chunk == nullptr) {
+        continue;
+      }
+      chunks.push_back({cx * static_cast<std::int32_t>(cfg.chunkSizeX),
+                        cz * static_cast<std::int32_t>(cfg.chunkSizeZ),
+                        cfg.chunkSizeX, cfg.chunkSizeZ,
+                        chunk->heightMap().data()});
     }
-    chunks.push_back({coord.x * static_cast<std::int32_t>(cfg.chunkSizeX),
-                      coord.z * static_cast<std::int32_t>(cfg.chunkSizeZ),
-                      cfg.chunkSizeX, cfg.chunkSizeZ,
-                      chunk->heightMap().data()});
   }
-  return vv::terrain::FarField::patchRegion(
-             m_farCells, m_farDim, m_farCell, m_farOriginVoxX, m_farOriginVoxZ,
-             chunks, m_world->terrain()) > 0;
+  if (chunks.empty() &&
+      (m_farPatchMaxX >= m_farPatchMinX)) {
+    return false;  // nothing new to patch
+  }
+
+  std::vector<std::uint32_t> changed;
+  vv::terrain::FarField::patchRegion(
+      m_farCells, m_farDim, m_farCell, m_farOriginVoxX, m_farOriginVoxZ,
+      chunks, m_world->terrain(), &changed);
+  if (changed.empty()) {
+    extendFarPatchExtent();
+    return false;
+  }
+
+  // Coalesce changed indices into contiguous runs for the delta upload.
+  uint32_t runStart = changed[0];
+  uint32_t runLen = 1;
+  for (std::size_t i = 1; i <= changed.size(); ++i) {
+    const bool flush = i == changed.size() || changed[i] != changed[i - 1] + 1;
+    if (flush) {
+      runs.emplace_back(runStart, runLen);
+      for (uint32_t k = 0; k < runLen; ++k) {
+        values.push_back(m_farCells[runStart + k]);
+      }
+      if (i < changed.size()) {
+        runStart = changed[i];
+        runLen = 1;
+      }
+    } else {
+      ++runLen;
+    }
+  }
+  extendFarPatchExtent();
+  return true;
+}
+
+void VulkanRenderer::extendFarPatchExtent() {
+  const int32_t r = static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+  const int32_t minX = m_regionCenter.x - r;
+  const int32_t maxX = m_regionCenter.x + r;
+  const int32_t minZ = m_regionCenter.z - r;
+  const int32_t maxZ = m_regionCenter.z + r;
+  if (m_farPatchMaxX < m_farPatchMinX) {
+    m_farPatchMinX = minX;
+    m_farPatchMaxX = maxX;
+    m_farPatchMinZ = minZ;
+    m_farPatchMaxZ = maxZ;
+  } else {
+    m_farPatchMinX = std::min(m_farPatchMinX, minX);
+    m_farPatchMaxX = std::max(m_farPatchMaxX, maxX);
+    m_farPatchMinZ = std::min(m_farPatchMinZ, minZ);
+    m_farPatchMaxZ = std::max(m_farPatchMaxZ, maxZ);
+  }
+}
+
+// Applies an incremental seam patch (if anything changed) as a small async
+// delta upload into the ACTIVE far half. No device/queue waits.
+void VulkanRenderer::uploadFarPatchDelta() {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  std::vector<uint32_t> values;
+  if (!patchFarFieldWithRegion(runs, values)) {
+    return;
+  }
+  std::string error;
+  if (!m_voxelResources.uploadFarFieldDelta(
+          m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+          m_farHalf, runs, values, error)) {
+    std::fprintf(stderr, "[vulkan] far LOD seam patch upload failed: %s\n",
+                 error.c_str());
+  }
 }
 
 glm::vec3 VulkanRenderer::spawnPosition() const {
@@ -1234,6 +1376,15 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
                                         std::string& outError) {
   const uint32_t radius = m_voxelConfig.renderRadiusChunks;
   const int32_t r = static_cast<int32_t>(radius);
+
+  // Synchronous path (initial region, teleport fallback): a full drain is
+  // acceptable here - it also retires every frame that could reference
+  // cooldown slots, so they can be recycled immediately.
+  vkDeviceWaitIdle(m_device);
+  for (auto it = m_slotCooldown.begin(); it != m_slotCooldown.end();) {
+    m_freeSlots.push_back(it->first);
+    it = m_slotCooldown.erase(it);
+  }
   const uint32_t gridW = m_voxelConfig.gridWidth();
   const uint32_t gridH = m_voxelConfig.gridHeight();
   const int32_t originX = centerChunkX - r;
@@ -1246,7 +1397,7 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   for (const vv::voxel::ChunkCoord& coord : evicted) {
     const auto it = m_slotOf.find(coord);
     if (it != m_slotOf.end()) {
-      m_freeSlots.push_back(it->second);
+      m_slotCooldown.emplace_back(it->second, m_frameCounter);
       m_slotOf.erase(it);
     }
   }
@@ -1285,6 +1436,8 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
       }
     }
   }
+  // (These capacity-fallback slots are safe to reuse immediately: the
+  // device wait at the top of this function already drained everything.)
 
   if (needUpload.size() > m_freeSlots.size()) {
     outError = "Chunk atlas exhausted (need " +
@@ -1329,25 +1482,30 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     }
     table[static_cast<size_t>(gx) + static_cast<size_t>(gz) * gridW] = slot;
   }
-  if (!m_voxelResources.writeChunkTable(table)) {
+  const uint32_t nextTableHalf =
+      (m_tableHalf + 1u) % vv::vulkan::VoxelResources::kTableHalves;
+  if (!m_voxelResources.writeChunkTable(table, nextTableHalf)) {
     outError = "Failed to update the chunk table.";
     return false;
   }
+  m_tableHalf = nextTableHalf;
 
-  // The region boundary moved: re-derive the far-LOD seam band from the
-  // now-active chunks (same as finishRegionMove). Without this, every
-  // synchronous path (initial region, teleport fallback, catch-up-era
-  // rebuilds) left the new seam on unpatched estimates, which under-shoot
-  // folded mountain terrain -> rare "missing chunks" holes at the seam.
-  if (patchFarFieldWithRegion()) {
-    std::string patchError;
-    if (!m_voxelResources.uploadFarField(m_device, m_physicalDevice,
-                                         m_commandPool, m_graphicsQueue,
-                                         m_farCells, patchError)) {
-      std::fprintf(stderr, "[vulkan] far LOD seam patch upload failed: %s\n",
-                   patchError.c_str());
+  // Diagnostic (rare missing-chunk hunt): log empty cells in the table
+  // that was just published.
+  for (std::size_t i = 0; i < table.size(); ++i) {
+    if (table[i] == vv::vulkan::VoxelResources::kEmptySlot) {
+      const int32_t gx =
+          static_cast<int32_t>(i % m_voxelConfig.gridWidth()) - r;
+      const int32_t gz =
+          static_cast<int32_t>(i / m_voxelConfig.gridWidth()) - r;
+      std::fprintf(stderr, "[vulkan] TABLE HOLE at chunk (%d,%d)\n",
+                   centerChunkX + gx, centerChunkZ + gz);
     }
   }
+
+  // The region boundary moved: re-derive the far-LOD seam band from the
+  // now-active chunks (same as finishRegionMove; incremental + async).
+  uploadFarPatchDelta();
 
   return true;
 }
@@ -1744,7 +1902,10 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
       m_regionCenter.x - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
   const int32_t originZ =
       m_regionCenter.z - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
-  push.region = glm::ivec4(originX, 0, originZ, 0);
+  // region.w = chunk-table half (ping-pong; the swap path writes the
+  // inactive half and flips this index - no device wait).
+  push.region = glm::ivec4(originX, 0, originZ,
+                           static_cast<int32_t>(m_tableHalf));
   push.grid = glm::uvec4(m_voxelConfig.gridWidth(), m_voxelConfig.gridHeight(),
                          static_cast<uint32_t>(m_voxelResources.slotWordStride()),
                          static_cast<uint32_t>(m_maxTerrainVoxelY));
@@ -1752,13 +1913,11 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     push.far = glm::ivec4(m_farOriginVoxX, m_farOriginVoxZ,
                           static_cast<int32_t>(m_farDim),
                           static_cast<int32_t>(m_farDim));
+    // farParams.y = far-field half (ping-pong; see uploadFarFieldHalf).
+    push.farParams = glm::vec4(static_cast<float>(m_farCell),
+                               static_cast<float>(m_farHalf), 0.0f, 0.0f);
   } else {
     push.far = glm::ivec4(0, 0, 0, 0);  // z = 0: far LOD off in the shader
-  }
-  if (m_farFieldActive) {
-    push.farParams = glm::vec4(static_cast<float>(m_farCell), 0.0f, 0.0f,
-                               0.0f);
-  } else {
     push.farParams = glm::vec4(0.0f);
   }
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,

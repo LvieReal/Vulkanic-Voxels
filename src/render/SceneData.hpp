@@ -12,10 +12,12 @@ struct PushConstants final {
 	glm::vec4 camera{};     // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance; see VulkanRenderer::fogCutDistance)
 	glm::uvec4 chunkSize{}; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
 	glm::vec4 voxelSize{};  // xyz=voxel size in world units
-	glm::ivec4 region{};    // x,z = region origin (min corner) in chunk coords
+	glm::ivec4 region{};    // x,z = region origin (min corner) in chunk coords;
+													// w = chunk-table half index (ping-pong buffer)
 	glm::uvec4 grid{};      // x=gridWidth, y=gridHeight, z=slot stride (words), w=max terrain voxel y (sky-skip)
 	glm::ivec4 far{};       // x,y = far-LOD field min corner (voxel X/Z), z,w = cell dims (z=0 = far LOD off)
-	glm::vec4 farParams{};  // x = far cell footprint in voxels
+	glm::vec4 farParams{};  // x = far cell footprint in voxels; y = far-field
+													// half index (ping-pong buffer)
 };
 
 // The Vulkan spec guarantees at least 128 bytes of push constants; this

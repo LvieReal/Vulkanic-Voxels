@@ -1074,6 +1074,26 @@ void testFarPatchRegion() {
 				field.originVoxZ, chunks, gen);
 	check(changed > 0, "far patch: something changed");
 
+	// Incremental semantics: re-patching with NO new chunks must change
+	// nothing (the renderer only passes newly loaded chunks on region
+	// swaps; interior cells must keep their exact values).
+	{
+		std::vector<vv::terrain::FarField::RegionChunkHeights> none;
+		const std::size_t again = vv::terrain::FarField::patchRegion(
+				field.cells, field.dim, field.cellVoxels, field.originVoxX,
+				field.originVoxZ, none, gen);
+		check(again == 0, "far patch: incremental no-op changes nothing");
+	}
+	// And the changed-index out-param reports exactly the cells written.
+	{
+		std::vector<std::uint32_t> indices;
+		std::vector<vv::terrain::FarField::RegionChunkHeights> none;
+		vv::terrain::FarField::patchRegion(
+				field.cells, field.dim, field.cellVoxels, field.originVoxX,
+				field.originVoxZ, none, gen, &indices);
+		check(indices.empty(), "far patch: no-op reports no indices");
+	}
+
 	// Independent recomputation: per-cell (max covered column top, covered
 	// column count) over the fabricated chunk block.
 	const int dim = int(field.dim);

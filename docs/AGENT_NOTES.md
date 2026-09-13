@@ -916,6 +916,52 @@ finishRegionMove; upload only on change).
 **Verified**: Release + Debug warning-free; all tests pass; offscreen
 smoke clean.
 
+### Pass 12: wait-free region swaps (the sprint hitch), sprint catch-up data, hole diagnostics
+
+Pass 11 report (owner): hitch persists at sprint with a REGULAR ~half-
+second rhythm; one chunk missing at (0,13) near spawn that fills in
+after flying away and back. (Adaptive pump from pass 11 stays.)
+
+**The hitch = the region-swap bundle.** With the catch-up gone, every
+crossing ends in finishRegionMove, which did: vkDeviceWaitIdle + a
+FULL 4 MB far-field sync upload (the seam patch) - and each far
+recenter (every ~16 chunks) added two more 4 MB sync uploads. At
+sprint that is a 5-15 ms stall every ~0.3 s: the reported rhythm.
+Fix - the swap path is now fully asynchronous:
+- Chunk table TRIPLE-buffered (3 halves): swaps write the inactive
+  half (plain mapped memcpy) and flip a push-constant index
+  (region.w). Three halves because with kMaxFramesInFlight = 2, the
+  half being rewritten must have been last read by a frame whose fence
+  the loop has since waited; two halves cannot guarantee that when
+  swaps land on consecutive frames.
+- Far field DOUBLE-buffered (2 halves): activations upload the patched
+  field into the inactive half via a persistent staging buffer + fence
+  (waits only its own copy, not the device), then flips farParams.y.
+- Seam patches are now INCREMENTAL (only newly covered chunks are
+  scanned, ~0.3 ms vs full region) and upload only the CHANGED cells
+  as small async deltas (fence-scoped; a torn frame can only show a
+  few seam cells with the previous estimate).
+- Released slots go to a 2-frame cooldown queue before rejoining the
+  free list (in-flight frames may still reference them through the
+  previous table half). rebuildChunkRegion (teleport/startup) drains
+  the device once and flushes the cooldown - acceptable on rare paths.
+- finishRegionMove waits ONLY the streaming upload fence before
+  publishing a table that references freshly uploaded slots.
+No vkDeviceWaitIdle / vkQueueWaitIdle remains on the per-crossing
+path.
+
+**The (0,13) hole**: data probes show the far estimate there is CORRECT
+(33-45 vs real 33-47), so the pass-11 seam theory does not explain it;
+it fills in after re-flying, so it is a state bug, not data. Shipped
+diagnostics: every published table is scanned and any empty cell logs
+"[vulkan] TABLE HOLE at chunk (x,z)" - if the hole is an empty table
+cell, the next run will name it. If nothing logs while the hole is
+visible, the far-side lookup is implicated next (then I instrument the
+far march).
+
+**Verified**: CPU tests pass (incl. new incremental no-op patch checks);
+Release + Debug warning-free; offscreen smoke clean.
+
 ## Roadmap status
 
 **Pass 1 — done (commit "Cross-platform platform layer…"):**
@@ -937,7 +983,13 @@ smoke clean.
       atlas + region management, distance fog)
 - [x] Pure-logic test suite (`tests/`, runs headless in sandbox)
 
-**Pass 11 — done (pending user verification):**
+**Pass 12 — done (pending user verification):**
+- [x] Sprint hitch: wait-free region swaps (triple-buffered table,
+      double-buffered far field, incremental async seam patches)
+- [x] Hole diagnostics: TABLE HOLE logging on every published table
+
+**Pass 11 — done (user-verified: catch-up removed, but swap-path hitch
+and the (0,13) hole remained -> pass 12):**
 - [x] Sprint stutter: sync catch-up removed; deficit-adaptive pump
       (4 chunks / 10 ms while behind, 1 / 3 ms otherwise)
 - [x] Rare seam holes: far seam re-patched after every synchronous

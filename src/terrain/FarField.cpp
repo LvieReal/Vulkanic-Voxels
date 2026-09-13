@@ -7,12 +7,13 @@
 namespace vv::terrain {
 
 std::size_t FarField::patchRegion(std::vector<std::uint32_t>& cells,
-																		std::uint32_t dim,
-																		std::uint32_t cellVoxels,
-																		std::int32_t originVoxX,
-																		std::int32_t originVoxZ,
-																		const std::vector<RegionChunkHeights>& chunks,
-																		const TerrainGenerator& gen) {
+																	std::uint32_t dim,
+																	std::uint32_t cellVoxels,
+																	std::int32_t originVoxX,
+																	std::int32_t originVoxZ,
+																	const std::vector<RegionChunkHeights>& chunks,
+																	const TerrainGenerator& gen,
+																	std::vector<std::uint32_t>* outChangedIndices) {
 	const std::int64_t dim64 = static_cast<std::int64_t>(dim);
 	const std::int64_t cell64 = static_cast<std::int64_t>(cellVoxels);
 	const std::int64_t originX = originVoxX;
@@ -69,7 +70,10 @@ std::size_t FarField::patchRegion(std::vector<std::uint32_t>& cells,
 		const std::int32_t top = static_cast<std::int32_t>(height) - 1;
 		const auto type = gen.typeForDepth(top, top);
 		cells[i] = packColumn(static_cast<std::uint16_t>(height),
-													static_cast<std::uint8_t>(type));
+														static_cast<std::uint8_t>(type));
+		if (outChangedIndices != nullptr) {
+			outChangedIndices->push_back(static_cast<std::uint32_t>(i));
+		}
 		++changed;
 	}
 	return changed;
