@@ -62,7 +62,6 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   far cell (data hole), cyan = data present but ray passed over (height
   too low), yellow = march never crossed the chunk.
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
-- VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation
@@ -84,57 +83,52 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
     src/voxel/{Chunk,VoxelTypes,VoxelTextures,World}.cpp -o /tmp/t && /tmp/t
 ```
 
-Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
-`~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
+Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
+(~17 min) and `ln -s ~/.cache/vv-deps /tmp/deps`. NOTE: `~/.cache` is
+excluded from workspace snapshots — EVERY sandbox restart needs the
+rebuild + reconfigure of build/release and build/debug.
 
-## Current status (pass 24)
+## Current status (pass 25)
 
-Owner report on pass 23 (9-ray cone): gaps/distortions fixed BUT "very
-slow" and "shadows look scattered, no smooth gradient". Pass 24 replaces
-the soft path with a CPU-precomputed SUN SHADOW HEIGHTMAP - soft
-shading is now a bounded handful of buffer fetches per pixel, cost
-independent of blocker distance, with continuous gradients.
+Owner report on pass 24 (heightmap + penumbra ring): "no success, it got
+worse, it also crashes randomly after a couple of seconds". Owner
+decision: REMOVE the cone-traced/soft shadow machinery entirely and try
+flood fill instead. Pass 25 is the removal; soft shadows are gone until
+the flood-fill pass lands.
 
-Delivered (pass 24):
-- `src/terrain/SunShadowMap.{hpp,cpp}`: `SunShadowBuilder` - parallel
-  light-ray splatting over the region's columns. Each ray (from the
-  up-sun grid edges, 0.25/0.75 sub-cell offsets) carries a running
-  shadow height hRun = max(tops seen) decayed by sunY per ray parameter
-  (tMax-delta between crossings; a two-axis DP was tried and REJECTED -
-  it smears shadows diagonally). Writes per column the PAIR (H, D):
-  H = the shadow ceiling at the column; D = distance from the winning
-  blocker to the column, quantized /4 in u16 (0 = the column's own top
-  won). Incremental tick(crossings); double-buffered; requestRebuild()
-  on chunk installs; shiftField on region moves. Validated +-1.0 vs a
-  9-offset brute-sup oracle in all four sun quadrants.
-- Binding 11 (set 0): [H grid][D grid], each 800x800 u16 packed two per
-  u32 along X (2.56 MB device-local, staging+fence upload on completed
-  build cycles; zero-initialized at startup so shading starts defined).
-- Renderer: tops mirror (`m_sunShadowTops`, Chunk::heightMap with far
-  fallback), sliced build (tick(64) per frame in updateWorld), publish
-  on cycle completion, shift + exposed-band refresh on table publishes,
-  full re-assembly on teleports, reconfigure on sun-direction change.
-- Shader soft path: short 8-column march of the receiver's EXACT ray
-  (entry knives - resolves close terrain-step grazes that bilinear
-  sampling cannot see) + a penumbra ring of 8 bilinear coverage
-  samples at radius coneTan*s_b around the center direction's LANDING
-  point (not the receiver!), all at entry = s_b. Knife = the same
-  formula as the far tier (climb-corrected, vertical spread
-  2*tan*sB*|sun.xz|), so near/far penumbrae join seamlessly. Far-LOD
-  hits: far cells -> one field test at the region boundary column ->
-  far cells (3 legs; visibility combines with min). Sharp mode
-  (coneTan 0 / VV_SHADOW_SHARP=1) = the single exact march, unchanged.
-- Tests: sharp parity 809/2191 agree; cone vs 13-dir dense reference
-  mean |diff| 0.031, 95.9% within 0.25, 1.6% beyond 0.5, 0.9%
-  graze-inconsistent (a column-quantized field cannot resolve
-  sub-column graze lines - bounded dither, bars set accordingly);
-  lateral profile tracks the reference smoothly (max 0.325, no gaps,
-  no hard steps); splat vs brute max dev 1.0.
+Delivered (pass 25):
+- Deleted `src/terrain/SunShadowMap.{hpp,cpp}`, binding 11 (layout count
+  12 -> 11, writes 12 -> 11, pool 10 -> 8), `uploadSunShadowField` +
+  buffer + staging/fence, all renderer hooks and members, the shader's
+  whole soft path, `VV_SHADOW_SHARP`, and `scene.misc.w` (coneTan).
+- `sunShadow()` is back to the pass-20 semantics: ONE exact binary ray
+  (`sunRayEscapes`) for every hit, near AND far-LOD. No soft mode.
+- Tests: mirror machinery for soft paths removed; `testSunShadowMarch`
+  (exact march vs dense brute) restored to direct mirror calls and
+  passing (809 lit / 2191 shadowed agree). All other tests unchanged.
 
-Workspace note: a previous sandbox wipe returned a FRESH CLONE at 240f625
-(pass-14..23 history lost locally); the remote still had the full per-pass
-history, so pass 24 was grafted on top of d375eb6 as a normal commit
-(a76d6e1) — per-pass git history is intact on the remote again.
+Next (agreed direction, NOT yet wired): CPU flood-fill sun light grid.
+Prototype validated in /home/user/floodprobe (outside the repo):
+- SEEDS: air cells whose exact sun ray escapes get light 1.0 — the
+  shadow boundary stays EXACT (0 violations vs the exact march; the
+  anisotropic-DP smearing dead end cannot recur because direct light
+  never propagates).
+- BLEED: Dial bucket-queue Dijkstra through air only; horizontal step
+  cost 1 (uniform) or 1 + 0.5*dot(step, sunXZ) (down-sun cheap,
+  up-sun 1.5x); down 1, up 2. Light = 1 - dist/budget. Smooth (max
+  adjacent step 44/255 at budget 14, zero hard steps), seamless
+  (distance field, merged wall+tower shadows continuous), fast
+  (~15-40 ms for the 64x64x48 fixture incl. seeding, on 2 contended
+  cores). Budget = penumbra width knob (5 = tight/steep, 14 = wide).
+- GPU story: 3D R8_UNORM texture (800x800x128 = 82 MB), ONE filtered
+  fetch per pixel replaces the whole march; trilinear gives sub-cell
+  smoothness on top of the cell grid.
+
+Workspace note: sandbox restarts can return a FRESH CLONE at the base
+commit with the working tree preserved (happened twice: before pass 24
+and before pass 25). Recovery that worked both times: `git fetch origin
+<branch>`, verify the tree matches FETCH_HEAD, `git reset FETCH_HEAD`,
+continue. Push often.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

@@ -131,32 +131,6 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 	}
 	std::memset(m_mappedTable, 0xFF, static_cast<std::size_t>(tableBytes));
 
-	// Sun shadow field (binding 11): TWO packed grids back to back -
-	// [shadow heights H][blocker distances D] (see SunShadowMap.hpp).
-	// The renderer uploads the first (zeroed) field right after
-	// create(), which doubles as the buffer's initialization -
-	// device-local memory cannot be memset.
-	m_sunShadowCols = config.gridWidth() * config.chunkSizeX;
-	m_sunShadowRows = config.gridHeight() * config.chunkSizeZ;
-	m_sunShadowWordsPerRow = m_sunShadowCols / 2u;
-	const VkDeviceSize shadowBytes = static_cast<VkDeviceSize>(
-			m_sunShadowWordsPerRow * m_sunShadowRows * 2u *
-			sizeof(std::uint32_t));
-	if ((m_sunShadowCols & 1u) != 0u || shadowBytes == 0) {
-		outError = "Sun shadow field needs even column count.";
-		cleanup(device);
-		return false;
-	}
-	if (!utils::createBuffer(device, physicalDevice, shadowBytes,
-													 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-														 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-													 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-													 m_sunShadowBuffer, m_sunShadowMemory,
-													 outError)) {
-		cleanup(device);
-		return false;
-	}
-
 	if (!createPalette(device, physicalDevice, outError)) {
 		cleanup(device);
 		return false;
@@ -875,96 +849,6 @@ bool VoxelResources::uploadChunksStreaming(
 	return true;
 }
 
-bool VoxelResources::uploadSunShadowField(
-		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
-		VkQueue queue, const std::vector<std::uint32_t>& packed,
-		std::string& outError) {
-	const VkDeviceSize bytes = static_cast<VkDeviceSize>(
-			m_sunShadowWordsPerRow * m_sunShadowRows * 2u *
-			sizeof(std::uint32_t));
-	if (m_sunShadowBuffer == VK_NULL_HANDLE || bytes == 0 ||
-			packed.size() * sizeof(std::uint32_t) != static_cast<std::size_t>(bytes)) {
-		outError = "Sun shadow field size mismatch.";
-		return false;
-	}
-	if (m_sunShadowStaging == VK_NULL_HANDLE) {
-		if (!utils::createBuffer(device, physicalDevice, bytes,
-														 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-														 m_sunShadowStaging,
-														 m_sunShadowStagingMemory, outError)) {
-			return false;
-		}
-		VkResult r = vkMapMemory(device, m_sunShadowStagingMemory, 0,
-														 VK_WHOLE_SIZE, 0,
-														 &m_sunShadowStagingMapped);
-		if (r != VK_SUCCESS || m_sunShadowStagingMapped == nullptr) {
-			outError = "Failed to map sun shadow staging memory.";
-			return false;
-		}
-		VkCommandBufferAllocateInfo alloc{};
-		alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		alloc.commandPool = commandPool;
-		alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		alloc.commandBufferCount = 1;
-		r = vkAllocateCommandBuffers(device, &alloc, &m_sunShadowCmd);
-		if (r != VK_SUCCESS) {
-			outError = "Failed to allocate sun shadow command buffer.";
-			return false;
-		}
-		VkFenceCreateInfo fence{};
-		fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-		fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-		r = vkCreateFence(device, &fence, nullptr, &m_sunShadowFence);
-		if (r != VK_SUCCESS) {
-			outError = "Failed to create sun shadow upload fence.";
-			return false;
-		}
-	}
-	if (m_sunShadowFencePending) {
-		vkWaitForFences(device, 1, &m_sunShadowFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_sunShadowFence);
-		m_sunShadowFencePending = false;
-	}
-	std::memcpy(m_sunShadowStagingMapped, packed.data(),
-							static_cast<std::size_t>(bytes));
-
-	VkResult r = vkResetCommandBuffer(m_sunShadowCmd, 0);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to reset sun shadow command buffer.";
-		return false;
-	}
-	VkCommandBufferBeginInfo begin{};
-	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	r = vkBeginCommandBuffer(m_sunShadowCmd, &begin);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to begin sun shadow command buffer.";
-		return false;
-	}
-	VkBufferCopy region{};
-	region.size = bytes;
-	vkCmdCopyBuffer(m_sunShadowCmd, m_sunShadowStaging, m_sunShadowBuffer, 1,
-									&region);
-	r = vkEndCommandBuffer(m_sunShadowCmd);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to end sun shadow command buffer.";
-		return false;
-	}
-	VkSubmitInfo submit{};
-	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submit.commandBufferCount = 1;
-	submit.pCommandBuffers = &m_sunShadowCmd;
-	r = vkQueueSubmit(queue, 1, &submit, m_sunShadowFence);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to submit sun shadow field upload.";
-		return false;
-	}
-	m_sunShadowFencePending = true;
-	return true;
-}
-
 void VoxelResources::waitStreamingUploadIdle(VkDevice device) {
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_streamFencePending[k]) {
@@ -1347,31 +1231,6 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_voxelMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_voxelMemory, nullptr);
 		m_voxelMemory = VK_NULL_HANDLE;
-	}
-	if (m_sunShadowFence != VK_NULL_HANDLE) {
-		vkDestroyFence(device, m_sunShadowFence, nullptr);
-		m_sunShadowFence = VK_NULL_HANDLE;
-		m_sunShadowFencePending = false;
-	}
-	if (m_sunShadowStagingMapped != nullptr) {
-		vkUnmapMemory(device, m_sunShadowStagingMemory);
-		m_sunShadowStagingMapped = nullptr;
-	}
-	if (m_sunShadowStaging != VK_NULL_HANDLE) {
-		vkDestroyBuffer(device, m_sunShadowStaging, nullptr);
-		m_sunShadowStaging = VK_NULL_HANDLE;
-	}
-	if (m_sunShadowStagingMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(device, m_sunShadowStagingMemory, nullptr);
-		m_sunShadowStagingMemory = VK_NULL_HANDLE;
-	}
-	if (m_sunShadowBuffer != VK_NULL_HANDLE) {
-		vkDestroyBuffer(device, m_sunShadowBuffer, nullptr);
-		m_sunShadowBuffer = VK_NULL_HANDLE;
-	}
-	if (m_sunShadowMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(device, m_sunShadowMemory, nullptr);
-		m_sunShadowMemory = VK_NULL_HANDLE;
 	}
 	m_slotCount = 0;
 	m_slotByteStride = 0;
