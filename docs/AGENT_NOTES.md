@@ -84,27 +84,33 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 16)
+## Current status (pass 17)
 
-Pass-15 log: buckets worked; remaining causes fixed.
+Owner-verified pass 16: "finally feels incremental, startup is instant,
+hitches gone" (on the DEBUG build). Pass 17 fixes the remaining
+streaming-order issues + the VS Code task problem:
 
-1. Startup freeze (SYNC 729 chunks, ~10 s) - the initial region was
-   still generated synchronously. Startup is now fully async: far
-   build launches first, then beginRegionMove streams the region from
-   frame one (table halves start all-empty = far-LOD view; world pops
-   in around the camera). spawnPosition reads the generator, not
-   chunks, so spawn is unaffected.
-2. Sprint SYNC (97-107 chunks, ~1.5 s) still fired because just-freed
-   slots sit in the 2-frame cooldown and cannot be reused instantly,
-   so the shortage check panicked into the sync path. A slot shortage
-   is NOT an error state - the pump installs what fits and the cooldown
-   recycles slots 2 frames later. Sync now only for genuine teleports
-   (pending > half the region). Promoting fresh cooldown entries
-   immediately would corrupt in-flight frames (active table half).
-3. One gen worker (~68 chunks/s on the owner's CPU) was right at the
-   sprint drain rate - now 2 workers, backlog 4.
-4. Owner CPU measures ~15 ms/chunk vs the sandbox's 2.8 - possibly a
-   Debug build on the owner side (Release should be ~5x faster); asked.
+1. Chunks appeared ALL AT ONCE: the region table only published at
+   streaming completion, so installed chunks sat invisible until the
+   whole region (incl. the 104 ring chunks) finished. The pump now
+   publishes the table INCREMENTALLY (publishRegionTable: write the
+   next half over the TARGET grid from m_slotOf - old-region chunks in
+   the overlap stay visible during crossings - then flip). drawFrame
+   takes the grid origin from the published table (m_tableOriginX/Z),
+   not m_regionCenter.
+2. Chunks generated BEHIND the camera first: the worker pops requests
+   from the back and the ring list was appended AFTER the region list -
+   ring corners (behind) generated first. Ring is now queued BEFORE the
+   region (and sorted by the same priority), so region chunks (ahead)
+   generate first.
+3. Nearby chunks came last: streamPriority was facing-dominant, so the
+   chunks beside/behind the camera generated last. Now near-first with
+   a forward bias: priority = -(dist - facing*96).
+4. VS Code tasks.json: "$gcc" problemMatcher is not in the user's VS
+   Code build (schema rejects it) - replaced with an inline GCC/MinGW
+   matcher on all 4 build tasks; the default build task is now RELEASE
+   (the owner was running Debug - ~5x slower at runtime: 15 ms/chunk
+   vs ~3).
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

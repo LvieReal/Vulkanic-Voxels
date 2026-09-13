@@ -569,7 +569,13 @@ static float streamPriority(const vv::voxel::ChunkCoord& coord,
   const glm::vec3 f(cameraForward.x, 0.0f, cameraForward.z);
   const float facing =
       glm::length(f) > 1e-6f ? glm::dot(dir / dist, glm::normalize(f)) : 0.0f;
-  return facing - dist * 0.0005f;
+  // NEAR-FIRST with a forward bias: priority = -(dist - facing * 96).
+  // The old facing-dominant order generated the far edge ahead of the
+  // camera before the chunks right next to it (at startup the NEAREST
+  // chunks face away/sideways and came last - "takes a while for nearby
+  // chunks"). Now near chunks always come first, ties/equal distance go
+  // to what is in front (96 world units of bias ~ 3 chunks).
+  return -(dist - facing * 96.0f);
 }
 
 void VulkanRenderer::rebuildStreamPending() {
@@ -608,6 +614,14 @@ void VulkanRenderer::rebuildStreamPending() {
   }
   const glm::vec3 pos = m_camera.position();
   const glm::vec3 fwd = m_camera.forward();
+  std::sort(m_streamRingPending.begin(), m_streamRingPending.end(),
+            [this, &pos, &fwd](const vv::voxel::ChunkCoord& a,
+                               const vv::voxel::ChunkCoord& b) {
+              return streamPriority(a, pos, fwd, m_voxelConfig.chunkSizeX,
+                                    m_voxelConfig.voxelSize.x) <
+                     streamPriority(b, pos, fwd, m_voxelConfig.chunkSizeX,
+                                    m_voxelConfig.voxelSize.x);
+            });
   std::sort(m_streamPending.begin(), m_streamPending.end(),
             [this, &pos, &fwd](const vv::voxel::ChunkCoord& a,
                                const vv::voxel::ChunkCoord& b) {
@@ -738,6 +752,14 @@ void VulkanRenderer::pumpRegionStreaming() {
                            m_streamPending.end());
     ++uploaded;
   }
+  // Chunks become visible AS THEY INSTALL: without this the table only
+  // published at completion and the whole region popped in at once
+  // ("nearby chunks appear all at once"). The table covers the TARGET
+  // grid; m_slotOf still holds old-region chunks, so the overlap stays
+  // visible during crossings too.
+  if (uploaded > 0) {
+    publishRegionTable(false);
+  }
   // Leftovers (not uploaded this frame) go back for the next pump.
   if (!done.empty()) {
     std::lock_guard<std::mutex> lock(m_genMutex);
@@ -764,13 +786,20 @@ void VulkanRenderer::pumpRegionStreaming() {
         m_genRequests.push_back(coord);
       }
     };
-    for (const vv::voxel::ChunkCoord& coord : m_streamPending) {
-      tryQueue(coord);
-    }
+    // Queue order matters: the worker pops from the BACK, so the REGION
+    // list (what the camera flies into) must be appended LAST - it is
+    // generated first. The ring (seam patch, includes chunks behind the
+    // camera) goes first in the queue = generated after the region.
+    // (Pass 16 appended the ring last: the workers generated ring
+    // corners behind the camera before the region ahead - "chunks
+    // regenerating behind me first".)
     for (const vv::voxel::ChunkCoord& coord : m_streamRingPending) {
       tryQueue(coord);
     }
-    m_genCV.notify_one();
+    for (const vv::voxel::ChunkCoord& coord : m_streamPending) {
+      tryQueue(coord);
+    }
+    m_genCV.notify_all();
   }
 
   // 4) Done when everything pending has been generated AND uploaded.
@@ -782,6 +811,68 @@ void VulkanRenderer::pumpRegionStreaming() {
   }
   if (finished && m_streamActive) {
     finishRegionMove();
+  }
+}
+
+// Writes the current slot map over the TARGET region grid into the next
+// table half and flips the half index. Called incrementally by the pump
+// (chunks appear as they install) and finally by finishRegionMove
+// (logHoles = true: a completed region must have no empty cells).
+// In-flight frames keep reading the half they were recorded with; three
+// halves make consecutive-frame flips safe (the one being rewritten was
+// last read by a frame whose fence the loop has since waited).
+void VulkanRenderer::publishRegionTable(bool logHoles) {
+  const auto& cfg = m_voxelConfig;
+  const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
+  const int32_t originX = m_streamTarget.x - r;
+  const int32_t originZ = m_streamTarget.z - r;
+  std::vector<uint32_t> table(
+      static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight(),
+      vv::vulkan::VoxelResources::kEmptySlot);
+  // m_slotOf also holds chunks of the PREVIOUS region that overlap the
+  // target grid - they stay visible during crossings until the swap.
+  for (const auto& [coord, slot] : m_slotOf) {
+    const int32_t gx = coord.x - originX;
+    const int32_t gz = coord.z - originZ;
+    if (gx < 0 || gz < 0 || gx >= static_cast<int32_t>(cfg.gridWidth()) ||
+        gz >= static_cast<int32_t>(cfg.gridHeight())) {
+      continue;
+    }
+    table[static_cast<std::size_t>(gx) +
+          static_cast<std::size_t>(gz) * cfg.gridWidth()] = slot;
+  }
+  const uint32_t nextHalf =
+      (m_tableHalf + 1u) % vv::vulkan::VoxelResources::kTableHalves;
+  if (!m_voxelResources.writeChunkTable(table, nextHalf)) {
+    std::fprintf(stderr, "[vulkan] region table publish failed\n");
+    return;
+  }
+  m_tableHalf = nextHalf;
+  m_tableOriginX = m_streamTarget.x;
+  m_tableOriginZ = m_streamTarget.z;
+
+  if (logHoles) {
+    std::size_t holes = 0;
+    for (std::size_t i = 0; i < table.size(); ++i) {
+      if (table[i] == vv::vulkan::VoxelResources::kEmptySlot) {
+        ++holes;
+        if (holes <= 5) {
+          const int32_t gx =
+              static_cast<int32_t>(i % cfg.gridWidth()) - r;
+          const int32_t gz =
+              static_cast<int32_t>(i / cfg.gridWidth()) - r;
+          std::fprintf(stderr,
+                       "[vulkan] TABLE HOLE at chunk (%d,%d) "
+                       "(region %d,%d)\n",
+                       m_streamTarget.x + gx, m_streamTarget.z + gz,
+                       m_streamTarget.x, m_streamTarget.z);
+        }
+      }
+    }
+    if (holes > 5) {
+      std::fprintf(stderr, "[vulkan] ... %zu more table holes\n",
+                   holes - 5);
+    }
   }
 }
 
@@ -817,59 +908,10 @@ void VulkanRenderer::finishRegionMove() {
   m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
                         cfg.renderRadiusChunks + 1, evicted, 8);
 
-  // Build the new table and write it into the INACTIVE half, then flip.
-  // No device/queue wait: no in-flight frame reads that half (three
-  // halves; the one being rewritten was last read by a frame whose fence
-  // the loop has since waited).
-  std::vector<uint32_t> table(
-      static_cast<std::size_t>(cfg.gridWidth()) * cfg.gridHeight(),
-      vv::vulkan::VoxelResources::kEmptySlot);
-  std::size_t holes = 0;
-  for (int32_t dz = -r; dz <= r; ++dz) {
-    for (int32_t dx = -r; dx <= r; ++dx) {
-      const vv::voxel::ChunkCoord coord{m_streamTarget.x + dx,
-                                        m_streamTarget.z + dz};
-      const auto it = m_slotOf.find(coord);
-      if (it == m_slotOf.end()) {
-        continue;  // cannot happen: streaming completes before finish
-      }
-      const std::size_t cell =
-          static_cast<std::size_t>(dx + r) +
-          static_cast<std::size_t>(dz + r) * cfg.gridWidth();
-      table[cell] = it->second;
-    }
-  }
-  const uint32_t nextHalf =
-      (m_tableHalf + 1u) % vv::vulkan::VoxelResources::kTableHalves;
-  if (!m_voxelResources.writeChunkTable(table, nextHalf)) {
-    std::fprintf(stderr, "[vulkan] region table swap failed\n");
-  } else {
-    m_tableHalf = nextHalf;
-  }
-  m_regionCenter = m_streamTarget;
-  m_streamActive = false;
-  m_streamPending.clear();
+  // Final publish (logs holes: after completion every region cell must
+  // have a slot; an empty one is a real missing chunk).
+  publishRegionTable(true);
 
-  // Diagnostic (rare missing-chunk hunt): log any empty cell in the table
-  // that was just published. Empty cells render as holes (rays skip the
-  // chunk and hit the far LOD or sky behind it).
-  for (std::size_t i = 0; i < table.size(); ++i) {
-    if (table[i] == vv::vulkan::VoxelResources::kEmptySlot) {
-      ++holes;
-      if (holes <= 5) {
-        const int32_t gx = static_cast<int32_t>(i % cfg.gridWidth()) - r;
-        const int32_t gz = static_cast<int32_t>(i / cfg.gridWidth()) - r;
-        std::fprintf(stderr,
-                     "[vulkan] TABLE HOLE at chunk (%d,%d) "
-                     "(region %d,%d)\n",
-                     m_streamTarget.x + gx, m_streamTarget.z + gz,
-                     m_streamTarget.x, m_streamTarget.z);
-      }
-    }
-  }
-  if (holes > 5) {
-    std::fprintf(stderr, "[vulkan] ... %zu more table holes\n", holes - 5);
-  }
 
   // The region boundary moved: re-derive the far field's seam band from
   // the now-active chunks (incrementally - only newly covered chunks are
@@ -2237,10 +2279,13 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
       glm::uvec4(m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
                  m_voxelConfig.chunkSizeZ, m_voxelConfig.maxTraceSteps);
   push.voxelSize = glm::vec4(m_voxelConfig.voxelSize, 0.0f);
+  // The origin matches whatever table half is active - during streaming
+  // that is the TARGET grid (published incrementally by the pump), not
+  // the old region center.
   const int32_t originX =
-      m_regionCenter.x - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+      m_tableOriginX - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
   const int32_t originZ =
-      m_regionCenter.z - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+      m_tableOriginZ - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
   // region.w = chunk-table half (ping-pong; the swap path writes the
   // inactive half and flips this index - no device wait).
   push.region = glm::ivec4(originX, 0, originZ,

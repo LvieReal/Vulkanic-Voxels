@@ -78,6 +78,8 @@ class VulkanRenderer final {
   void rebuildStreamPending();
 
   void finishRegionMove();
+  // Incremental chunk-table publish (see the .cpp).
+  void publishRegionTable(bool logHoles);
 
   // Incremental far-LOD seam patch: rewrites the cells covered by
   // NEWLY-loaded chunks with the real per-column tops (exact for fully
@@ -293,8 +295,12 @@ class VulkanRenderer final {
   std::int32_t m_farPatchMinZ = 0;
   std::int32_t m_farPatchMaxX = -1;
   std::int32_t m_farPatchMaxZ = -1;
-  // Active chunk-table half (push-constant index; triple-buffered).
+  // Active chunk-table half (push-constant index; triple-buffered) and
+  // the chunk-grid origin of the table content in that half (during
+  // streaming this is the TARGET grid, published incrementally).
   std::uint32_t m_tableHalf = 0;
+  std::int32_t m_tableOriginX = 0;
+  std::int32_t m_tableOriginZ = 0;
   // Slots released by a region swap, waiting until no in-flight frame can
   // reference them (two frames) before rejoining the free list.
   std::vector<std::pair<std::uint32_t, std::uint32_t>> m_slotCooldown;
