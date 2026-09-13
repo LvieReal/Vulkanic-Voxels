@@ -2220,6 +2220,125 @@ void testSunLightGrid() {
 		}
 		check(allLit, "light grid: low sun lights everything");
 	}
+
+	// --- renderer shape: window wider than the region, NONZERO origin ---
+	// The renderer's light window (1088) is wider than the chunk region
+	// (800) and its origin is snap-offset from it (pass-26.1: the cone
+	// walk must switch to far-LOD at the REGION edge - the adapter's
+	// bounds - not the window edge, or spurious umbra bands appear along
+	// the sun-facing window edges; reproduced on real terrain in the
+	// sunprobe). Also pins the no-data band semantics (umbra, air bits
+	// rewritten every cycle - no stale state across origin moves - and
+	// bleed-through from the region) and a full parity re-check after
+	// the window moves.
+	{
+		const int C2 = 96, R2 = 96;
+		// The window must CONTAIN the region [0,64)^2 (the renderer's
+		// invariant: region edges never cross the window edge).
+		int ox = -16, oz = -8;  // window [-16,80) x [-8,88)
+		std::vector<std::uint8_t> field2(std::size_t(C2) * R2 * H, 77);
+		vv::terrain::SunLightGrid g2;
+		g2.configure(C2, R2, H, w.near.wx, sun[0], sun[1], sun[2],
+		             std::uint32_t(V), &vox, field2.data());
+		const auto parityAt = [&](const char* what) {
+			long long wrong = 0, checked = 0, lit = 0;
+			for (int z = 0; z < R; ++z) {
+				for (int x = 0; x < C; ++x) {
+					for (int y = 0; y < H; ++y) {
+						if (w.near.at(x, y, z) != 0) {
+							continue;
+						}
+						if (x - ox < 0 || x - ox >= C2 || z - oz < 0 ||
+						    z - oz >= R2) {
+							continue;  // outside the window
+						}
+						++checked;
+						const double o[3] = {x + 0.5, y + 0.5, z + 0.5};
+						const bool m = sunRayEscapesMirror(w, o, sun);
+						const bool c = field2[std::size_t(x - ox) +
+						                      std::size_t(z - oz) * C2 +
+						                      std::size_t(y) * C2 * R2] ==
+						               0;
+						if (m) {
+							++lit;
+						}
+						if (m != c && ++wrong <= 3) {
+							std::printf(
+							    "FAIL %s (%d,%d,%d): march %d grid %d\n",
+							    what, x, y, z, int(m), int(c));
+						}
+					}
+				}
+			}
+			std::printf("light grid: %s at origin (%d,%d): %lld wrong / "
+			            "%lld checked (%lld lit)\n",
+			            what, ox, oz, wrong, checked, lit);
+			return wrong;
+		};
+		g2.setOrigin(ox, oz);
+		g2.setCenter(32.0, 32.0);
+		drainGrid(g2, 1e9);
+		check(parityAt("window parity") == 0,
+		      "light grid: nonzero-origin window parity");
+
+		// Coverage + determinism: a second build into a field init'd
+		// with a DIFFERENT sentinel. Any cell the cycle leaves unwritten
+		// keeps its own sentinel (77 vs 123); written cells must match
+		// exactly. (A single-sentinel scan is ambiguous: dist 77 is a
+		// real fill value.) This pins the prepass rewriting EVERY cell
+		// including the no-data band (the old early return left the
+		// band stale across origin moves).
+		{
+			std::vector<std::uint8_t> fieldB(std::size_t(C2) * R2 * H,
+			                                 123);
+			vv::terrain::SunLightGrid gB;
+			gB.configure(C2, R2, H, w.near.wx, sun[0], sun[1], sun[2],
+			             std::uint32_t(V), &vox, fieldB.data());
+			gB.setOrigin(ox, oz);
+			gB.setCenter(32.0, 32.0);
+			drainGrid(gB, 1e9);
+			long long unwritten = 0, mismatch = 0;
+			for (std::size_t i = 0; i < field2.size(); ++i) {
+				const std::uint8_t a = field2[i], b = fieldB[i];
+				if (a == 77 && b == 123) {
+					++unwritten;
+				} else if (a != b) {
+					++mismatch;
+				}
+			}
+			check(unwritten == 0 && mismatch == 0,
+			      "light grid: every cell written, builds deterministic");
+		}
+
+		// Band semantics: a no-data column beyond the region has no seeds
+		// (umbra) but air above the far height, so the bleed from lit
+		// region cells crosses the boundary (dist < 255 somewhere in the
+		// first band column with air).
+		bool bled = false;
+		for (int z = 0; z < R && !bled; ++z) {
+			for (int y = 0; y < H; ++y) {
+				// x = -1: first band column west of the region.
+				if (field2[std::size_t(-1 - ox) +
+				          std::size_t(z - oz) * C2 +
+				          std::size_t(y) * C2 * R2] < 255) {
+					bled = true;
+					break;
+				}
+			}
+		}
+		check(bled, "light grid: bleed crosses into the far band");
+
+		// Move the window (still containing the region) and rebuild: the
+		// parity must hold at the new origin (no stale band state).
+		ox = -32;
+		oz = -16;  // window [-32,64) x [-16,80)
+		g2.setOrigin(ox, oz);
+		g2.setCenter(32.0, 32.0);
+		g2.requestRebuild();
+		drainGrid(g2, 1e9);
+		check(parityAt("moved-window parity") == 0,
+		      "light grid: moved-window parity (no stale band state)");
+	}
 }
 
 int main() {

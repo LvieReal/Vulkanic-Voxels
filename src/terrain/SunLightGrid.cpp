@@ -197,11 +197,36 @@ void SunLightGrid::refreshColumn(std::uint32_t gx, std::uint32_t gz) {
 	const std::int32_t wz = m_originZ + std::int32_t(gz);
 	const std::uint8_t* vox =
 	    m_voxels ? m_voxels->columnVoxels(wx, wz) : nullptr;
+	const std::uint32_t slice = m_cols * m_rows;
 	if (!vox) {
+		// No near data (window margin beyond the region, or a not-yet-
+		// streamed slot): a VIRTUAL column from the far LOD - solid up
+		// to the far height, air above, all cells umbra. The fog-cut
+		// sphere always fits inside the region, so nothing VISIBLE ever
+		// samples these cells; seeding them (and border-scanning ~50M
+		// band air cells) cost 3.5x the cycle time for invisible
+		// pixels. The virtual air bits still matter: the bleed can pass
+		// through the band, and the bits stay coherent across window
+		// moves (no stale state from the previous cycle - the old early
+		// return skipped them entirely). hasData stays 0: the cone walk
+		// uses the far branch, the border scan skips the column.
+		const int fh = m_voxels
+		                   ? int(m_voxels->farHeightAt(wx, wz))
+		                   : 0;
+		const int solidTop = fh > 0 ? std::min(fh, int(m_height)) - 1 : -1;
+		for (std::uint32_t y = 0; y < m_height; ++y) {
+			const std::size_t i =
+			    std::size_t(base) + std::size_t(y) * slice;
+			m_work[i] = 255;
+			if (int(y) <= solidTop) {
+				m_air[i >> 6] &= ~(1ull << (i & 63));
+			} else {
+				m_air[i >> 6] |= 1ull << (i & 63);
+			}
+		}
 		return;
 	}
 	m_hasData[base] = 1;
-	const std::uint32_t slice = m_cols * m_rows;
 	int run = -1;
 	int count = 0;
 	for (std::uint32_t y = 0; y < m_height; ++y) {
@@ -395,12 +420,15 @@ bool SunLightGrid::tick(double budgetMs) {
 				if (!((m_air[i >> 6] >> (i & 63)) & 1ull)) {
 					continue;  // solid
 				}
-				if (m_work[i] == 0) {
-					continue;  // interior seed
-				}
 				const std::uint32_t gx = std::uint32_t(i % m_cols);
 				const std::uint32_t gz =
 				    std::uint32_t((i / m_cols) % m_rows);
+				if (!m_hasData[gx + gz * m_cols]) {
+					continue;  // virtual far column (beyond the fog)
+				}
+				if (m_work[i] == 0) {
+					continue;  // interior seed
+				}
 				const std::uint32_t y =
 				    std::uint32_t(i / slice);
 				for (const Step& st : m_steps) {

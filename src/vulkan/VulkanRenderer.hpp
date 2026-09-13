@@ -304,20 +304,33 @@ class VulkanRenderer final {
   std::int32_t m_farPatchMaxX = -1;
   std::int32_t m_farPatchMaxZ = -1;
   // --- Sun light grid (pass 26) ---
-  // Fixed light window: kSunGridXZ^2 x worldHeight cells centered on the
-  // camera (origin snapped to kSunGridOriginSnap so walking does not
-  // retrigger builds). The near chunk region (400x400 at radius 12) sits
-  // inside it; columns without a loaded chunk seed from far-LOD heights -
-  // the same fallback the shader march uses. The GPU texture stacks TWO
-  // fields along depth (ping-pong halves): the GPU samples one half while
-  // the next completed build is copied into the other; the half index and
-  // window origin travel in push constants (per-CB snapshot: no shared-UBO
-  // in-flight race), and the light ramp divisor (8 * bleed budget) in
-  // scene.misc.w. farParams.z/w carry the half + enabled flag and are
-  // shared with VV_DEBUG_HOLE instrumentation (the two modes exclude
-  // each other).
-  static constexpr std::uint32_t kSunGridXZ = 800;
-  static constexpr std::uint32_t kSunGridOriginSnap = 256;
+  // Fixed light window: kSunGridXZ^2 x worldHeight cells around the
+  // camera (origin snapped to kSunGridOriginSnap). CRITICAL INVARIANT:
+  // the window must ALWAYS contain the active chunk-table region (the
+  // march's near<->far switch boundary). The module switches cone
+  // columns to far-LOD at the WINDOW edge, the march at the REGION
+  // edge; if the region pokes out of the window, the module tests
+  // conservative far max-heights where the march reads real voxels ->
+  // spurious umbra bands along the sun-facing window edges (the pass-26
+  // release bug, reproduced + pinned by the sunprobe/test parity cases).
+  // Geometry: region = 2r+1 chunks wide, camera-centered within +/-
+  // half a chunk; origin o = floor((cam - W/2)/S)*S, so
+  // o in [cam - W/2 - S + 1, cam - W/2]. Window contains the region
+  // (worst edge cam + (r + 0.5)*chunk + 1) iff W/2 - S + 1 >= that
+  // edge offset; with W = 1088 (34 chunks), S = 64, r = 12, chunk 32:
+  // 544 - 64 + 1 = 481 >= 416, margin 65 voxels of mid-cycle camera
+  // drift. Columns inside the window but outside the region (or in the
+  // streaming ring) seed from far-LOD heights exactly like the march
+  // (the adapter bounds queries by the table region). The GPU texture
+  // stacks TWO fields along depth (ping-pong halves): the GPU samples
+  // one half while the next completed build is copied into the other;
+  // the half index and window origin travel in push constants (per-CB
+  // snapshot: no shared-UBO in-flight race), and the light ramp divisor
+  // (8 * bleed budget) in scene.misc.w. farParams.z/w carry the half +
+  // enabled flag and are shared with VV_DEBUG_HOLE instrumentation (the
+  // two modes exclude each other).
+  static constexpr std::uint32_t kSunGridXZ = 1088;
+  static constexpr std::uint32_t kSunGridOriginSnap = 64;
   static constexpr std::uint32_t kSunFillBudgetVoxels = 14;  // bleed depth
   vv::terrain::SunLightGrid m_sunGrid;
   std::unique_ptr<SunGridVoxels> m_sunVoxels;

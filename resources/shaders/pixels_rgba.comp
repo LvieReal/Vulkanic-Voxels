@@ -120,7 +120,7 @@ layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
 // DISTANCE from directly sunlit air (0 = lit, 255 = umbra); trilinear
 // filtering turns it into smooth penumbrae. The window min corner rides
 // in pc.voxelSize.w / pc.region.y. Sampler: linear, clamp, no mips.
-const uint kSunFieldXZ = 800u;  // sync with VulkanRenderer::kSunGridXZ
+const uint kSunFieldXZ = 1088u;  // sync with VulkanRenderer::kSunGridXZ
 layout(set = 0, binding = 11) uniform texture3D sunField;
 layout(set = 0, binding = 12) uniform sampler sunSampler;
 

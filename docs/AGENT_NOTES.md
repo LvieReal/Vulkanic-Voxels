@@ -92,53 +92,49 @@ Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
 excluded from workspace snapshots — EVERY sandbox restart needs the
 rebuild + reconfigure of build/release and build/debug.
 
-## Current status (pass 26)
+## Current status (pass 26.1 — fixing the first owner report)
 
-Pass 26 (per owner direction after rejecting pass 24's cone/heightmap
-soft shadows): regular CPU FLOOD-FILL light grid, GPU reads the texture.
-Delivered:
+Owner report on pass 26: Debug runs but "everything is shadowed, edges
+softly lit, light grid oriented incorrectly"; Release crashes immediately
+with no message.
 
-- `src/terrain/SunLightGrid.{hpp,cpp}`: phased incremental builder —
-  Prepass (spans/air per column) -> Seeding (cone-table DDA from cell
-  centers; exact vs the march on both test fixtures + the real-terrain
-  probe: 3.3M exhaustive + 300k random cells, 0 misses) -> Border seeds
-  -> Dial-bucket Dijkstra fill (26-conn, x8-quantized direction-weighted
-  costs; down-sun 5, up-sun 11, down 8, up 16 per step at azimuth
-  (1,1)/sqrt2) -> sliced publish into caller storage. Field = u8 bleed
-  distance, budget-independent.
-- Renderer: 800x800xH window (origin snapped 256) centered on the
-  camera; chunks inside the near region seed from real voxels, columns
-  without data from far-LOD heights (same convention as the march).
-  Two fields ping-pong along the DEPTH of one 3D R8 texture
-  (800x800x2H, binding 11 + own sampler at 12); the served half rides
-  in push `farParams.z`, the window origin in `voxelSize.w` (X) and
-  `region.y` (Z) — push constants, so no shared-UBO in-flight race.
-  `scene.misc.w` = 8*bleed budget (default 14 -> 112) is the shader's
-  ramp divisor. `tickSunGrid()` slices the build ~3 ms/frame
-  (VV_SUN_MS); requestRebuild() on chunk installs, region moves,
-  teleports, far swaps and seam patches; window/sun changes defer to
-  the next cycle boundary (a running build stays coherent). The GPU
-  copy (staging -> inactive half, GENERAL layout) is recorded in the
-  same frame the cycle completes.
-- Shader: `sunShadow()` = ONE trilinear fetch when `farParams.w` says
-  the field is live (smooth penumbrae, seamless merged shadows);
-  `sunRayEscapes` stays as the pre-first-field and VV_SUN_GRID=0
-  fallback and remains pinned by the CPU mirror test.
-- Tests (`testSunLightGrid`): exhaustive seed parity vs the march
-  mirror on two fixtures, boundary exactness, smoothness (max adjacent
-  step 0.116 light units), deep-umbra dark, sliced-ticks == one-shot
-  build (this caught a real bug: the fill's budget check consumed a
-  bucket pop without relaxing it), refresh after geometry change,
-  directional step costs (table + sealed-tunnel deltas), all-air
-  column agreement, low-sun all-lit. All passing; both builds
-  warning-free.
-- Also fixed: descriptor pool under-declared its size classes
-  (poolSizeCount 2 although sampled/sampler were allocated from;
-  count is now 4 with the sun field included).
+FIXED (visual bug, reproduced + proven on real terrain in
+/home/user/sunprobe/probe.cpp): the light window (800) was the same width
+as the chunk region (800) but snap-offset from it, so (a) the snap math
+could not even cover the fog-visible range, and (b) the module's cone
+walk switched columns to far-LOD at the WINDOW edge while the exact march
+switches at the REGION edge -> conservative far max-heights shadowed
+bands up-sun of the window offset (spurious umbra + clamp-repeat =
+"everything shadowed, oriented incorrectly"). Fixes:
+- kSunGridXZ 800 -> 1088, kSunGridOriginSnap 256 -> 64. INVARIANT (must
+  hold for parity): the window always contains the region; worst case
+  o = floor((cam - W/2)/S)*S leaves margin 65 voxels of camera drift.
+- The renderer's SunGridVoxels adapter bounds near queries by the ACTIVE
+  chunk-table region (the march's resolveColumn grid); ring chunks
+  beyond it must NOT feed the seeding (the march tests far there).
+- No-data columns (window margin / unstreamed slots) are VIRTUAL far
+  columns: work 255, air bits above the far height (bleed passes
+  through, bits rewritten every cycle - the old early return left them
+  stale across window moves), but NO own seeds and NO border scan
+  (~50M band air cells cost 3.5x cycle time for invisible pixels; the
+  fog-cut sphere always fits inside the region, so nothing visible
+  samples the band).
+- Shader kSunFieldXZ 800 -> 1088 (sync with the renderer constant).
+- Cycle work on the sandbox: ~3.2 s total (1088^2 window; was 1.9 s at
+  800^2) - fine at high fps, slow at 60 (VV_SUN_MS knob).
+- Regression tests added: nonzero-origin window parity (exhaustive) +
+  moved-window parity + two-sentinel every-cell-written/determinism +
+  bleed-crossing checks; sunprobe parity 0 on two cycles with real
+  terrain, moved regions and far rings.
 
-Owner to verify: soft seamless shadows, no banding, no shadow pops on
-window moves, fps impact (VV_PERF=1 shows a `sun` bucket; first field
-~1-2 s after startup, then rebuilds only on big moves/installs).
+OPEN (Release-only immediate crash, no message; Debug runs fine):
+not reproduced in the sandbox (module + adapter ASAN/UBSAN-clean at
+renderer scale, -O3 clean on Linux; no assert()/NDEBUG conditionals in
+src). Instrumentation added: "[vulkan] sun grid: resources created" and
+"first field published" log lines bracket the new init/frame paths.
+Next data needed from the owner: Release run from a console (stderr),
+whether the sun-grid log lines appear, and VV_SUN_GRID=0 as a
+differential (crashes too => the bug is outside the sun grid).
 
 Workspace note: sandbox restarts can return a FRESH CLONE at the base
 commit with the working tree preserved (happened twice: before pass 24

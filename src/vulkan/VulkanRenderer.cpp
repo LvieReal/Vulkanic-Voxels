@@ -1186,15 +1186,29 @@ class VulkanRenderer::SunGridVoxels final
 
   const std::uint8_t* columnVoxels(std::int32_t x,
                                     std::int32_t z) const override {
+    // Bounded by the ACTIVE chunk-table region (the same grid the shader
+    // march's resolveColumn uses): chunks in the streaming ring beyond it
+    // exist in the World cache, but the MARCH tests far cells there - the
+    // light grid must switch to far at the same boundary or the seeding
+    // diverges from the exact march along the region edge.
     const std::int32_t cs =
         static_cast<std::int32_t>(m_r->m_voxelConfig.chunkSizeX);
+    const std::int32_t r =
+        static_cast<std::int32_t>(m_r->m_voxelConfig.renderRadiusChunks);
+    const std::int32_t minX = (m_r->m_tableOriginX - r) * cs;
+    const std::int32_t maxX = (m_r->m_tableOriginX + r + 1) * cs;
+    const std::int32_t minZ = (m_r->m_tableOriginZ - r) * cs;
+    const std::int32_t maxZ = (m_r->m_tableOriginZ + r + 1) * cs;
+    if (x < minX || x >= maxX || z < minZ || z >= maxZ) {
+      return nullptr;  // outside the region: far-LOD fallback
+    }
     const std::int32_t cx = static_cast<std::int32_t>(
         std::floor(static_cast<double>(x) / cs));
     const std::int32_t cz = static_cast<std::int32_t>(
         std::floor(static_cast<double>(z) / cs));
     const vv::voxel::Chunk* chunk = m_r->m_world->findChunk({cx, cz});
     if (!chunk || chunk->voxelTypes().empty()) {
-      return nullptr;  // no near data: far-LOD fallback in the builder
+      return nullptr;  // not streamed yet: far-LOD fallback in the builder
     }
     const std::size_t height = m_r->m_world->worldHeight();
     const std::size_t lx = static_cast<std::size_t>(x - cx * cs);
@@ -1234,6 +1248,7 @@ class VulkanRenderer::SunGridVoxels final
 
 bool VulkanRenderer::createSunGridResources() {
   if (!m_sunGridWanted) {
+    std::fprintf(stderr, "[vulkan] sun grid disabled (VV_SUN_GRID=0)\n");
     return true;  // explicitly disabled: march fallback
   }
   if (m_holeDebugX != kHoleDebugOff) {
@@ -1424,6 +1439,12 @@ bool VulkanRenderer::createSunGridResources() {
     }
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
   }
+
+  std::fprintf(stderr,
+               "[vulkan] sun grid: resources created (%ux%ux%u image, "
+               "%.1f MB staging mapped)\n",
+               kSunGridXZ, kSunGridXZ, m_voxelConfig.worldHeight,
+               double(fieldBytes) / (1024.0 * 1024.0));
 
   m_sunVoxels = std::make_unique<SunGridVoxels>(this);
   const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
@@ -2960,6 +2981,13 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     // window origin of the cycle that produced it.
     m_sunOriginX = m_sunCycleOriginX;
     m_sunOriginZ = m_sunCycleOriginZ;
+    if (!m_sunGridReady) {
+      std::fprintf(stderr,
+                   "[vulkan] sun grid: first field published (origin "
+                   "(%d,%d), %llu lit cells)\n",
+                   m_sunOriginX, m_sunOriginZ,
+                   static_cast<unsigned long long>(m_sunGrid.litCells()));
+    }
     m_sunGridReady = true;
   }
 
