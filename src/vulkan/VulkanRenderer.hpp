@@ -81,18 +81,10 @@ class VulkanRenderer final {
   // Incremental chunk-table publish (see the .cpp).
   void publishRegionTable(bool logHoles);
 
-  // Incremental far-LOD seam patch: rewrites the cells covered by
-  // NEWLY-loaded chunks with the real per-column tops (exact for fully
-  // covered cells, max-with-estimate on the partial edge) and returns the
-  // changed runs + values for a delta upload. Folded mountains can
+  // Sliced far-LOD seam patch (see the .cpp): a few chunks per frame,
+  // extent grows only over chunks actually scanned. Folded mountains can
   // under-estimate by 20+ voxels -> holes at the seam without this.
-  bool patchFarFieldWithRegion(
-      std::vector<std::pair<uint32_t, uint32_t>>& runs,
-      std::vector<uint32_t>& values);
-  // Grows the patched-extent box to include the active region.
-  void extendFarPatchExtent();
-  // Applies an incremental seam patch as a small async delta upload.
-  void uploadFarPatchDelta();
+  std::size_t drainFarPatch();
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;

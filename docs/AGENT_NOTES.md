@@ -84,33 +84,31 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 17)
+## Current status (pass 18)
 
-Owner-verified pass 16: "finally feels incremental, startup is instant,
-hitches gone" (on the DEBUG build). Pass 17 fixes the remaining
-streaming-order issues + the VS Code task problem:
+Owner-verified pass 17: chunks generate in front; hitches gone; startup
+instant (Debug build). Pass 18:
 
-1. Chunks appeared ALL AT ONCE: the region table only published at
-   streaming completion, so installed chunks sat invisible until the
-   whole region (incl. the 104 ring chunks) finished. The pump now
-   publishes the table INCREMENTALLY (publishRegionTable: write the
-   next half over the TARGET grid from m_slotOf - old-region chunks in
-   the overlap stay visible during crossings - then flip). drawFrame
-   takes the grid origin from the published table (m_tableOriginX/Z),
-   not m_regionCenter.
-2. Chunks generated BEHIND the camera first: the worker pops requests
-   from the back and the ring list was appended AFTER the region list -
-   ring corners (behind) generated first. Ring is now queued BEFORE the
-   region (and sorted by the same priority), so region chunks (ahead)
-   generate first.
-3. Nearby chunks came last: streamPriority was facing-dominant, so the
-   chunks beside/behind the camera generated last. Now near-first with
-   a forward bias: priority = -(dist - facing*96).
-4. VS Code tasks.json: "$gcc" problemMatcher is not in the user's VS
-   Code build (schema rejects it) - replaced with an inline GCC/MinGW
-   matcher on all 4 build tasks; the default build task is now RELEASE
-   (the owner was running Debug - ~5x slower at runtime: 15 ms/chunk
-   vs ~3).
+1. "Sorted backwards, farthermost first" - the worker pops the request
+   queue from the BACK, but the top-up filled the backlog from the
+   FRONT of the ascending-sorted pending list = with the WORST coords.
+   The workers therefore ground through the list farthest-first. The
+   top-up now iterates both lists in REVERSE (best first), so the
+   backlog always holds the top-k and generation runs
+   nearest-ahead-first.
+2. "Hitch when entering ungenerated area" - the far seam patch scanned
+   the whole region in one call (~630 chunks, 50-100 ms; the pass-15
+   log's "far 96.8 ms" frame). Now SLICED: drainFarPatch scans <=16
+   chunks per frame from updateWorld, extent grows only over chunks
+   actually scanned. (Also fixed a latent bug: the old code marked the
+   whole region box "patched" even when the chunks did not exist yet
+   - async startup would have left edge estimates unpatched forever.)
+3. Throughput: install cap 8 -> 16 per frame (fence-scoped uploads are
+   sub-ms; the user asked), worker backlog 4 -> 6.
+4. tasks.json for the owner's msys2 setup: Windows tasks use the full
+   cmake path (C:/msys64/mingw64/bin/cmake.exe) with the msys2 bin
+   prepended to PATH, generator switched MinGW Makefiles -> Ninja
+   (ships with msys2 mingw64). Release is the default build task.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites
