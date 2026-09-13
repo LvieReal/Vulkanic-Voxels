@@ -234,8 +234,11 @@ class VulkanRenderer final {
   std::vector<vv::voxel::ChunkCoord> m_streamPending;
   // Generate-only coords for the far seam patch (r+1 ring; no slots).
   std::vector<vv::voxel::ChunkCoord> m_streamRingPending;
-  // Async generation worker (see pumpRegionStreaming).
-  std::thread m_genThread;
+  // Async generation workers (see pumpRegionStreaming). Two: a single
+  // worker produces ~68 chunks/s on a slow CPU - right at the sprint
+  // drain rate - so a second keeps the deficit shrinking.
+  static constexpr std::size_t kGenWorkers = 2;
+  std::vector<std::thread> m_genThreads;
   std::mutex m_genMutex;
   std::condition_variable m_genCV;
   std::vector<vv::voxel::ChunkCoord> m_genRequests;

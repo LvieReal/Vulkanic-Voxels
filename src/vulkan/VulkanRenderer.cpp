@@ -44,7 +44,7 @@ constexpr std::size_t kStreamChunksPerFrame = 1;
 constexpr std::size_t kStreamSprintChunks = 8;
 // How many chunks the generation worker may run ahead of the upload pump
 // (bounds worker memory: N x 128 KB of staged voxel data).
-constexpr std::size_t kGenBacklog = 3;
+constexpr std::size_t kGenBacklog = 4;
 // Sentinel for "VV_DEBUG_HOLE not set" (int32 max).
 constexpr int32_t kHoleDebugOff = 0x7FFFFFFF;
 
@@ -444,17 +444,17 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
             ++it;
           }
         }
-        for (auto it = m_slotCooldown.begin();
-             it != m_slotCooldown.end() &&
-             m_streamPending.size() > m_freeSlots.size();) {
-          if (m_frameCounter - it->second >= 2u) {
-            m_freeSlots.push_back(it->first);
-            it = m_slotCooldown.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        if (m_streamPending.size() > m_freeSlots.size()) {
+        // A slot shortage is NOT an error state: the pump installs what
+        // fits (its cap) and the cooldown recycles the freed slots two
+        // frames later, so the deficit drains on its own. Only a genuine
+        // teleport - more than half the region missing - still takes the
+        // synchronous path (it beats tens of seconds of far-LOD-only
+        // world). (Promoting just-freed cooldown entries immediately is
+        // NOT safe: in-flight frames still reference them via the active
+        // table half.)
+        const std::size_t regionChunks = static_cast<std::size_t>(
+            m_voxelConfig.gridWidth()) * m_voxelConfig.gridHeight();
+        if (m_streamPending.size() > regionChunks / 2) {
           m_streamActive = false;
           m_streamPending.clear();
           std::string error;
@@ -522,10 +522,13 @@ void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
     std::lock_guard<std::mutex> lock(m_genMutex);
     m_genRequests.clear();
   }
-  if (!m_genThread.joinable() && m_world) {
+  if (m_genThreads.empty() && m_world) {
     m_genStop = false;
-    m_genThread = std::thread(&VulkanRenderer::generationWorker, this,
-                              &m_world->terrain());
+    m_genThreads.reserve(kGenWorkers);
+    for (std::size_t k = 0; k < kGenWorkers; ++k) {
+      m_genThreads.emplace_back(&VulkanRenderer::generationWorker, this,
+                                &m_world->terrain());
+    }
   }
   m_streamTarget = vv::voxel::ChunkCoord{targetChunkX, targetChunkZ};
   rebuildStreamPending();
@@ -644,7 +647,7 @@ void VulkanRenderer::generationWorker(
 }
 
 void VulkanRenderer::stopGenerationWorker() {
-  if (!m_genThread.joinable()) {
+  if (m_genThreads.empty()) {
     return;
   }
   {
@@ -653,7 +656,12 @@ void VulkanRenderer::stopGenerationWorker() {
     m_genRequests.clear();
   }
   m_genCV.notify_all();
-  m_genThread.join();
+  for (std::thread& t : m_genThreads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  m_genThreads.clear();
   m_genResults.clear();
 }
 
@@ -1653,15 +1661,15 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
     m_freeSlots.push_back(slot);
   }
 
-  // Initial region around chunk (0,0); the camera spawns inside it.
-  if (!rebuildChunkRegion(0, 0, outError)) {
-    return false;
-  }
-
-  // Kick off the first far-LOD build on the background thread (~1M noise
-  // evaluations at the default radius; renders start immediately with the
-  // fog wall at the near-region boundary until the field pops in).
+  // Startup is ASYNC now: the old synchronous initial region blocked the
+  // first frame for ~10 s on slow machines (729 chunks x ~15 ms). The far
+  // build starts first (it needs the longest head start), then the region
+  // streams in through the normal worker + pump path from frame one -
+  // the world pops in around the camera over a couple of seconds instead
+  // of freezing. The table halves start zeroed (= all empty slots), so
+  // the first frames simply show far-LOD terrain everywhere.
   launchFarFieldBuild(0, 0);
+  beginRegionMove(0, 0);
 
   // Safety net above the fog cut: the budget must never bind before the fog
   // does. Worst case a ray crosses ~sqrt(3) cells per unit of distance; the

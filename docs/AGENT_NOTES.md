@@ -84,32 +84,27 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 15)
+## Current status (pass 16)
 
-Pass-14 owner log named every remaining culprit; all fixed:
+Pass-15 log: buckets worked; remaining causes fixed.
 
-1. "Two different worlds" - pass 14's window-reuse copy had a SIGN
-   error (`i + shift` instead of `i - shift`): every recenter showed
-   the old terrain shifted twice. Fixed; the recenter unit test now
-   uses centers on DIFFERENT snap cells (real 128-cell shift), so it
-   can never pass vacuously again.
-2. Sprint freeze - the synchronous fallback fired at sprint ("SYNC
-   region rebuild: 98 chunks, 1615 ms"). Two fixes: ordinary overruns
-   now release out-of-target slots through the cooldown queue and keep
-   streaming (sync only for genuine teleports), and the sync path
-   generates chunks via the fast move-based fill (~3 ms/chunk; the old
-   131k set() loop was ~16 ms - startup's 729 chunks dropped from
-   ~12 s to ~2 s).
-3. Hitch at normal speed (pump 34.9 ms on one frame) - the streaming
-   upload's fence wait trailed the GPU by a full frame (the copy is
-   queued behind the previous frame's compute). Streaming AND far
-   upload paths are now double-buffered (staging + cmd + fence x2,
-   alternating): the pre-write wait targets a submit two uploads old,
-   which is always retired.
-4. Untimed 100 ms frames - the non-streaming updateWorld branches
-   (far activation) were unbucketed; VV_PERF now times them too.
-
-If anything still hitches, the VV_PERF=1 log now has no blind spots.
+1. Startup freeze (SYNC 729 chunks, ~10 s) - the initial region was
+   still generated synchronously. Startup is now fully async: far
+   build launches first, then beginRegionMove streams the region from
+   frame one (table halves start all-empty = far-LOD view; world pops
+   in around the camera). spawnPosition reads the generator, not
+   chunks, so spawn is unaffected.
+2. Sprint SYNC (97-107 chunks, ~1.5 s) still fired because just-freed
+   slots sit in the 2-frame cooldown and cannot be reused instantly,
+   so the shortage check panicked into the sync path. A slot shortage
+   is NOT an error state - the pump installs what fits and the cooldown
+   recycles slots 2 frames later. Sync now only for genuine teleports
+   (pending > half the region). Promoting fresh cooldown entries
+   immediately would corrupt in-flight frames (active table half).
+3. One gen worker (~68 chunks/s on the owner's CPU) was right at the
+   sprint drain rate - now 2 workers, backlog 4.
+4. Owner CPU measures ~15 ms/chunk vs the sandbox's 2.8 - possibly a
+   Debug build on the owner side (Release should be ~5x faster); asked.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites
