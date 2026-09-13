@@ -62,6 +62,10 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   far cell (data hole), cyan = data present but ray passed over (height
   too low), yellow = march never crossed the chunk.
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
+- `VV_SUN_GRID=0` — disable the pass-26 flood-fill light grid (exact
+  binary march fallback). Default on.
+- `VV_SUN_MS=<double>` — per-frame CPU build slice for the light grid
+  (default 3.0 ms).
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation
@@ -79,7 +83,7 @@ QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH=/tmp/deps/qt6/lib:/tmp/deps/prefix/lib
     timeout 8 ./build/release/bin/game            # must exit cleanly (Vulkan dialog, no crash)
 # CPU tests without the toolchain:
 g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
-    src/terrain/{Noise,Noise3D,TerrainGenerator,FarField}.cpp \
+    src/terrain/{Noise,Noise3D,TerrainGenerator,FarField,SunLightGrid}.cpp \
     src/voxel/{Chunk,VoxelTypes,VoxelTextures,World}.cpp -o /tmp/t && /tmp/t
 ```
 
@@ -88,41 +92,53 @@ Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
 excluded from workspace snapshots — EVERY sandbox restart needs the
 rebuild + reconfigure of build/release and build/debug.
 
-## Current status (pass 25)
+## Current status (pass 26)
 
-Owner report on pass 24 (heightmap + penumbra ring): "no success, it got
-worse, it also crashes randomly after a couple of seconds". Owner
-decision: REMOVE the cone-traced/soft shadow machinery entirely and try
-flood fill instead. Pass 25 is the removal; soft shadows are gone until
-the flood-fill pass lands.
+Pass 26 (per owner direction after rejecting pass 24's cone/heightmap
+soft shadows): regular CPU FLOOD-FILL light grid, GPU reads the texture.
+Delivered:
 
-Delivered (pass 25):
-- Deleted `src/terrain/SunShadowMap.{hpp,cpp}`, binding 11 (layout count
-  12 -> 11, writes 12 -> 11, pool 10 -> 8), `uploadSunShadowField` +
-  buffer + staging/fence, all renderer hooks and members, the shader's
-  whole soft path, `VV_SHADOW_SHARP`, and `scene.misc.w` (coneTan).
-- `sunShadow()` is back to the pass-20 semantics: ONE exact binary ray
-  (`sunRayEscapes`) for every hit, near AND far-LOD. No soft mode.
-- Tests: mirror machinery for soft paths removed; `testSunShadowMarch`
-  (exact march vs dense brute) restored to direct mirror calls and
-  passing (809 lit / 2191 shadowed agree). All other tests unchanged.
+- `src/terrain/SunLightGrid.{hpp,cpp}`: phased incremental builder —
+  Prepass (spans/air per column) -> Seeding (cone-table DDA from cell
+  centers; exact vs the march on both test fixtures + the real-terrain
+  probe: 3.3M exhaustive + 300k random cells, 0 misses) -> Border seeds
+  -> Dial-bucket Dijkstra fill (26-conn, x8-quantized direction-weighted
+  costs; down-sun 5, up-sun 11, down 8, up 16 per step at azimuth
+  (1,1)/sqrt2) -> sliced publish into caller storage. Field = u8 bleed
+  distance, budget-independent.
+- Renderer: 800x800xH window (origin snapped 256) centered on the
+  camera; chunks inside the near region seed from real voxels, columns
+  without data from far-LOD heights (same convention as the march).
+  Two fields ping-pong along the DEPTH of one 3D R8 texture
+  (800x800x2H, binding 11 + own sampler at 12); the served half rides
+  in push `farParams.z`, the window origin in `voxelSize.w` (X) and
+  `region.y` (Z) — push constants, so no shared-UBO in-flight race.
+  `scene.misc.w` = 8*bleed budget (default 14 -> 112) is the shader's
+  ramp divisor. `tickSunGrid()` slices the build ~3 ms/frame
+  (VV_SUN_MS); requestRebuild() on chunk installs, region moves,
+  teleports, far swaps and seam patches; window/sun changes defer to
+  the next cycle boundary (a running build stays coherent). The GPU
+  copy (staging -> inactive half, GENERAL layout) is recorded in the
+  same frame the cycle completes.
+- Shader: `sunShadow()` = ONE trilinear fetch when `farParams.w` says
+  the field is live (smooth penumbrae, seamless merged shadows);
+  `sunRayEscapes` stays as the pre-first-field and VV_SUN_GRID=0
+  fallback and remains pinned by the CPU mirror test.
+- Tests (`testSunLightGrid`): exhaustive seed parity vs the march
+  mirror on two fixtures, boundary exactness, smoothness (max adjacent
+  step 0.116 light units), deep-umbra dark, sliced-ticks == one-shot
+  build (this caught a real bug: the fill's budget check consumed a
+  bucket pop without relaxing it), refresh after geometry change,
+  directional step costs (table + sealed-tunnel deltas), all-air
+  column agreement, low-sun all-lit. All passing; both builds
+  warning-free.
+- Also fixed: descriptor pool under-declared its size classes
+  (poolSizeCount 2 although sampled/sampler were allocated from;
+  count is now 4 with the sun field included).
 
-Next (agreed direction, NOT yet wired): CPU flood-fill sun light grid.
-Prototype validated in /home/user/floodprobe (outside the repo):
-- SEEDS: air cells whose exact sun ray escapes get light 1.0 — the
-  shadow boundary stays EXACT (0 violations vs the exact march; the
-  anisotropic-DP smearing dead end cannot recur because direct light
-  never propagates).
-- BLEED: Dial bucket-queue Dijkstra through air only; horizontal step
-  cost 1 (uniform) or 1 + 0.5*dot(step, sunXZ) (down-sun cheap,
-  up-sun 1.5x); down 1, up 2. Light = 1 - dist/budget. Smooth (max
-  adjacent step 44/255 at budget 14, zero hard steps), seamless
-  (distance field, merged wall+tower shadows continuous), fast
-  (~15-40 ms for the 64x64x48 fixture incl. seeding, on 2 contended
-  cores). Budget = penumbra width knob (5 = tight/steep, 14 = wide).
-- GPU story: 3D R8_UNORM texture (800x800x128 = 82 MB), ONE filtered
-  fetch per pixel replaces the whole march; trilinear gives sub-cell
-  smoothness on top of the cell grid.
+Owner to verify: soft seamless shadows, no banding, no shadow pops on
+window moves, fps impact (VV_PERF=1 shows a `sun` bucket; first field
+~1-2 s after startup, then rebuilds only on big moves/installs).
 
 Workspace note: sandbox restarts can return a FRESH CLONE at the base
 commit with the working tree preserved (happened twice: before pass 24

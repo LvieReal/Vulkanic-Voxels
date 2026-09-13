@@ -5,6 +5,7 @@ function(vv_add_tests)
     add_executable(voxel_tests
         tests/terrain_world_tests.cpp
         src/terrain/FarField.cpp
+        src/terrain/SunLightGrid.cpp
         src/terrain/Noise.cpp
         src/terrain/Noise3D.cpp
         src/terrain/TerrainGenerator.cpp

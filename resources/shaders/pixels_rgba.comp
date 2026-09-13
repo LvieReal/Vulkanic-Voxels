@@ -9,8 +9,10 @@ layout(push_constant) uniform Push {
     uvec4 screen;   // x=width, y=height, z=bgra, w=frame
     vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance)
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
-    vec4 voxelSize; // xyz=voxel size in world units
+    vec4 voxelSize; // xyz=voxel size in world units;
+                    // w = sun-grid window origin X (voxels; pass 26)
     ivec4 region;   // x,z = region origin (min corner) in chunk coords;
+                    // y = sun-grid window origin Z (voxels; pass 26);
                     // w = chunk-table half index (ping-pong upload buffer)
     uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words),
                     // w=max terrain voxel y (sky-skip ceiling; MUST be a true
@@ -19,7 +21,10 @@ layout(push_constant) uniform Push {
     ivec4 far;      // x,y = far-LOD min corner (voxel X/Z), z,w = cell dims;
                     // z = 0 means far LOD is off
     vec4 farParams; // x = far cell footprint in voxels;
-                    // y = far-field half index (ping-pong upload buffer)
+                    // y = far-field half index (ping-pong upload buffer);
+                    // z,w = sun light field half + enabled flag (pass 26),
+                    //   or the VV_DEBUG_HOLE target chunk when the grid is
+                    //   off (z encodes x+4096 as the on-flag)
 } pc;
 
 // Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types
@@ -106,6 +111,18 @@ layout(set = 0, binding = 9) uniform sampler voxelSampler;
 layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
     uint perType[];
 } voxelTexInfo;
+
+// Sun light field (pass 26): CPU flood-fill grid as an
+// kSunFieldXZ x kSunFieldXZ x (2 * worldHeight) R8 3D texture - one
+// texel per world voxel (x -> width, z -> height, y -> depth), with TWO
+// fields ping-ponged along depth (the active one selected by
+// pc.farParams.z). A texel stores the x8-quantized geodesic BLEED
+// DISTANCE from directly sunlit air (0 = lit, 255 = umbra); trilinear
+// filtering turns it into smooth penumbrae. The window min corner rides
+// in pc.voxelSize.w / pc.region.y. Sampler: linear, clamp, no mips.
+const uint kSunFieldXZ = 800u;  // sync with VulkanRenderer::kSunGridXZ
+layout(set = 0, binding = 11) uniform texture3D sunField;
+layout(set = 0, binding = 12) uniform sampler sunSampler;
 
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
@@ -474,23 +491,39 @@ bool sunRayEscapes(vec3 origin, vec3 sunV)
     return true;
 }
 
-// Sun visibility at a hit position (voxel space): ONE exact binary
-// shadow ray - ascending column DDA + height-bound voxel walk, coarse
-// far cells beyond the near region (pass 25: the cone/heightmap soft
-// machinery of passes 21-24 is removed; soft shadows will return as a
-// CPU-built light grid). Far-LOD hits shadow through the same march:
-// from beyond the region it self-selects the cheap far-cell path.
+// Sun visibility at a hit position (voxel space). Pass 26: ONE
+// trilinear fetch of the CPU flood-fill light field (the window spans
+// +-400 voxels around the camera - everything the fog does not cut), so
+// the smooth penumbrae come precomputed. The field stores the
+// x8-quantized bleed distance; scene.misc.w = 8 * bleed budget turns it
+// into light. The exact binary march below stays as the fallback for the
+// first seconds (before the first field publishes) and VV_SUN_GRID=0 -
+// it is also still pinned by the CPU parity mirror in
+// tests/terrain_world_tests.cpp.
 float sunShadow(vec3 hitPosVox, vec3 n)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);
     if (sunWorld.y <= 0.05) {
-        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
+        return 1.0;  // low/sunset sun: the grid lights everything too
     }
     const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
     const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
     // Lift off the surface (along the normal, then along the sun) to avoid
     // self-shadow acne; the hit face's outward cell is air by construction.
     const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    if (pc.farParams.w > 0.5) {
+        const vec2 sunOrg = vec2(pc.voxelSize.w, float(pc.region.y));
+        const float halfW = pc.farParams.z * 0.5;  // depth offset of the
+                                                   // active ping-pong half
+        const vec3 uvw = vec3(
+            (origin.x - sunOrg.x) * (1.0 / float(kSunFieldXZ)),
+            (origin.z - sunOrg.y) * (1.0 / float(kSunFieldXZ)),
+            halfW + origin.y * (0.5 / float(pc.chunkSize.y)));
+        const float dist01 =
+            textureLod(sampler3D(sunField, sunSampler), uvw, 0.0).r;
+        const float d = dist01 * 255.0;
+        return clamp(1.0 - d / scene.misc.w, 0.0, 1.0);
+    }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }
 

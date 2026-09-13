@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "terrain/FarField.hpp"
+#include "terrain/SunLightGrid.hpp"
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
@@ -1772,6 +1773,455 @@ static void testVoxelTextures() {
 	check(plainOk, "textures: default set is plain colors");
 }
 
+
+// ---------------------------------------------------------------------------
+// Flood-fill sun light grid (pass 26): SunLightGrid over the ShadowWorld
+// fixture + a deterministic cost-model fixture. Pins:
+//  - seed parity: field d==0  <=>  exact march lit, EVERY air cell;
+//  - boundary: lit ground light exactly 1.0, shadowed < 1.0 (no lit gaps);
+//  - smoothness: flat-adjacent ground light steps <= 0.25;
+//  - deep umbra: far-from-lit shadowed cells are dark;
+//  - directional costs: sealed tunnels through solid rock force single
+//    paths, so d must equal k * round(8 * cost(direction));
+//  - incremental ticks == one-shot; refresh after geometry change;
+//  - low sun => everything lit.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class FixtureLightVoxels : public vv::terrain::SunLightVoxels {
+public:
+	const ShadowWorld* w = nullptr;
+
+	const std::uint8_t* columnVoxels(std::int32_t x,
+	                                 std::int32_t z) const override {
+		if (x < 0 || x >= w->near.wx || z < 0 || z >= w->near.wz) {
+			return nullptr;
+		}
+		return &w->near.cells[std::size_t(x) +
+		                      std::size_t(z) * w->near.wx * w->near.wh];
+	}
+
+	std::uint16_t farHeightAt(std::int32_t x,
+	                          std::int32_t z) const override {
+		const int fx = int(std::floor(
+			(double(x) + 0.5 - double(w->farOrigin)) / w->farCell));
+		const int fz = int(std::floor(
+			(double(z) + 0.5 - double(w->farOrigin)) / w->farCell));
+		if (fx < 0 || fz < 0 || fx >= int(w->farDim) ||
+		    fz >= int(w->farDim)) {
+			return 0;
+		}
+		return std::uint16_t(
+			w->farCells[std::size_t(fx) + std::size_t(fz) * w->farDim] &
+			0xFFFFu);
+	}
+};
+
+double lightFromDist(std::uint8_t d, double budget) {
+	return std::max(0.0, 1.0 - (double(d) * 0.125) / budget);
+}
+
+void drainGrid(vv::terrain::SunLightGrid& g, double slice) {
+	for (;;) {
+		if (g.tick(slice)) {
+			return;
+		}
+	}
+}
+
+}  // namespace
+
+void testSunLightGrid() {
+	ShadowWorld w = makeShadowWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+	FixtureLightVoxels vox;
+	vox.w = &w;
+
+	const int C = 64, R = 64, H = 48;
+	const int V = int(w.maxTerr) - 1;  // march ascend bound = maxTerr
+	std::vector<std::uint8_t> field(std::size_t(C) * R * H, 77);
+	vv::terrain::SunLightGrid grid;
+	grid.configure(C, R, H, w.near.wx, sun[0], sun[1], sun[2],
+	               std::uint32_t(V), &vox, field.data());
+	grid.setOrigin(0, 0);
+	grid.setCenter(32.5, 32.5);
+	drainGrid(grid, 1e9);
+
+	// --- seed parity (exhaustive over every air cell) ---
+	{
+		long long checked = 0, lit = 0, wrong = 0;
+		for (int z = 0; z < R; ++z) {
+			for (int x = 0; x < C; ++x) {
+				for (int y = 0; y < H; ++y) {
+					if (w.near.at(x, y, z) != 0) {
+						continue;
+					}
+					const double o[3] = {x + 0.5, y + 0.5, z + 0.5};
+					const bool m = sunRayEscapesMirror(w, o, sun);
+					const bool c =
+					    field[std::size_t(x) + std::size_t(z) * C +
+					          std::size_t(y) * C * R] == 0;
+					++checked;
+					if (m) {
+						++lit;
+					}
+					if (m != c && ++wrong <= 3) {
+						std::printf(
+							"FAIL light seed (%d,%d,%d): march %d "
+							"grid %d\n",
+							x, y, z, int(m), int(c));
+					}
+				}
+			}
+		}
+		check(wrong == 0, "light grid: seeds match the exact march");
+		check(lit > 20000 && checked - lit > 2000,
+		      "light grid: both outcomes well exercised");
+		std::printf("light grid: %lld air cells, %lld lit, seed parity "
+		            "exact\n",
+		            checked, lit);
+	}
+
+	// --- boundary + smoothness + deep umbra on ground cells ---
+	{
+		const double budget = 14.0;
+		// Ground = first air cell above the column top.
+		const auto groundY = [&](int x, int z) {
+			for (int y = 0; y < H; ++y) {
+				if (w.near.at(x, y, z) == 0) {
+					return y;
+				}
+			}
+			return -1;
+		};
+		std::vector<char> litG(C * R, 0);
+		for (int z = 0; z < R; ++z) {
+			for (int x = 0; x < C; ++x) {
+				const int y = groundY(x, z);
+				if (y < 0) {
+					continue;
+				}
+				const double o[3] = {x + 0.5, y + 0.5, z + 0.5};
+				litG[x + z * C] =
+				    sunRayEscapesMirror(w, o, sun) ? 1 : 0;
+			}
+		}
+		// Boundary: lit -> exactly 1.0; shadowed -> strictly < 1.0.
+		long long litCells = 0, shadowCells = 0, gaps = 0;
+		for (int z = 0; z < R; ++z) {
+			for (int x = 0; x < C; ++x) {
+				const int y = groundY(x, z);
+				if (y < 0) {
+					continue;
+				}
+				const double l = lightFromDist(
+				    field[std::size_t(x) + std::size_t(z) * C +
+				          std::size_t(y) * C * R],
+				    budget);
+				if (litG[x + z * C]) {
+					++litCells;
+					if (l < 0.999) {
+						++gaps;
+					}
+				} else {
+					++shadowCells;
+					if (l >= 0.999) {
+						++gaps;
+					}
+				}
+			}
+		}
+		check(gaps == 0, "light grid: boundary exact (no lit gaps)");
+		// Smoothness: flat-adjacent ground pairs.
+		double maxStep = 0;
+		long long pairs = 0;
+		for (int z = 0; z < R; ++z) {
+			for (int x = 0; x < C; ++x) {
+				const int y0 = groundY(x, z);
+				if (y0 < 0) {
+					continue;
+				}
+				const double l0 = lightFromDist(
+				    field[std::size_t(x) + std::size_t(z) * C +
+				          std::size_t(y0) * C * R],
+				    budget);
+				const auto step = [&](int x1, int z1) {
+					const int y1 = groundY(x1, z1);
+					if (y1 < 0 || std::abs(y1 - y0) > 1) {
+						return;
+					}
+					const double l1 = lightFromDist(
+					    field[std::size_t(x1) + std::size_t(z1) * C +
+					          std::size_t(y1) * C * R],
+					    budget);
+					maxStep = std::max(maxStep, std::abs(l1 - l0));
+					++pairs;
+				};
+				if (x + 1 < C) {
+					step(x + 1, z);
+				}
+				if (z + 1 < R) {
+					step(x, z + 1);
+				}
+			}
+		}
+		check(maxStep <= 0.25, "light grid: smooth ground gradients");
+		// Deep umbra: shadowed >= 30 cells (Chebyshev) from any lit cell.
+		long long deep = 0, deepWrong = 0;
+		for (int z = 0; z < R; ++z) {
+			for (int x = 0; x < C; ++x) {
+				if (litG[x + z * C]) {
+					continue;
+				}
+				bool nearLit = false;
+				for (int dz = -30; dz <= 30 && !nearLit; ++dz) {
+					for (int dx = -30; dx <= 30; ++dx) {
+						const int nx = x + dx, nz = z + dz;
+						if (nx >= 0 && nx < C && nz >= 0 && nz < R &&
+						    litG[nx + nz * C]) {
+							nearLit = true;
+							break;
+						}
+					}
+				}
+				if (nearLit) {
+					continue;
+				}
+				const int y = groundY(x, z);
+				if (y < 0) {
+					continue;
+				}
+				++deep;
+				if (lightFromDist(field[std::size_t(x) +
+				                        std::size_t(z) * C +
+				                        std::size_t(y) * C * R],
+				                  budget) > 0.02) {
+					++deepWrong;
+				}
+			}
+		}
+		check(deepWrong == 0, "light grid: deep umbra stays dark");
+		std::printf("light grid: ground %lld lit / %lld shadowed, max "
+		            "step %.3f over %lld pairs, %lld deep-umbra cells\n",
+		            litCells, shadowCells, maxStep, pairs, deep);
+	}
+
+	// --- incremental ticks == one shot ---
+	{
+		std::vector<std::uint8_t> field2(std::size_t(C) * R * H, 77);
+		vv::terrain::SunLightGrid g2;
+		g2.configure(C, R, H, w.near.wx, sun[0], sun[1], sun[2],
+		             std::uint32_t(V), &vox, field2.data());
+		g2.setOrigin(0, 0);
+		g2.setCenter(10.5, 50.5);
+		drainGrid(g2, 0.02);
+		bool same = field2 == field;
+		if (!same) {
+			int shown = 0;
+			for (std::size_t i = 0; i < field.size() && shown < 5; ++i) {
+				if (field[i] != field2[i]) {
+					const int y = int(i / (C * R));
+					const int z = int((i / C) % R);
+					const int x = int(i % C);
+					std::printf("  DIFF cell (%d,%d,%d): one-shot d=%d "
+					            "sliced d=%d\n",
+					            x, y, z, int(field[i]), int(field2[i]));
+					++shown;
+				}
+			}
+		}
+		check(same, "light grid: sliced ticks match a one-shot build");
+	}
+
+	// --- refresh after geometry change (new wall + all-air column) ---
+	{
+		for (int y = 0; y < 44; ++y) {
+			w.near.cells[std::size_t(30) + std::size_t(y) * w.near.wx +
+			             std::size_t(10) * w.near.wx * w.near.wh] = 2;
+		}
+		for (int y = 0; y < w.near.wh; ++y) {
+			w.near.cells[std::size_t(50) + std::size_t(y) * w.near.wx +
+			             std::size_t(40) * w.near.wx * w.near.wh] = 0;
+		}
+		w.near.recomputeHeights();
+		grid.requestRebuild();
+		drainGrid(grid, 1e9);
+		// Behind the new wall (down-sun): now shadowed, march agrees.
+		const double o[3] = {28.5, double(w.near.boundAt(28, 10)) + 0.5,
+		                     10.5};
+		const int yG = int(w.near.boundAt(28, 10));
+		const bool m = sunRayEscapesMirror(w, o, sun);
+		const bool c = field[std::size_t(28) + std::size_t(10) * C +
+		                     std::size_t(yG) * C * R] == 0;
+		check(!m && !c, "light grid: refresh picks up new blockers");
+		// The all-air column (50, z=40) must behave as a NEAR no-block
+		// column (bound 0, no walk) - NOT fall back to far heights
+		// (~38 there), which would shadow its cells differently than
+		// the march. Every air cell of the column must agree.
+		long long colWrong = 0, colChecked = 0;
+		for (int y = 0; y < H; ++y) {
+			const double o2[3] = {50.5, double(y) + 0.5, 40.5};
+			const bool m2 = sunRayEscapesMirror(w, o2, sun);
+			const bool c2 = field[std::size_t(50) + std::size_t(40) * C +
+			                      std::size_t(y) * C * R] == 0;
+			++colChecked;
+			if (m2 != c2) {
+				++colWrong;
+			}
+		}
+		check(colWrong == 0,
+		      "light grid: all-air near column matches the march");
+		(void)colChecked;
+	}
+
+	// --- directional cost model (sealed tunnels through solid rock) ---
+	{
+		ShadowWorld cw;  // 20 x 12 x 20, all solid except shafts/tunnels
+		cw.near.wx = 20;
+		cw.near.wz = 20;
+		cw.near.wh = 12;
+		cw.maxTerr = 13.0f;
+		cw.near.cells.assign(std::size_t(20) * 12 * 20, 1);
+		cw.farCells.clear();
+		cw.farDim = 0;  // no far data: nothing blocks from beyond
+		const auto carve = [&](int x, int y0, int y1, int z) {
+			for (int y = y0; y <= y1; ++y) {
+				cw.near.cells[std::size_t(x) + std::size_t(y) * 20 +
+				              std::size_t(z) * 20 * 12] = 0;
+			}
+		};
+		carve(2, 9, 11, 2);    // shaft S1 (lit from the top)
+		for (int x = 3; x <= 10; ++x) {
+			carve(x, 9, 9, 2);  // tunnel A: +x from S1
+		}
+		carve(17, 9, 11, 5);   // shaft S2
+		for (int x = 16; x >= 9; --x) {
+			carve(x, 9, 9, 5);  // tunnel B: -x from S2
+		}
+		carve(10, 9, 11, 10);  // shaft S4
+		carve(11, 9, 9, 10);   //   then +x
+		carve(12, 9, 11, 10);  //   then UP (dead end)
+		carve(5, 9, 11, 12);   // shaft S5
+		carve(5, 7, 8, 12);    //   then DOWN (dead end)
+		cw.near.recomputeHeights();
+
+		FixtureLightVoxels cvox;
+		cvox.w = &cw;
+		std::vector<std::uint8_t> cfield(std::size_t(20) * 20 * 12, 77);
+		vv::terrain::SunLightGrid cg;
+		cg.configure(20, 20, 12, 20, sun[0], sun[1], sun[2], 12, &cvox,
+		             cfield.data());  // V = maxTerr(13) - 1, like w
+		cg.setOrigin(0, 0);
+		cg.setCenter(10.5, 10.5);
+		drainGrid(cg, 1e9);
+
+		const auto dAt = [&](int x, int y, int z) {
+			return cfield[std::size_t(x) + std::size_t(z) * 20 +
+			             std::size_t(y) * 20 * 20];
+		};
+		// Sun azimuth (1,1)/sqrt2: +x step cost 1+0.5*0.7071 = 1.3536
+		// -> round(8*c) = 11 units; -x -> 5; up -> 16; down -> 8. The
+		// tunnels are sealed, so each cell is reachable only through
+		// the tunnel line: consecutive deltas must equal the step cost
+		// exactly (absolute values depend on which shaft cells are lit).
+		// Sun azimuth (1,1)/sqrt2. Horizontal: +sun-axis step costs
+		// 1 + 0.5*0.7071 = 1.3536 units -> round(8*c) = 11; against the
+		// sun 0.6464 -> 5. Vertical: down 1 -> 8, up 2 -> 16. Diagonal
+		// composites: (+1,+1,0) sqrt(1.3536^2+2^2)=2.416 -> 19;
+		// (-1,-1,0) sqrt(0.6464^2+1)=1.191 -> 10.
+		bool costsOk = true;
+		const int expectCosts[][4] = {
+		    {1, 0, 0, 11},  {-1, 0, 0, 5},  {0, 0, 1, 11},
+		    {0, 0, -1, 5},  {0, 1, 0, 16},  {0, -1, 0, 8},
+		    {1, 1, 0, 19},  {-1, -1, 0, 10}};
+		for (const auto& e : expectCosts) {
+			if (cg.stepCost8ForTest(e[0], e[1], e[2]) != e[3]) {
+				costsOk = false;
+			}
+		}
+		// The tunnels are sealed, so each cell is reachable only along
+		// the line: consecutive deltas must equal the step cost exactly
+		// (absolute values also depend on which shaft cells are lit -
+		// only the shaft tops see the sun diagonally).
+		for (int k = 4; k <= 10; ++k) {  // tunnel A: +x away from S1
+			const int d0 = dAt(k - 1, 9, 2), d1 = dAt(k, 9, 2);
+			if (d1 - d0 != 11 || d1 <= d0) {
+				costsOk = false;
+			}
+		}
+		for (int k = 9; k <= 15; ++k) {  // tunnel B: -x toward S2
+			const int d0 = dAt(k + 1, 9, 5), d1 = dAt(k, 9, 5);
+			if (d1 - d0 != 5 || d1 <= d0) {
+				costsOk = false;
+			}
+		}
+		for (int k = 7; k <= 8; ++k) {  // down shaft below S5
+			const int d0 = dAt(5, k, 12), d1 = dAt(5, k + 1, 12);
+			if (d0 - d1 != 8 || d0 <= d1) {
+				costsOk = false;
+			}
+		}
+		// The sealed 2-cell pocket up from the horizontal tunnel at
+		// (12, 10..11, 10): its TOP sees the sun diagonally (ray escapes
+		// before the solid mass), so light flows DOWN it: deltas 8.
+		for (int k = 10; k <= 11; ++k) {
+			const int d0 = dAt(12, k - 1, 10), d1 = dAt(12, k, 10);
+			if (d0 - d1 != 8 || d0 <= d1) {
+				costsOk = false;
+			}
+		}
+		check(costsOk, "light grid: directional step costs exact");
+		// Seed parity on the tunnel fixture too (overhang columns).
+		{
+			long long wrong = 0;
+			for (int z = 0; z < 20; ++z) {
+				for (int x = 0; x < 20; ++x) {
+					for (int y = 0; y < 12; ++y) {
+						if (cw.near.at(x, y, z) != 0) {
+							continue;
+						}
+						const double o[3] = {x + 0.5, y + 0.5, z + 0.5};
+						const bool m = sunRayEscapesMirror(cw, o, sun);
+						const bool c = dAt(x, y, z) == 0;
+						if (m != c) {
+							++wrong;
+						}
+					}
+				}
+			}
+			check(wrong == 0,
+			      "light grid: tunnel fixture seed parity exact");
+			std::printf("light grid: cost fixture parity ok\n");
+		}
+	}
+
+	// --- low sun: everything lit ---
+	{
+		std::vector<std::uint8_t> field3(std::size_t(C) * R * H, 77);
+		vv::terrain::SunLightGrid g3;
+		g3.configure(C, R, H, w.near.wx, 0.3, 0.04, 0.3,
+		             std::uint32_t(V), &vox, field3.data());
+		g3.setOrigin(0, 0);
+		drainGrid(g3, 1e9);
+		bool allLit = true;
+		for (int z = 0; z < R && allLit; ++z) {
+			for (int x = 0; x < C && allLit; ++x) {
+				for (int y = 0; y < H; ++y) {
+					if (w.near.at(x, y, z) == 0 &&
+					    field3[std::size_t(x) + std::size_t(z) * C +
+					           std::size_t(y) * C * R] != 0) {
+						allLit = false;
+						break;
+					}
+				}
+			}
+		}
+		check(allLit, "light grid: low sun lights everything");
+	}
+}
+
 int main() {
 	testVertexAO();
 	testNoiseDeterministic();
@@ -1791,6 +2241,7 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testSunLightGrid();
 	testVoxelTextures();
 
 	if (g_failures == 0) {
