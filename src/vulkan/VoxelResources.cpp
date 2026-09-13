@@ -318,63 +318,68 @@ bool VoxelResources::uploadChunksStreaming(
 		return false;
 	}
 
-	// Lazily create the persistent staging (exactly one chunk's worth:
-	// voxel bytes + height words), command buffer and fence.
-	if (m_streamStaging == VK_NULL_HANDLE) {
+	// Lazily create BOTH sets of the double-buffered upload resources
+	// (staging + command buffer + fence each): uploads alternate so the
+	// pre-write wait targets a submit TWO uploads old - always retired.
+	if (m_streamStaging[0] == VK_NULL_HANDLE) {
 		const VkDeviceSize bytes = static_cast<VkDeviceSize>(m_slotByteStride) +
 				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
-		if (!utils::createBuffer(device, physicalDevice, bytes,
+		for (std::uint32_t k = 0; k < 2; ++k) {
+			if (!utils::createBuffer(device, physicalDevice, bytes,
 														 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 																 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-														 m_streamStaging, m_streamStagingMemory,
-														 outError)) {
-			return false;
-		}
-		VkResult r = vkMapMemory(device, m_streamStagingMemory, 0, VK_WHOLE_SIZE, 0,
-														 &m_streamStagingMapped);
-		if (r != VK_SUCCESS || m_streamStagingMapped == nullptr) {
-			outError = "Failed to map streaming staging memory.";
-			return false;
-		}
-		VkCommandBufferAllocateInfo alloc{};
-		alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		alloc.commandPool = commandPool;
-		alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		alloc.commandBufferCount = 1;
-		r = vkAllocateCommandBuffers(device, &alloc, &m_streamCmd);
-		if (r != VK_SUCCESS) {
-			outError = "Failed to allocate streaming command buffer.";
-			return false;
+														 m_streamStaging[k],
+														 m_streamStagingMemory[k], outError)) {
+				return false;
+			}
+			VkResult r = vkMapMemory(device, m_streamStagingMemory[k], 0,
+														VK_WHOLE_SIZE, 0, &m_streamStagingMapped[k]);
+			if (r != VK_SUCCESS || m_streamStagingMapped[k] == nullptr) {
+				outError = "Failed to map streaming staging memory.";
+				return false;
+			}
+			VkCommandBufferAllocateInfo alloc{};
+			alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+			alloc.commandPool = commandPool;
+			alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			alloc.commandBufferCount = 1;
+			r = vkAllocateCommandBuffers(device, &alloc, &m_streamCmd[k]);
+			if (r != VK_SUCCESS) {
+				outError = "Failed to allocate streaming command buffer.";
+				return false;
+			}
+			VkFenceCreateInfo fence{};
+			fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+			fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+			r = vkCreateFence(device, &fence, nullptr, &m_streamFence[k]);
+			if (r != VK_SUCCESS) {
+				outError = "Failed to create streaming upload fence.";
+				return false;
+			}
 		}
 		m_streamCommandPool = commandPool;
-		VkFenceCreateInfo fence{};
-		fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-		fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-		r = vkCreateFence(device, &fence, nullptr, &m_streamFence);
-		if (r != VK_SUCCESS) {
-			outError = "Failed to create streaming upload fence.";
-			return false;
-		}
 	}
 
-	// Wait for the PREVIOUS streaming submit only (not the device/queue):
-	// by the next frame it is long done, so this normally costs nothing.
-	if (m_streamFencePending) {
-		vkWaitForFences(device, 1, &m_streamFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_streamFence);
-		m_streamFencePending = false;
+	// Use the slot the previous upload did NOT use; wait its fence only if
+	// pending (that submit is two uploads old - long retired, so this
+	// normally costs nothing).
+	const std::uint32_t idx = m_streamParity ^ 1u;
+	if (m_streamFencePending[idx]) {
+		vkWaitForFences(device, 1, &m_streamFence[idx], VK_TRUE, UINT64_MAX);
+		vkResetFences(device, 1, &m_streamFence[idx]);
+		m_streamFencePending[idx] = false;
 	}
 
 	// Staging layout: [voxel bytes][heightmap words].
 	const auto& types = upload.chunk->voxelTypes();
-	std::memcpy(m_streamStagingMapped, types.data(), types.size());
+	std::memcpy(m_streamStagingMapped[idx], types.data(), types.size());
 	const auto& heights = upload.chunk->heightMapWords();
-	std::memcpy(static_cast<std::uint8_t*>(m_streamStagingMapped) +
+	std::memcpy(static_cast<std::uint8_t*>(m_streamStagingMapped[idx]) +
 								static_cast<std::size_t>(m_slotByteStride),
-							heights.data(), heights.size() * sizeof(std::uint32_t));
+					heights.data(), heights.size() * sizeof(std::uint32_t));
 
-	VkResult r = vkResetCommandBuffer(m_streamCmd, 0);
+	VkResult r = vkResetCommandBuffer(m_streamCmd[idx], 0);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to reset streaming command buffer.";
 		return false;
@@ -382,7 +387,7 @@ bool VoxelResources::uploadChunksStreaming(
 	VkCommandBufferBeginInfo begin{};
 	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	r = vkBeginCommandBuffer(m_streamCmd, &begin);
+	r = vkBeginCommandBuffer(m_streamCmd[idx], &begin);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to begin streaming command buffer.";
 		return false;
@@ -393,15 +398,16 @@ bool VoxelResources::uploadChunksStreaming(
 	voxelRegion.size = static_cast<VkDeviceSize>(m_slotByteStride);
 	voxelRegion.dstOffset =
 			static_cast<VkDeviceSize>(upload.slot) * m_slotByteStride;
-	vkCmdCopyBuffer(m_streamCmd, m_streamStaging, m_voxelBuffer, 1, &voxelRegion);
+	vkCmdCopyBuffer(m_streamCmd[idx], m_streamStaging[idx], m_voxelBuffer, 1,
+								&voxelRegion);
 	VkBufferCopy heightRegion{};
 	heightRegion.srcOffset = static_cast<VkDeviceSize>(m_slotByteStride);
 	heightRegion.size = static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
 	heightRegion.dstOffset = static_cast<VkDeviceSize>(upload.slot) *
 														static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
-	vkCmdCopyBuffer(m_streamCmd, m_streamStaging, m_heightBuffer, 1,
-									&heightRegion);
-	r = vkEndCommandBuffer(m_streamCmd);
+	vkCmdCopyBuffer(m_streamCmd[idx], m_streamStaging[idx], m_heightBuffer, 1,
+								&heightRegion);
+	r = vkEndCommandBuffer(m_streamCmd[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to end streaming command buffer.";
 		return false;
@@ -410,28 +416,31 @@ bool VoxelResources::uploadChunksStreaming(
 	VkSubmitInfo submit{};
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
-	submit.pCommandBuffers = &m_streamCmd;
-	r = vkQueueSubmit(queue, 1, &submit, m_streamFence);
+	submit.pCommandBuffers = &m_streamCmd[idx];
+	r = vkQueueSubmit(queue, 1, &submit, m_streamFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit streaming chunk upload.";
 		return false;
 	}
-	m_streamFencePending = true;
+	m_streamFencePending[idx] = true;
+	m_streamParity = idx;
 	return true;
 }
 
 void VoxelResources::waitStreamingUploadIdle(VkDevice device) {
-	if (m_streamFencePending) {
-		vkWaitForFences(device, 1, &m_streamFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_streamFence);
-		m_streamFencePending = false;
+	for (std::uint32_t k = 0; k < 2; ++k) {
+		if (m_streamFencePending[k]) {
+			vkWaitForFences(device, 1, &m_streamFence[k], VK_TRUE, UINT64_MAX);
+			vkResetFences(device, 1, &m_streamFence[k]);
+			m_streamFencePending[k] = false;
+		}
 	}
 }
 
 bool VoxelResources::ensureFarUploadResources(
 		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
 		std::string& outError) {
-	if (m_farStaging != VK_NULL_HANDLE) {
+	if (m_farStaging[0] != VK_NULL_HANDLE) {
 		return true;
 	}
 	const VkDeviceSize bytes =
@@ -440,47 +449,51 @@ bool VoxelResources::ensureFarUploadResources(
 		outError = "Far LOD is not enabled on this resource set.";
 		return false;
 	}
-	if (!utils::createBuffer(device, physicalDevice, bytes,
-													 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-													 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-													 m_farStaging, m_farStagingMemory,
-													 outError)) {
-		return false;
-	}
-	VkResult r = vkMapMemory(device, m_farStagingMemory, 0, VK_WHOLE_SIZE, 0,
-													 &m_farStagingMapped);
-	if (r != VK_SUCCESS || m_farStagingMapped == nullptr) {
-		outError = "Failed to map far staging memory.";
-		return false;
-	}
-	VkCommandBufferAllocateInfo alloc{};
-	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	alloc.commandPool = commandPool;
-	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	alloc.commandBufferCount = 1;
-	r = vkAllocateCommandBuffers(device, &alloc, &m_farCmd);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to allocate far upload command buffer.";
-		return false;
+	for (std::uint32_t k = 0; k < 2; ++k) {
+		if (!utils::createBuffer(device, physicalDevice, bytes,
+														 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+																 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+														 m_farStaging[k], m_farStagingMemory[k],
+														 outError)) {
+			return false;
+		}
+		VkResult r = vkMapMemory(device, m_farStagingMemory[k], 0, VK_WHOLE_SIZE, 0,
+														 &m_farStagingMapped[k]);
+		if (r != VK_SUCCESS || m_farStagingMapped[k] == nullptr) {
+			outError = "Failed to map far staging memory.";
+			return false;
+		}
+		VkCommandBufferAllocateInfo alloc{};
+		alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		alloc.commandPool = commandPool;
+		alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		alloc.commandBufferCount = 1;
+		r = vkAllocateCommandBuffers(device, &alloc, &m_farCmd[k]);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to allocate far upload command buffer.";
+			return false;
+		}
+		VkFenceCreateInfo fence{};
+		fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+		r = vkCreateFence(device, &fence, nullptr, &m_farFence[k]);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to create far upload fence.";
+			return false;
+		}
 	}
 	m_farCommandPool = commandPool;
-	VkFenceCreateInfo fence{};
-	fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-	r = vkCreateFence(device, &fence, nullptr, &m_farFence);
-	if (r != VK_SUCCESS) {
-		outError = "Failed to create far upload fence.";
-		return false;
-	}
 	return true;
 }
 
 void VoxelResources::waitPreviousFarUpload(VkDevice device) {
-	if (m_farFencePending) {
-		vkWaitForFences(device, 1, &m_farFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_farFence);
-		m_farFencePending = false;
+	for (std::uint32_t k = 0; k < 2; ++k) {
+		if (m_farFencePending[k]) {
+			vkWaitForFences(device, 1, &m_farFence[k], VK_TRUE, UINT64_MAX);
+			vkResetFences(device, 1, &m_farFence[k]);
+			m_farFencePending[k] = false;
+		}
 	}
 }
 
@@ -502,10 +515,11 @@ bool VoxelResources::uploadFarFieldHalf(
 	}
 	waitPreviousFarUpload(device);
 
-	std::memcpy(m_farStagingMapped, cells.data(),
+	const std::uint32_t idx = m_farParity ^ 1u;
+	std::memcpy(m_farStagingMapped[idx], cells.data(),
 							cells.size() * sizeof(std::uint32_t));
 
-	VkResult r = vkResetCommandBuffer(m_farCmd, 0);
+	VkResult r = vkResetCommandBuffer(m_farCmd[idx], 0);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to reset far upload command buffer.";
 		return false;
@@ -513,7 +527,7 @@ bool VoxelResources::uploadFarFieldHalf(
 	VkCommandBufferBeginInfo begin{};
 	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	r = vkBeginCommandBuffer(m_farCmd, &begin);
+	r = vkBeginCommandBuffer(m_farCmd[idx], &begin);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to begin far upload command buffer.";
 		return false;
@@ -522,8 +536,8 @@ bool VoxelResources::uploadFarFieldHalf(
 	region.dstOffset =
 			static_cast<VkDeviceSize>(half) * m_farCellsPerHalf * 4u;
 	region.size = static_cast<VkDeviceSize>(m_farCellsPerHalf) * 4u;
-	vkCmdCopyBuffer(m_farCmd, m_farStaging, m_farBuffer, 1, &region);
-	r = vkEndCommandBuffer(m_farCmd);
+	vkCmdCopyBuffer(m_farCmd[idx], m_farStaging[idx], m_farBuffer, 1, &region);
+	r = vkEndCommandBuffer(m_farCmd[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to end far upload command buffer.";
 		return false;
@@ -531,8 +545,8 @@ bool VoxelResources::uploadFarFieldHalf(
 	VkSubmitInfo submit{};
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
-	submit.pCommandBuffers = &m_farCmd;
-	r = vkQueueSubmit(queue, 1, &submit, m_farFence);
+	submit.pCommandBuffers = &m_farCmd[idx];
+	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far field upload.";
 		return false;
@@ -540,8 +554,9 @@ bool VoxelResources::uploadFarFieldHalf(
 	// Wait for THIS copy so the caller can flip the half index immediately
 	// (a frame reading the new half must not race the copy). This waits a
 	// single 4 MB transfer, not the device.
-	vkWaitForFences(device, 1, &m_farFence, VK_TRUE, UINT64_MAX);
-	vkResetFences(device, 1, &m_farFence);
+	vkWaitForFences(device, 1, &m_farFence[idx], VK_TRUE, UINT64_MAX);
+	vkResetFences(device, 1, &m_farFence[idx]);
+	m_farParity = idx;
 	return true;
 }
 
@@ -569,17 +584,26 @@ bool VoxelResources::uploadFarFieldDelta(
 																outError)) {
 		return false;
 	}
-	waitPreviousFarUpload(device);
+	// Use the slot the previous far upload did NOT use; wait only its
+	// fence (that submit is two uploads old - retired). The in-flight
+	// previous upload reads the OTHER staging buffer, so this write is
+	// safe without waiting it.
+	const std::uint32_t idx = m_farParity ^ 1u;
+	if (m_farFencePending[idx]) {
+		vkWaitForFences(device, 1, &m_farFence[idx], VK_TRUE, UINT64_MAX);
+		vkResetFences(device, 1, &m_farFence[idx]);
+		m_farFencePending[idx] = false;
+	}
 
 	std::size_t src = 0;
-	auto* staging = static_cast<std::uint32_t*>(m_farStagingMapped);
+	auto* staging = static_cast<std::uint32_t*>(m_farStagingMapped[idx]);
 	for (const auto& run : cellRuns) {
 		std::memcpy(staging + src, values.data() + src,
 								static_cast<std::size_t>(run.second) * sizeof(std::uint32_t));
 		src += run.second;
 	}
 
-	VkResult r = vkResetCommandBuffer(m_farCmd, 0);
+	VkResult r = vkResetCommandBuffer(m_farCmd[idx], 0);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to reset far upload command buffer.";
 		return false;
@@ -587,7 +611,7 @@ bool VoxelResources::uploadFarFieldDelta(
 	VkCommandBufferBeginInfo begin{};
 	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	r = vkBeginCommandBuffer(m_farCmd, &begin);
+	r = vkBeginCommandBuffer(m_farCmd[idx], &begin);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to begin far upload command buffer.";
 		return false;
@@ -606,9 +630,9 @@ bool VoxelResources::uploadFarFieldDelta(
 		regions.push_back(region);
 		src += run.second;
 	}
-	vkCmdCopyBuffer(m_farCmd, m_farStaging, m_farBuffer,
+	vkCmdCopyBuffer(m_farCmd[idx], m_farStaging[idx], m_farBuffer,
 									static_cast<std::uint32_t>(regions.size()), regions.data());
-	r = vkEndCommandBuffer(m_farCmd);
+	r = vkEndCommandBuffer(m_farCmd[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to end far upload command buffer.";
 		return false;
@@ -616,13 +640,14 @@ bool VoxelResources::uploadFarFieldDelta(
 	VkSubmitInfo submit{};
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
-	submit.pCommandBuffers = &m_farCmd;
-	r = vkQueueSubmit(queue, 1, &submit, m_farFence);
+	submit.pCommandBuffers = &m_farCmd[idx];
+	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far delta upload.";
 		return false;
 	}
-	m_farFencePending = true;  // async; the next far upload waits it
+	m_farFencePending[idx] = true;  // async; the next far upload waits it
+	m_farParity = idx;
 	return true;
 }
 
@@ -640,28 +665,32 @@ bool VoxelResources::writeChunkTable(
 }
 
 void VoxelResources::cleanup(VkDevice device) {
-	if (m_streamFence != VK_NULL_HANDLE) {
-		vkDestroyFence(device, m_streamFence, nullptr);
-		m_streamFence = VK_NULL_HANDLE;
-	}
-	if (m_streamCmd != VK_NULL_HANDLE && m_streamCommandPool != VK_NULL_HANDLE) {
-		vkFreeCommandBuffers(device, m_streamCommandPool, 1, &m_streamCmd);
-		m_streamCmd = VK_NULL_HANDLE;
+	for (std::uint32_t k = 0; k < 2; ++k) {
+		if (m_streamFence[k] != VK_NULL_HANDLE) {
+			vkDestroyFence(device, m_streamFence[k], nullptr);
+			m_streamFence[k] = VK_NULL_HANDLE;
+		}
+		if (m_streamCmd[k] != VK_NULL_HANDLE &&
+				m_streamCommandPool != VK_NULL_HANDLE) {
+			vkFreeCommandBuffers(device, m_streamCommandPool, 1, &m_streamCmd[k]);
+			m_streamCmd[k] = VK_NULL_HANDLE;
+		}
+		if (m_streamStagingMapped[k] != nullptr) {
+			vkUnmapMemory(device, m_streamStagingMemory[k]);
+			m_streamStagingMapped[k] = nullptr;
+		}
+		if (m_streamStaging[k] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, m_streamStaging[k], nullptr);
+			m_streamStaging[k] = VK_NULL_HANDLE;
+		}
+		if (m_streamStagingMemory[k] != VK_NULL_HANDLE) {
+			vkFreeMemory(device, m_streamStagingMemory[k], nullptr);
+			m_streamStagingMemory[k] = VK_NULL_HANDLE;
+		}
+		m_streamFencePending[k] = false;
 	}
 	m_streamCommandPool = VK_NULL_HANDLE;
-	if (m_streamStagingMapped != nullptr) {
-		vkUnmapMemory(device, m_streamStagingMemory);
-		m_streamStagingMapped = nullptr;
-	}
-	if (m_streamStaging != VK_NULL_HANDLE) {
-		vkDestroyBuffer(device, m_streamStaging, nullptr);
-		m_streamStaging = VK_NULL_HANDLE;
-	}
-	if (m_streamStagingMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(device, m_streamStagingMemory, nullptr);
-		m_streamStagingMemory = VK_NULL_HANDLE;
-	}
-	m_streamFencePending = false;
+
 	if (m_mappedTable != nullptr && m_chunkTableMemory != VK_NULL_HANDLE) {
 		vkUnmapMemory(device, m_chunkTableMemory);
 		m_mappedTable = nullptr;
@@ -674,28 +703,31 @@ void VoxelResources::cleanup(VkDevice device) {
 		vkFreeMemory(device, m_heightMemory, nullptr);
 		m_heightMemory = VK_NULL_HANDLE;
 	}
-	if (m_farFence != VK_NULL_HANDLE) {
-		vkDestroyFence(device, m_farFence, nullptr);
-		m_farFence = VK_NULL_HANDLE;
-	}
-	if (m_farCmd != VK_NULL_HANDLE && m_farCommandPool != VK_NULL_HANDLE) {
-		vkFreeCommandBuffers(device, m_farCommandPool, 1, &m_farCmd);
-		m_farCmd = VK_NULL_HANDLE;
+	for (std::uint32_t k = 0; k < 2; ++k) {
+		if (m_farFence[k] != VK_NULL_HANDLE) {
+			vkDestroyFence(device, m_farFence[k], nullptr);
+			m_farFence[k] = VK_NULL_HANDLE;
+		}
+		if (m_farCmd[k] != VK_NULL_HANDLE && m_farCommandPool != VK_NULL_HANDLE) {
+			vkFreeCommandBuffers(device, m_farCommandPool, 1, &m_farCmd[k]);
+			m_farCmd[k] = VK_NULL_HANDLE;
+		}
+		if (m_farStagingMapped[k] != nullptr) {
+			vkUnmapMemory(device, m_farStagingMemory[k]);
+			m_farStagingMapped[k] = nullptr;
+		}
+		if (m_farStaging[k] != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, m_farStaging[k], nullptr);
+			m_farStaging[k] = VK_NULL_HANDLE;
+		}
+		if (m_farStagingMemory[k] != VK_NULL_HANDLE) {
+			vkFreeMemory(device, m_farStagingMemory[k], nullptr);
+			m_farStagingMemory[k] = VK_NULL_HANDLE;
+		}
+		m_farFencePending[k] = false;
 	}
 	m_farCommandPool = VK_NULL_HANDLE;
-	if (m_farStagingMapped != nullptr) {
-		vkUnmapMemory(device, m_farStagingMemory);
-		m_farStagingMapped = nullptr;
-	}
-	if (m_farStaging != VK_NULL_HANDLE) {
-		vkDestroyBuffer(device, m_farStaging, nullptr);
-		m_farStaging = VK_NULL_HANDLE;
-	}
-	if (m_farStagingMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(device, m_farStagingMemory, nullptr);
-		m_farStagingMemory = VK_NULL_HANDLE;
-	}
-	m_farFencePending = false;
+
 	if (m_farBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_farBuffer, nullptr);
 		m_farBuffer = VK_NULL_HANDLE;

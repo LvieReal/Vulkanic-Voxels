@@ -46,24 +46,16 @@ Chunk* World::generateChunk(const ChunkCoord& coord) {
 			static_cast<std::int64_t>(coord.x) * m_chunkSizeX;
 	const std::int64_t baseZ =
 			static_cast<std::int64_t>(coord.z) * m_chunkSizeZ;
+	// Same canonical generator output, but MOVED into the chunk instead of
+	// ~131k set() calls (the set loop was ~16 ms/chunk - the synchronous
+	// region rebuild burned 12 s on 729 chunks at startup and 1.6 s on the
+	// sprint fallback; the move is ~3 ms/chunk total).
 	std::vector<std::uint8_t> types;
 	m_terrain.generateChunkVoxels(static_cast<std::int32_t>(baseX),
 																static_cast<std::int32_t>(baseZ),
 																m_chunkSizeX, m_chunkSizeZ, m_worldHeight,
 																types);
-	for (std::uint32_t z = 0; z < m_chunkSizeZ; ++z) {
-		for (std::uint32_t y = 0; y < m_worldHeight; ++y) {
-			const std::size_t base = (static_cast<std::size_t>(z) *
-																m_chunkSizeX * m_worldHeight) +
-															 static_cast<std::size_t>(y) * m_chunkSizeX;
-			for (std::uint32_t x = 0; x < m_chunkSizeX; ++x) {
-				const auto type = static_cast<vv::voxel::VoxelType>(types[base + x]);
-				if (type != vv::voxel::VoxelType::Air) {
-					chunk->set(x, y, z, type);
-				}
-			}
-		}
-	}
+	chunk->setVoxelTypes(std::move(types));
 
 	Chunk* raw = chunk.get();
 	m_chunks.emplace(coord, std::move(chunk));

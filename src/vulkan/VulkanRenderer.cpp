@@ -426,14 +426,43 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       rebuildStreamPending();
       const std::size_t needed = m_streamPending.size();
       if (needed > m_freeSlots.size()) {
-        // Too far for the spare ring (teleport-scale): fall back to the
-        // synchronous rebuild.
-        m_streamActive = false;
-        m_streamPending.clear();
-        std::string error;
-        if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
-          std::fprintf(stderr, "[vulkan] chunk region update failed: %s\n",
-                       error.c_str());
+        // Sprint overran the spare ring. The old response (synchronous
+        // full rebuild) was the multi-second sprint freeze. Instead:
+        // release the slots of chunks that left the new target's region
+        // through the cooldown queue (in-flight frames may still read
+        // them via the active table half - same rule as finishRegionMove)
+        // and keep streaming. Only a genuine teleport (still short after
+        // freeing) takes the synchronous path.
+        const int32_t rr =
+            static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
+        for (auto it = m_slotOf.begin(); it != m_slotOf.end();) {
+          if (std::abs(it->first.x - m_streamTarget.x) > rr ||
+              std::abs(it->first.z - m_streamTarget.z) > rr) {
+            m_slotCooldown.emplace_back(it->second, m_frameCounter);
+            it = m_slotOf.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        for (auto it = m_slotCooldown.begin();
+             it != m_slotCooldown.end() &&
+             m_streamPending.size() > m_freeSlots.size();) {
+          if (m_frameCounter - it->second >= 2u) {
+            m_freeSlots.push_back(it->first);
+            it = m_slotCooldown.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        if (m_streamPending.size() > m_freeSlots.size()) {
+          m_streamActive = false;
+          m_streamPending.clear();
+          std::string error;
+          if (!rebuildChunkRegion(chunkX, chunkZ, error)) {
+            std::fprintf(stderr,
+                         "[vulkan] chunk region update failed: %s\n",
+                         error.c_str());
+          }
         }
       } else if (m_streamPending.empty()) {
         finishRegionMove();
@@ -461,12 +490,28 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
   }
 
   if (chunkX == m_regionCenter.x && chunkZ == m_regionCenter.z) {
+    const auto t0 = std::chrono::steady_clock::now();
     ensureFarField(chunkX, chunkZ);
+    m_perfFarMs += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
     return;
   }
 
-  beginRegionMove(chunkX, chunkZ);
-  ensureFarField(chunkX, chunkZ);
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    beginRegionMove(chunkX, chunkZ);
+    m_perfPumpMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  }
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    ensureFarField(chunkX, chunkZ);
+    m_perfFarMs += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+  }
 }
 
 void VulkanRenderer::beginRegionMove(int32_t targetChunkX,

@@ -176,8 +176,15 @@ FarField FarField::build(const TerrainGenerator& gen,
 			// shiftJ) cells); only exposed strips fall through to the
 			// estimate below.
 			if (prev != nullptr) {
-				const std::int64_t si = static_cast<std::int64_t>(i) + shiftI;
-				const std::int64_t sj = static_cast<std::int64_t>(j) + shiftJ;
+				// Index of this world cell in the PREVIOUS window. Note the
+				// MINUS: prevIndex = (worldX - prevOrigin)/cell
+				//        = i - (prevOrigin - newOrigin)/cell = i - shift.
+				// (Pass 14 shipped `i + shift` - every recenter displayed
+				// the old terrain shifted by TWICE the window move, i.e. a
+				// different landscape: the "LOD switches between two
+				// different worlds" report.)
+				const std::int64_t si = static_cast<std::int64_t>(i) - shiftI;
+				const std::int64_t sj = static_cast<std::int64_t>(j) - shiftJ;
 				if (si >= 0 && sj >= 0 &&
 						si < static_cast<std::int64_t>(field.dim) &&
 						sj < static_cast<std::int64_t>(field.dim)) {

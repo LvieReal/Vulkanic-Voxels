@@ -888,9 +888,17 @@ void testFarField() {
 	// produce EXACTLY the same cells as a fresh build (window reuse copies,
 	// exposed strips recompute - values must not diverge).
 	{
-		const auto fresh = vv::terrain::FarField::build(gen, 3, 2, 2, cell, chunk);
-		auto seeded = vv::terrain::FarField::build(gen, 3, 2, 2, cell, chunk,
+		// Center chunk (17, 0): its center voxel (560, 16) snaps to a
+		// DIFFERENT 512-cell than (16, 16) -> 0, so the seeded build
+		// exercises a REAL window shift (128 cells). (The pass-14 version
+		// used center (3,2) - same snap cell, shift 0 - which let a sign
+		// error in the copy index pass vacuously: every recenter showed
+		// the old terrain shifted twice = "two different worlds".)
+		auto fresh = vv::terrain::FarField::build(gen, 17, 0, 2, cell, chunk);
+		auto seeded = vv::terrain::FarField::build(gen, 17, 0, 2, cell, chunk,
 																							 &field);
+		check(fresh.originVoxX != field.originVoxX,
+					"far: recenter test actually shifts the window");
 		check(fresh.dim == seeded.dim && fresh.originVoxX == seeded.originVoxX &&
 						fresh.originVoxZ == seeded.originVoxZ,
 					"far: incremental recenter geometry matches");

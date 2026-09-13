@@ -143,14 +143,20 @@ class VoxelResources final {
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;
 	std::uint64_t m_farCellsPerHalf = 0;  // far dim * far dim
 
-	// --- Far upload path (persistent staging, one fence) ---
-	VkBuffer m_farStaging = VK_NULL_HANDLE;
-	VkDeviceMemory m_farStagingMemory = VK_NULL_HANDLE;
-	void* m_farStagingMapped = nullptr;
+	// --- Far upload path (double-buffered: staging + cmd + fence x2) ---
+	// Each upload uses the slot NOT used by the previous one, so the wait
+	// before writing targets a submit TWO uploads old - always retired.
+	// (A single buffer made the wait trail the GPU by a full frame, since
+	// the copy is queued behind the previous frame's compute work - a
+	// frame-time stall per streaming frame at high load.)
+	VkBuffer m_farStaging[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkDeviceMemory m_farStagingMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	void* m_farStagingMapped[2] = {nullptr, nullptr};
 	VkCommandPool m_farCommandPool = VK_NULL_HANDLE;
-	VkCommandBuffer m_farCmd = VK_NULL_HANDLE;
-	VkFence m_farFence = VK_NULL_HANDLE;
-	bool m_farFencePending = false;
+	VkCommandBuffer m_farCmd[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkFence m_farFence[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	bool m_farFencePending[2] = {false, false};
+	std::uint32_t m_farParity = 0;
 
 	bool ensureFarUploadResources(VkDevice device,
 																VkPhysicalDevice physicalDevice,
@@ -161,14 +167,15 @@ class VoxelResources final {
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;
 
-	// --- Streaming upload path (uploadChunksStreaming) ---
-	VkBuffer m_streamStaging = VK_NULL_HANDLE;
-	VkDeviceMemory m_streamStagingMemory = VK_NULL_HANDLE;
-	void* m_streamStagingMapped = nullptr;
+	// --- Streaming upload path (double-buffered, see far above) ---
+	VkBuffer m_streamStaging[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkDeviceMemory m_streamStagingMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	void* m_streamStagingMapped[2] = {nullptr, nullptr};
 	VkCommandPool m_streamCommandPool = VK_NULL_HANDLE;
-	VkCommandBuffer m_streamCmd = VK_NULL_HANDLE;
-	VkFence m_streamFence = VK_NULL_HANDLE;
-	bool m_streamFencePending = false;
+	VkCommandBuffer m_streamCmd[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkFence m_streamFence[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	bool m_streamFencePending[2] = {false, false};
+	std::uint32_t m_streamParity = 0;
 	// Uploads the palette built from vv::voxel::kVoxelTypeInfo.
 	bool createPalette(VkDevice device, VkPhysicalDevice physicalDevice,
 										 std::string& outError);

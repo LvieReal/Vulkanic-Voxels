@@ -84,29 +84,32 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 14)
+## Current status (pass 15)
 
-Owner-verified: pass 9 stable base (no TAA/SSAA). The pass-13 perf log
-plus the owner's observation ("holes vary on X, stay at 13; renderRadius
-is 12 - something at the edges") pinned both open issues down:
+Pass-14 owner log named every remaining culprit; all fixed:
 
-1. **Edge holes** - chunk row 13 = first row BEYOND the region, rendered
-   by far cells that were never seam-patched (the patch covered region
-   chunks only); the estimate under-shoots folded columns by up to ~25
-   voxels -> chunk-shaped notches varying with X. Pass 14: the seam
-   patch covers the r+1 ring with REAL data - streaming generates ring
-   chunks on the worker (generate-only, no slots), sync paths call
-   ensureRegion(r+1).
-2. **Sprint hitch** - big frames (0.4-1.5 s) showed stream 0.0 ms: the
-   old timing only covered the pump. Found + fixed: (a) the far field
-   NEVER recentered (snap-cell vs chunk-distance threshold bug); recent
-   -ers now trigger on snap-cell change and are INCREMENTAL (window
-   shift + strip recompute, ~13% of the grid, unit-tested identical to
-   a fresh build); (b) the activation patch keeps its extent across
-   world-aligned shifts (only the new ring is scanned); (c) VV_PERF now
-   times every bucket (world total / pump / sync / far / gpu-wait) and
-   rebuildChunkRegion logs "SYNC region rebuild: N chunks, X ms" - if
-   any hitch remains, the next log names it.
+1. "Two different worlds" - pass 14's window-reuse copy had a SIGN
+   error (`i + shift` instead of `i - shift`): every recenter showed
+   the old terrain shifted twice. Fixed; the recenter unit test now
+   uses centers on DIFFERENT snap cells (real 128-cell shift), so it
+   can never pass vacuously again.
+2. Sprint freeze - the synchronous fallback fired at sprint ("SYNC
+   region rebuild: 98 chunks, 1615 ms"). Two fixes: ordinary overruns
+   now release out-of-target slots through the cooldown queue and keep
+   streaming (sync only for genuine teleports), and the sync path
+   generates chunks via the fast move-based fill (~3 ms/chunk; the old
+   131k set() loop was ~16 ms - startup's 729 chunks dropped from
+   ~12 s to ~2 s).
+3. Hitch at normal speed (pump 34.9 ms on one frame) - the streaming
+   upload's fence wait trailed the GPU by a full frame (the copy is
+   queued behind the previous frame's compute). Streaming AND far
+   upload paths are now double-buffered (staging + cmd + fence x2,
+   alternating): the pre-write wait targets a submit two uploads old,
+   which is always retired.
+4. Untimed 100 ms frames - the non-streaming updateWorld branches
+   (far activation) were unbucketed; VV_PERF now times them too.
+
+If anything still hitches, the VV_PERF=1 log now has no blind spots.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

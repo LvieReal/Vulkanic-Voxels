@@ -74,6 +74,10 @@ void Chunk::recomputeHeightMap() const {
 
 void Chunk::setVoxelTypes(std::vector<std::uint8_t>&& types) {
 	m_voxelTypes = std::move(types);
+	// The uploader copies paddedByteSize() bytes; keep the vector at that
+	// size (no-op for the default 32x128x32 chunk - 131072 is divisible
+	// by 4 - but stay safe for any future geometry).
+	m_voxelTypes.resize(paddedByteSize());
 	m_heightMapDirty = true;
 }
 
