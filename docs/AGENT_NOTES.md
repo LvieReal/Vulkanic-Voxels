@@ -131,9 +131,10 @@ Delivered (pass 24):
   lateral profile tracks the reference smoothly (max 0.325, no gaps,
   no hard steps); splat vs brute max dev 1.0.
 
-Workspace note: this sandbox is a FRESH CLONE at 240f625 (the pass-14
-to 23 commits were lost with the previous workspace); all session work
-through pass 24 is committed together from the working tree.
+Workspace note: a previous sandbox wipe returned a FRESH CLONE at 240f625
+(pass-14..23 history lost locally); the remote still had the full per-pass
+history, so pass 24 was grafted on top of d375eb6 as a normal commit
+(a76d6e1) — per-pass git history is intact on the remote again.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites
