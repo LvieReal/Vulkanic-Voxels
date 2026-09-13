@@ -1449,10 +1449,12 @@ struct ShadowWorld {
 	}
 };
 
-// Mirror of the shader's sunShadow (pass 21): one ascending column
-// march; each blocker contributes an angular coverage of the sun disk
-// (see the shader comment). coneTan = 0 reproduces the exact binary
-// march (same offsets, clamps, tie-breaks, cap).
+// Mirror of the shader's sunShadow (pass 21 + the pass-22 lateral
+// fix): one ascending column march; each blocker contributes an angular
+// coverage of the sun disk, plus per-step near lateral samples (gap
+// closing) and a lateral sweep at the worst blocker's distance (full
+// penumbra width). coneTan = 0 reproduces the exact binary march (same
+// offsets, clamps, tie-breaks, cap).
 double sunVisMarch(const ShadowWorld& w, const double origin[3],
 									 const double n[3], const double sun[3],
 									 double coneTan) {
@@ -1465,6 +1467,38 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 	for (int a = 0; a < 3; ++a) {
 		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
 	}
+	// Perpendicular axis of the sun's XZ direction (lateral samples).
+	double pAxis[2] = {1.0, 0.0};
+	{
+		const double len = std::sqrt(sun[0] * sun[0] + sun[2] * sun[2]);
+		if (len > 1e-5) {
+			pAxis[0] = -sun[2] / len;
+			pAxis[1] = sun[0] / len;
+		}
+	}
+	auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+	// Lateral blocker top: near height bound or far cell height.
+	auto lateralTop = [&](int cx, int cz, double& top) -> bool {
+		if (cx >= 0 && cx < w.near.wx && cz >= 0 && cz < w.near.wz) {
+			const unsigned bound = w.near.boundAt(cx, cz);
+			if (bound == 0xFFFFu) {
+				return false;
+			}
+			top = double(bound);
+			return true;
+		}
+		const int fcX = int(std::floor((double(cx) + 0.5 - w.farOrigin) /
+																	 w.farCell));
+		const int fcZ = int(std::floor((double(cz) + 0.5 - w.farOrigin) /
+																	 w.farCell));
+		const unsigned packed = w.farAt(fcX, fcZ);
+		const double h = double(packed & 0xFFFFu);
+		if (h > 0.0) {
+			top = h;
+			return true;
+		}
+		return false;
+	};
 	int stepX = (sun[0] > 0.0) ? 1 : -1;
 	int stepZ = (sun[2] > 0.0) ? 1 : -1;
 	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
@@ -1485,13 +1519,13 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 
 	double s = 0.0;
 	double pen = 0.0;
-	auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
+	double sBest = 0.0;
 	for (int i = 0; i < 256; ++i) {
 		const double sExit = std::min(tMaxX, tMaxZ);
 		const double y0 = o[1] + sun[1] * s;
 		const double dip = soft ? coneTan * s : 0.0;
 		if (y0 - dip >= w.maxTerr) {
-			return 1.0 - pen;
+			break;
 		}
 		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
 												colZ < w.near.wz;
@@ -1510,9 +1544,55 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 																				 (2.0 * coneTan *
 																					std::max(s, 1e-4)))
 											: 1.0;
-						pen = std::max(pen, cov);
+						if (cov > pen) {
+							pen = cov;
+							sBest = s;
+						}
 						if (pen >= 1.0) {
 							return 0.0;
+						}
+					}
+				}
+			}
+			// Gap closing: dense lateral columns 1-4 cells beside the ray
+			// line; any hit records sBest for the final integral.
+			if (soft && coneTan * s >= 0.75) {
+				const double ccx = o[0] + sun[0] * s;
+				const double ccz = o[2] + sun[2] * s;
+				const double r = coneTan * s;
+				for (int k = 1; k <= 4; ++k) {
+					for (int sg = -1; sg <= 1; sg += 2) {
+						const double sx = ccx + pAxis[0] * double(k * sg);
+						const double sz = ccz + pAxis[1] * double(k * sg);
+						const double cellx = std::floor(sx) + 0.5;
+						const double cellz = std::floor(sz) + 0.5;
+						const double d =
+								std::sqrt((cellx - ccx) * (cellx - ccx) +
+													(cellz - ccz) * (cellz - ccz));
+						// Rim cells (center just outside the disk, area still
+						// overlapping) count with a clipped chord.
+						const double dEff = std::min(d, r - 0.01);
+						if (d >= r + 0.7 || dEff <= 0.0) {
+							continue;
+						}
+						double top;
+						if (lateralTop(int(std::floor(sx)), int(std::floor(sz)),
+													 top)) {
+							// One cell = one chord strip of the disk:
+							// fraction = chord(d) * 1 / disk area.
+							const double strip =
+									2.0 * std::sqrt(std::max(
+												r * r - dEff * dEff, 0.0)) /
+									(3.14159265358979323846 * r * r);
+							const double vCov =
+									clamp01(0.5 + (top - y0) /
+															 (2.0 * coneTan *
+																std::max(s, 1e-4)));
+							const double cov = vCov * strip;
+							if (cov > pen) {
+								pen = cov;
+								sBest = s;
+							}
 						}
 					}
 				}
@@ -1530,7 +1610,10 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 																 (2.0 * coneTan *
 																	std::max(s, 1e-4)))
 								 : 1.0;
-				pen = std::max(pen, cov);
+				if (cov > pen) {
+					pen = cov;
+					sBest = s;
+				}
 				if (pen >= 1.0) {
 					return 0.0;
 				}
@@ -1542,6 +1625,49 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 		tMaxZ += takeX ? 0.0 : dZ;
 		colX += takeX ? stepX : 0;
 		colZ += takeX ? 0 : stepZ;
+	}
+
+	// Lateral integral at the worst blocker's distance: chord-weighted
+	// quadrature of the disk's horizontal diameter (see the shader).
+	if (soft && pen > 0.0) {
+		const double r = sBest * coneTan;
+		if (r >= 0.75) {
+			const double ccx = o[0] + sun[0] * sBest;
+			const double ccz = o[2] + sun[2] * sBest;
+			const double yB = o[1] + sun[1] * sBest;
+			const int maxD = std::min(int(std::floor(r + 0.7)), 16);
+			double covSum = 0.0;
+			double wSum = 0.0;
+			for (int k = 0; k <= maxD; ++k) {
+				for (int sg = (k == 0) ? 1 : -1; sg <= 1; sg += 2) {
+					const double sx = ccx + pAxis[0] * double(k * sg);
+					const double sz = ccz + pAxis[1] * double(k * sg);
+					const double cellx = std::floor(sx) + 0.5;
+					const double cellz = std::floor(sz) + 0.5;
+					const double d =
+							std::sqrt((cellx - ccx) * (cellx - ccx) +
+													(cellz - ccz) * (cellz - ccz));
+					// Rim cells: clip the offset into the disk.
+					const double dEff = std::min(d, r - 0.01);
+					if (d >= r + 0.7 || dEff <= 0.0) {
+						continue;
+					}
+					const double chordHalf = std::sqrt(
+							std::max(r * r - dEff * dEff, 1e-6));
+					double top;
+					if (lateralTop(int(std::floor(sx)), int(std::floor(sz)),
+													 top)) {
+						const double vCov =
+								clamp01(0.5 + (top - yB) / (2.0 * chordHalf));
+						covSum += chordHalf * vCov;
+					}
+					wSum += chordHalf;
+				}
+			}
+			if (wSum > 0.0) {
+				pen = std::max(pen, covSum / wSum);
+			}
+		}
 	}
 	return 1.0 - pen;
 }
@@ -1831,6 +1957,90 @@ double sunVisReference(const ShadowWorld& w, const double origin[3],
 	return double(litCount) / double(dirs);
 }
 
+// Lateral join (pass 22): a wide pillar over flat ground, points moving
+// PERPENDICULAR to the sun direction across the pillar's shadow. The
+// pass-21 single-ray march was blind beside the ray line (hard edges +
+// lit gaps next to the penumbra); with the lateral sampling the march
+// must follow the dense disk reference continuously along the whole
+// profile. Wide cone (0.15) so the penumbra spans many cells.
+void testShadowLateralJoin() {
+	ShadowWorld w;
+	w.near.cells.assign(std::size_t(w.near.wx) * w.near.wh * w.near.wz, 0);
+	for (int z = 0; z < w.near.wz; ++z) {
+		for (int x = 0; x < w.near.wx; ++x) {
+			for (int y = 0; y < 10; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+										 std::size_t(z) * w.near.wx * w.near.wh] = 1;
+			}
+		}
+	}
+	// 4x4 pillar, height 30, at (30..33, 30..33).
+	for (int z = 30; z < 34; ++z) {
+		for (int x = 30; x < 34; ++x) {
+			for (int y = 0; y < 30; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+										 std::size_t(z) * w.near.wx * w.near.wh] = 2;
+			}
+		}
+	}
+	w.near.recomputeHeights();
+	w.farCells.assign(std::size_t(w.farDim) * w.farDim, 0u);
+
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+	const double coneTan = 0.15;
+	const double n[3] = {0.0, 1.0, 0.0};
+
+	// Points along the perpendicular axis through (24, 10, 24): the
+	// sun-ray from that point passes the pillar center; k = perpendicular
+	// distance from that line (exact, since sun.xz || (1, 1)).
+	double maxDiff = 0.0;
+	int penumbral = 0;
+	int gaps = 0;  // k where ref sees partial shadow but the march sees none
+	double prevVis = -1.0;
+	double prevRef = -1.0;
+	double maxGradDiff = 0.0;  // march's step-to-step change vs reference's
+	for (int k = 0; k <= 10; ++k) {
+		const double invSqrt2 = 0.7071067811865476;
+		double origin[3] = {24.0 - invSqrt2 * k, 10.0, 24.0 + invSqrt2 * k};
+		const double vis = sunVisMarch(w, origin, n, sun, coneTan);
+		const double ref = sunVisReference(w, origin, n, sun, coneTan);
+		if (vis < -1e-9 || vis > 1.0 + 1e-9) {
+			check(false, "shadow lateral: visibility within [0, 1]");
+			return;
+		}
+		if (ref > 0.05 && ref < 0.95) {
+			++penumbral;
+			if (vis <= 1e-4 && ref > 0.3) {
+				++gaps;
+				std::printf("FAIL shadow lateral gap at k=%d: march %.3f ref "
+										"%.3f\n",
+										k, vis, ref);
+			}
+		}
+		const double diff = std::fabs(vis - ref);
+		maxDiff = std::max(maxDiff, diff);
+		if (prevVis >= 0.0) {
+			// A SEAM = the march transitions where the reference does not
+			// (its step-to-step change exceeds the reference's widely).
+			const double gradDiff =
+					std::fabs((vis - prevVis) - (ref - prevRef));
+			maxGradDiff = std::max(maxGradDiff, gradDiff);
+		}
+		prevVis = vis;
+		prevRef = ref;
+	}
+	check(gaps == 0, "shadow lateral: no lit gaps inside the penumbra");
+	check(maxDiff <= 0.35,
+				"shadow lateral: march follows the reference profile");
+	check(maxGradDiff <= 0.3,
+				"shadow lateral: no transitions the reference does not have");
+	check(penumbral >= 3, "shadow lateral: penumbra actually exercised");
+	std::printf("shadow lateral: profile max|diff| %.3f over %d penumbral "
+							"points\n",
+							maxDiff, penumbral);
+}
+
 void testSunShadowCone() {
 	ShadowWorld w = makeShadowWorld();
 	double sun[3] = {0, 0, 0};
@@ -1974,8 +2184,8 @@ static void testVoxelTextures() {
 			std::string(vt::voxelTextureSuffix(VoxelTextureMode::SideUniform, 2)) ==
 					"_side";
 	check(sideSuffixes, "textures: side-uniform suffixes top/bottom/side");
-	const char* customWant[6] = {"_top", "_bottom", "_px", "_nx", "_pz",
-															"_nz"};
+	const char* customWant[6] = {"_top", "_bottom", "_back", "_front",
+															"_right", "_left"};
 	bool customSuffixes = true;
 	for (std::uint32_t f = 0; f < 6; ++f) {
 		if (std::string(vt::voxelTextureSuffix(VoxelTextureMode::Custom, f)) !=
@@ -2034,6 +2244,7 @@ int main() {
 	testFarMarch();
 	testSunShadowMarch();
 	testSunShadowCone();
+	testShadowLateralJoin();
 	testVoxelTextures();
 
 	if (g_failures == 0) {

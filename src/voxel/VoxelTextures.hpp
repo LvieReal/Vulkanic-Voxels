@@ -12,9 +12,9 @@ namespace vv::voxel {
 // table (binding 10) mapping type x face -> image index.
 //
 // Face id convention (used everywhere: files, table, shader):
-//   0 = +Y (top)   1 = -Y (bottom)
-//   2 = +X         3 = -X
-//   4 = +Z         5 = -Z
+//   0 = +Y (top)      1 = -Y (bottom)
+//   2 = +X (back)     3 = -X (front)
+//   4 = +Z (right)    5 = -Z (left)
 
 // How many textures a type uses and which file serves which face.
 enum class VoxelTextureMode : std::uint8_t {
@@ -39,7 +39,8 @@ constexpr std::uint32_t voxelTextureFileCount(VoxelTextureMode mode) {
 // File name suffix for file index i (0..count-1) of a mode:
 //   Uniform:     ""
 //   SideUniform: "_top", "_bottom", "_side"
-//   Custom:      "_top", "_bottom", "_px", "_nx", "_pz", "_nz"
+//   Custom:      "_top", "_bottom", "_back", "_front", "_right", "_left"
+// (file index = face id; +X is "back", -X is "front")
 // Pure function on constexpr data - unit tested in
 // tests/terrain_world_tests.cpp.
 const char* voxelTextureSuffix(VoxelTextureMode mode, std::uint32_t file);

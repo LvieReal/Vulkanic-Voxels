@@ -87,40 +87,39 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 21)
+## Current status (pass 22)
 
-Owner-verified pass 20 (textures seamless). Pass 21 asks: (1) load
-textures from resources/textures/voxels (files on the owner's machine;
-plain-color fallback here), (2) nearest sampling by default, (3) three
-texture definition modes (uniform / side-uniform / custom), (4) soft
-shadows via CONE TRACING (chosen over flood-fill and opacity grid).
+Owner-verified pass 21 (textures work seamlessly; screenshot showed
+shadow seams). Pass 22 asks: (1) reuse texture names across types
+(e.g. dirt for grass bottom), (2) rename px/nx/pz/nz to
+front/back/right/left, (3) fix shadows not joining (sharp transitions,
+seams, gaps between penumbrae).
 
 Delivered:
-- File textures: Qt loader (src/render/VoxelTextureFiles.*) reads
-  <name>.png (uniform, all 6 faces), <name>_top/_bottom/_side.png
-  (side-uniform) or <name>_top/_bottom/_px/_nx/_pz/_nz.png (custom);
-  most specific complete set wins, missing -> plain palette colors.
-  Search: executableDir()/resources/textures/voxels then CWD (run
-  scripts launch from repo root -> new files work without rebuild).
-  Binding 8 = image array (capacity kMaxVoxelTextures=48, unused slots
-  bound to a 1x1 white dummy), binding 9 = sampler (NEAREST texels,
-  linear mips), binding 10 = per-type table SSBO (6 face image indices
-  or 0xFFFFFFFF = plain, word 6 = nominal size for the explicit LOD).
-  Textured faces use the file as ALBEDO; far-LOD hits sample deep mips
-  (average color) so the near/far seam stays consistent. The pass-20
-  procedural generator is GONE (replaced by files + plain fallback).
-- Soft sun shadows, cone-traced: ONE march (same column DDA + voxel
-  walk as the sharp march) where each blocker contributes an ANGULAR
-  coverage: cov = clamp(0.5 + (blockerTop - y)/(2*coneTan*s), 0, 1);
-  vis = 1 - worst coverage. coneTan = scene.misc.w (default tan 2.5
-  deg = 0.0437); VV_SHADOW_SHARP=1 (or 0) -> exact binary march
-  (byte-identical behavior, pinned by the parity test). Vertical-slice
-  approximation: azimuthal disk extent ignored (occluders beside the
-  ray lighten penumbrae slightly).
-- Tests: texture mode/suffix/face-map tables; shadow cone mirror vs an
-  independent 13-direction dense reference (mean |diff| 0.012, >=97%
-  within 0.25, quantization-graze outliers <=1% and only where the
-  exact sharp march also blocks - consistency invariant checked).
+- Custom-mode files renamed: _top/_bottom/_front/_back/_right/_left
+  (front=-X, back=+X, right=+Z, left=-Z; face ids unchanged).
+- aliases.txt in resources/textures/voxels: "<type> <face> = <source>
+  [<source face>]", faces top/bottom/front/back/right/left/sides/all;
+  source face defaults to the target's name resolved through the
+  source's mode. Overrides file-based faces; logged at startup.
+- Shadow lateral fix (the pass-21 single ray was blind BESIDE the sun
+  line -> penumbrae didn't join):
+  (a) per near-region march step, dense lateral samples 1-4 cells
+      either side of the ray line (near height bounds / far cells);
+      each hit seeds pen with a chord-strip fraction
+      (2*sqrt(r^2-d^2)/(pi*r^2)) and records sBest;
+  (b) after the march, a chord-weighted integral of the sun disk's
+      horizontal diameter at sBest (each lateral cell blocks the
+      fraction of its chord below the cell top; rim cells clipped);
+      pen = max(center coverage, integral).
+  Wide casters converge to their full vertical-slice coverage;
+  penumbrae reach true width and merge. Sharp mode (coneTan 0) is
+  untouched and still byte-identical to the old march.
+- New test testShadowLateralJoin: 4x4 pillar, points sweeping
+  perpendicular across its shadow, wide cone (0.15): no lit gaps inside
+  the penumbra, profile within 0.154 of the 13-direction dense
+  reference, and step-to-step gradients track the reference (a seam
+  would be a transition the reference doesn't have).
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

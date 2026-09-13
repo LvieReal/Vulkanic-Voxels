@@ -15,12 +15,30 @@ files wins (custom > side-uniform > uniform):
 |--------------|----------------------------------------------------------|-------|
 | uniform      | `<name>.png`                                             | all 6 faces share one texture |
 | side-uniform | `<name>_top.png` `<name>_bottom.png` `<name>_side.png`   | top / bottom / all 4 sides |
-| custom       | `<name>_top.png` `<name>_bottom.png` `<name>_px.png` `<name>_nx.png` `<name>_pz.png` `<name>_nz.png` | every face its own |
+| custom       | `<name>_top.png` `<name>_bottom.png` `<name>_front.png` `<name>_back.png` `<name>_right.png` `<name>_left.png` | every face its own |
+
+Custom face names map to world axes: **front = −X**, **back = +X**,
+**right = +Z**, **left = −Z** (top = +Y, bottom = −Y).
 
 Notes:
 
 - A mode only applies when ALL of its files exist; a type with no
   complete set uses plain colors.
+- Reuse another type's textures instead of duplicating files with an
+  optional `aliases.txt` in this directory:
+
+  ```
+  # <type> <face> = <source type> [<source face>]
+  grass bottom = dirt          # grass's bottom face uses dirt's texture
+  grass sides = dirt side      # all 4 grass sides use dirt's side art
+  ```
+
+  Faces: `top`, `bottom`, `front`, `back`, `right`, `left`, `sides`
+  (all 4 sides), `all`. The source face defaults to the target face's
+  name, resolved through the SOURCE's mode (a uniform source serves any
+  face; a side-uniform source maps side faces to its side texture; a
+  custom source needs the explicit face name). Aliases override
+  file-based assignments for those faces.
 - Any reasonable PNG/JPG size works (square or not; mip chain is
   generated). Textures should be tileable - they repeat per voxel
   (1 texture unit = 1 voxel).
