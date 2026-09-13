@@ -15,6 +15,7 @@
 #include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
 #include "vulkan/VulkanUtils.hpp"
+#include "voxel/VoxelTypes.hpp"
 
 namespace vv::vulkan {
 
@@ -1482,12 +1483,52 @@ bool VulkanRenderer::createDevice(std::string& outError) {
   }
 
   VkPhysicalDeviceFeatures features{};
+  // Bindless voxel textures (binding 8): non-uniform indexing into a
+  // sampled-image array. Requires the descriptor-indexing feature set
+  // (core since Vulkan 1.2).
+  features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+  VkPhysicalDeviceVulkan12Features v12Features{};
+  v12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  v12Features.descriptorIndexing = VK_TRUE;
+  v12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+  {
+    // Verify support before creating the device; a clear message beats a
+    // device-lost later. vkGetPhysicalDeviceFeatures2 needs an instance
+    // of 1.1+; without it descriptor indexing cannot exist anyway.
+    uint32_t instanceVersion = VK_API_VERSION_1_0;
+    auto fpEnumerateInstanceVersion =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+    if (fpEnumerateInstanceVersion) {
+      fpEnumerateInstanceVersion(&instanceVersion);
+    }
+    if (instanceVersion < VK_API_VERSION_1_2) {
+      outError =
+          "Vulkan 1.2 instance required (bindless voxel textures).";
+      return false;
+    }
+    VkPhysicalDeviceVulkan12Features supported12{};
+    supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceFeatures2 supported2{};
+    supported2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    supported2.pNext = &supported12;
+    vkGetPhysicalDeviceFeatures2(m_physicalDevice, &supported2);
+    if (!supported12.descriptorIndexing ||
+        !supported12.shaderSampledImageArrayNonUniformIndexing ||
+        !supported2.features.shaderSampledImageArrayDynamicIndexing) {
+      outError =
+          "This GPU/driver lacks Vulkan 1.2 descriptor indexing "
+          "(required for the bindless voxel texture array).";
+      return false;
+    }
+  }
 
   VkDeviceCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
   createInfo.pQueueCreateInfos = queueInfos.data();
   createInfo.pEnabledFeatures = &features;
+  createInfo.pNext = &v12Features;
   createInfo.enabledExtensionCount =
       static_cast<uint32_t>(utils::kDeviceExtensions.size());
   createInfo.ppEnabledExtensionNames = utils::kDeviceExtensions.data();
@@ -1685,13 +1726,28 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   fadeBinding.descriptorCount = 1;
   fadeBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // Bindless voxel textures (pass 20): one sampled image per VoxelType,
+  // indexed non-uniformly per ray; separate sampler at binding 9.
+  VkDescriptorSetLayoutBinding textureArrayBinding{};
+  textureArrayBinding.binding = 8;
+  textureArrayBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  textureArrayBinding.descriptorCount =
+      vv::voxel::kVoxelTypeCount;
+  textureArrayBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutBinding textureSamplerBinding{};
+  textureSamplerBinding.binding = 9;
+  textureSamplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  textureSamplerBinding.descriptorCount = 1;
+  textureSamplerBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
-      paletteBinding, heightBinding, farBinding, fadeBinding};
+      paletteBinding, heightBinding, farBinding, fadeBinding,
+      textureArrayBinding, textureSamplerBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 8;
+  info.bindingCount = 10;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1750,6 +1806,11 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
 
   if (!m_voxelResources.create(m_device, m_physicalDevice, m_voxelConfig,
                                outError)) {
+    return false;
+  }
+  if (!m_voxelResources.createVoxelTextures(
+          m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+          outError)) {
     return false;
   }
 
@@ -2034,13 +2095,18 @@ void VulkanRenderer::cleanupStorageResources() {
 }
 
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
-  VkDescriptorPoolSize poolSizes[2] = {};
+  VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   poolSizes[0].descriptorCount = 7;  // voxel atlas, output, chunk table,
                                      // palette, column heights, far LOD,
                                      // chunk fade
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
+  poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  poolSizes[2].descriptorCount =
+      vv::voxel::kVoxelTypeCount;  // bindless texture array
+  poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+  poolSizes[3].descriptorCount = 1;
 
   VkDescriptorPoolCreateInfo pool{};
   pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2104,7 +2170,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[8] = {};
+  VkWriteDescriptorSet writes[10] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2166,7 +2232,35 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[7].pBufferInfo = &fadeInfo;
 
-  vkUpdateDescriptorSets(m_device, 8, writes, 0, nullptr);
+  // Bindless voxel textures: one image view per VoxelType (binding 8)
+  // plus the shared sampler (binding 9).
+  std::vector<VkDescriptorImageInfo> textureInfos(
+      vv::voxel::kVoxelTypeCount);
+  for (uint32_t type = 0; type < vv::voxel::kVoxelTypeCount; ++type) {
+    textureInfos[type].sampler = VK_NULL_HANDLE;
+    textureInfos[type].imageView = m_voxelResources.voxelTextureView(type);
+    textureInfos[type].imageLayout =
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
+  writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[8].dstSet = m_descriptorSet;
+  writes[8].dstBinding = 8;
+  writes[8].descriptorCount = vv::voxel::kVoxelTypeCount;
+  writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  writes[8].pImageInfo = textureInfos.data();
+
+  VkDescriptorImageInfo samplerInfo{};
+  samplerInfo.sampler = m_voxelResources.voxelSampler();
+  samplerInfo.imageView = VK_NULL_HANDLE;
+  samplerInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[9].dstSet = m_descriptorSet;
+  writes[9].dstBinding = 9;
+  writes[9].descriptorCount = 1;
+  writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  writes[9].pImageInfo = &samplerInfo;
+
+  vkUpdateDescriptorSets(m_device, 10, writes, 0, nullptr);
   return true;
 }
 

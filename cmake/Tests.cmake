@@ -10,6 +10,7 @@ function(vv_add_tests)
         src/terrain/TerrainGenerator.cpp
         src/voxel/Chunk.cpp
         src/voxel/VoxelTypes.cpp
+        src/voxel/VoxelTextures.cpp
         src/voxel/World.cpp
     )
 

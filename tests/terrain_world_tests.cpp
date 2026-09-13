@@ -1,7 +1,7 @@
 // Pure-logic tests for the terrain/world modules. No Qt, no Vulkan: this
 // suite also runs in restricted sandboxes where the game itself cannot.
 //
-// Run via ctest or directly: ./build/bin/voxel_tests
+// Run via ctest or directly: ./build/release/bin/voxel_tests
 
 #include <cmath>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
+#include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
 namespace {
@@ -1675,6 +1676,64 @@ void testSunShadowMarch() {
 }  // namespace
 }  // namespace
 
+
+static void testVoxelTextures() {
+	using vv::voxel::kVoxelTextureSize;
+	using vv::voxel::kVoxelTypeCount;
+
+	const std::size_t texels =
+			static_cast<std::size_t>(kVoxelTextureSize) * kVoxelTextureSize;
+
+	// Determinism: two runs must be byte-identical for every type.
+	bool deterministic = true;
+	// Range + character: grayscale, alpha opaque, in-range detail, and
+	// actual variance for every material (a flat texture would be a
+	// regression in the recipes).
+	bool grayscaleOpaque = true;
+	bool inRange = true;
+	bool variance = true;
+	for (std::uint32_t type = 0; type < kVoxelTypeCount; ++type) {
+		const std::vector<std::uint8_t> a =
+				vv::voxel::generateVoxelTextureRGBA(type);
+		const std::vector<std::uint8_t> b =
+				vv::voxel::generateVoxelTextureRGBA(type);
+		if (a.size() != texels * 4 || a != b) {
+			deterministic = false;
+		}
+		if (type == 0) {
+			continue;  // Air is a never-sampled placeholder.
+		}
+		float lo = 1.0f;
+		float hi = 0.0f;
+		for (std::size_t i = 0; i < texels; ++i) {
+			const std::uint8_t r = a[i * 4 + 0];
+			const std::uint8_t g = a[i * 4 + 1];
+			const std::uint8_t bl = a[i * 4 + 2];
+			const std::uint8_t al = a[i * 4 + 3];
+			if (r != g || g != bl || al != 255) {
+				grayscaleOpaque = false;
+			}
+			const float d = static_cast<float>(r) / 255.0f;
+			lo = d < lo ? d : lo;
+			hi = d > hi ? d : hi;
+			if (d < 0.54f || d > 1.0f) {
+				inRange = false;
+			}
+		}
+		if (hi - lo < 0.05f) {
+			variance = false;  // every material needs visible character
+		}
+		// Tileability: edge texels are free values (lattice wrap), so
+		// just sanity-check the size contract here; the seam test would
+		// need the noise internals.
+	}
+	check(deterministic, "textures: generator is deterministic");
+	check(grayscaleOpaque, "textures: grayscale RGB, opaque alpha");
+	check(inRange, "textures: detail within [0.55, 1.0]");
+	check(variance, "textures: every material has detail variance");
+}
+
+
 int main() {
 	testVertexAO();
 	testNoiseDeterministic();
@@ -1694,6 +1753,7 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testVoxelTextures();
 
 	if (g_failures == 0) {
 		std::printf("all tests passed\n");

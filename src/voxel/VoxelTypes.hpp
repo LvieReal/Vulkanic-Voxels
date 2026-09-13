@@ -9,8 +9,8 @@ namespace vv::voxel {
 // voxel, packed 4-per-uint32 in the chunk atlas). The compute shader maps
 // types to colors through the voxel palette buffer (binding 4), which the
 // renderer fills from kVoxelTypeInfo below, so colors stay data-driven.
-// Placeholder: a bindless texture array with real per-type albedo textures
-// is planned for the texturing pass.
+// Detail textures live in a separate bindless image array (binding 8,
+// VoxelTextures.hpp): grayscale detail multiplied into these albedos.
 enum class VoxelType : std::uint8_t {
 	Air = 0,
 	Grass = 1,

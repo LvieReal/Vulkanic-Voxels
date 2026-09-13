@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -83,6 +84,16 @@ layout(set = 0, binding = 6) readonly buffer FarLod {
 layout(set = 0, binding = 7) readonly buffer ChunkFade {
     float alpha[];
 } chunkFade;
+
+// Bindless per-type voxel detail textures (pass 20): one image per
+// VoxelType - NO atlas. Grayscale detail in [0.55, 1.0], multiplied into
+// the palette albedo at hit time (colors stay data-driven, see
+// kVoxelTypeInfo). Indexed non-uniformly: the type varies per ray. The
+// sampler (binding 9) is REPEAT (world-space UVs tile it per voxel) with
+// trilinear mips; the LOD is explicit because ray divergence makes
+// derivatives useless in a marcher.
+layout(set = 0, binding = 8) uniform texture2D voxelTextures[7];
+layout(set = 0, binding = 9) uniform sampler voxelSampler;
 
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
@@ -475,6 +486,27 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
     vec3 sunDir = normalize(scene.lightDir.xyz);
     float ndl = max(dot(n, sunDir), 0.0);
     vec3 base = voxelColor(sType, sNormal);
+
+    // Detail texture (near hits only - the far LOD keeps the flat
+    // palette color, which is what the mip chain averages to anyway).
+    if (!sFarHit) {
+        // World-space UV on the hit face: the two axes tangent to it.
+        // REPEAT addressing tiles the texture per voxel (1 uv unit).
+        const vec2 uv = abs(sNormal.y) > 0.5
+            ? hitPos.xz
+            : (abs(sNormal.x) > 0.5 ? hitPos.zy : hitPos.xy);
+        // Explicit LOD from the texel footprint: texels per pixel =
+        // texRes * worldUnitsPerPixel, worldUnitsPerPixel at distance d
+        // = d * 2 * tanHalfFov / screenHeight.
+        const float texelsPerPixel =
+            32.0 * (sTEntryOffset + sTHit) * 2.0 * pc.camera.x /
+            float(pc.screen.y);
+        const float lod = log2(max(texelsPerPixel, 1.0));
+        const float detail = textureLod(
+            sampler2D(voxelTextures[nonuniformEXT(sType)], voxelSampler),
+            uv, lod).r;
+        base *= detail;
+    }
 
     // Per-vertex simulated AO on the hit face (from the owner's WGSL
     // reference): darkens creases and corners. Far-LOD hits skip AO

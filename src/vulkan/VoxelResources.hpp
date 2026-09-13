@@ -48,6 +48,14 @@ class VoxelResources final {
 	bool create(VkDevice device, VkPhysicalDevice physicalDevice,
 							const vv::voxel::VoxelConfig& config, std::string& outError);
 
+	// Bindless per-type voxel detail textures (bindings 8/9): one
+	// mip-mapped RGBA8 image per VoxelType (no atlas), generated
+	// deterministically on the CPU (vv::voxel::generateVoxelTextureRGBA),
+	// uploaded + mip-chained with one one-time submit. Idempotent.
+	bool createVoxelTextures(VkDevice device, VkPhysicalDevice physicalDevice,
+													 VkCommandPool commandPool, VkQueue queue,
+													 std::string& outError);
+
 	// Batch-uploads chunk data into their slots (single staging buffer + one
 	// one-time submit; waits for the queue so in-flight frames never read a
 	// half-uploaded atlas). Synchronous - used for the initial region and
@@ -125,6 +133,17 @@ class VoxelResources final {
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
 	VkBuffer fadeBuffer() const { return m_fadeBuffer; }
+
+	// Bindless texture array (one image per VoxelType, see
+	// createVoxelTextures). Empty until created.
+	std::uint32_t voxelTextureCount() const {
+		return static_cast<std::uint32_t>(m_voxelTextureViews.size());
+	}
+	VkImageView voxelTextureView(std::uint32_t type) const {
+		return type < m_voxelTextureViews.size() ? m_voxelTextureViews[type]
+																					 : VK_NULL_HANDLE;
+	}
+	VkSampler voxelSampler() const { return m_voxelSampler; }
 	VkBuffer farBuffer() const { return m_farBuffer; }
 	VkBuffer paletteBuffer() const { return m_paletteBuffer; }
 
@@ -150,6 +169,13 @@ class VoxelResources final {
 	VkBuffer m_fadeBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_fadeMemory = VK_NULL_HANDLE;
 	void* m_mappedFade = nullptr;
+
+	// Bindless voxel textures (see createVoxelTextures): one image per
+	// VoxelType plus a shared REPEAT/linear/mip sampler.
+	std::vector<VkImage> m_voxelTextureImages;
+	std::vector<VkDeviceMemory> m_voxelTextureMemory;
+	std::vector<VkImageView> m_voxelTextureViews;
+	VkSampler m_voxelSampler = VK_NULL_HANDLE;
 
 	VkBuffer m_farBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;

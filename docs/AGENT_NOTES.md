@@ -80,40 +80,39 @@ QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH=/tmp/deps/qt6/lib:/tmp/deps/prefix/lib
 # CPU tests without the toolchain:
 g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
     src/terrain/{Noise,Noise3D,TerrainGenerator,FarField}.cpp \
-    src/voxel/{Chunk,VoxelTypes,World}.cpp -o /tmp/t && /tmp/t
+    src/voxel/{Chunk,VoxelTypes,VoxelTextures,World}.cpp -o /tmp/t && /tmp/t
 ```
 
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 19)
+## Current status (pass 20)
 
-Owner-verified pass 18: much faster; Release better; asks for (1)
-build-path updates (build/release/bin/game.exe) and (2) smooth chunk
-fade-in + something for "LOD chunks appear before near chunks".
+Owner-verified pass 19 (fade-in works, no adjustments). Pass 20 asks:
+fix two run scripts still on build/bin/, add voxel TEXTURES via
+BINDLESS textures (no atlas), and traversal-optimization TIPS only (no
+optimization work this pass).
 
 Delivered:
-- Chunk fade-in with TRUE compositing: per-slot fade alphas (binding 7,
-  mapped, rewritten each frame; 0.6 s). When a ray hits a fading chunk
-  the march records it as the FRONT layer, skips past that chunk's XZ
-  box (DDA crossing times re-initialized; steps/deltas unchanged) and
-  keeps tracing - so the chunk blends against whatever is really behind
-  it: the far-LOD preview of the same terrain, another chunk, or sky.
-  One layer per ray; later fading hits shade normally. The shading tail
-  was extracted into shadeSurfaceHit() (shared by base + front layers).
-  The no-fade path (alpha = 1) is byte-identical to the old march -
-  parity tests unaffected.
-- Far-field FIRST activation fades in over 1.5 s (scene.misc.z);
-  recenters do NOT fade (window-shift cells are bit-identical - no
-  flicker). This plus near-fades makes the far LOD read as a preview
-  that detail materializes over, instead of two competing pops.
-- Fade starts: pump installs, rebuildChunkRegion uploads (teleport
-  regions fade too); slot releases reset to opaque so lingering
-  in-flight references never see a stale fade. Draw-frame barrier #4
-  (HOST_WRITE -> SHADER_READ) publishes the mapped alphas.
-- Paths: README / toolchain script / these notes now use
-  build/release/bin/game(.exe); sandbox reconfigured to build/release +
-  build/debug to match tasks.json.
+- run.bat / run.sh (repo root) + a stale tests comment now use
+  build/release/bin/game(.exe).
+- Bindless per-type detail textures: one 32x32 mip-chained RGBA8 image
+  per VoxelType (binding 8, sampled-image array indexed
+  nonuniformEXT(type); shared REPEAT/trilinear sampler at binding 9; NO
+  atlas). Images are generated deterministically on the CPU
+  (src/voxel/VoxelTextures.{hpp,cpp}: tileable lattice noise, grayscale
+  detail in [0.55, 1.0], per-type recipes; unit tested), uploaded and
+  mip-blitted in one one-time submit (VoxelResources::
+  createVoxelTextures). Shader multiplies the detail into the palette
+  albedo (colors stay data-driven) with world-space face UVs (tile per
+  voxel) and an EXPLICIT LOD: texelsPerPixel = 32 * dist * 2 *
+  tanHalfFov / screenH (derivatives are useless under ray divergence).
+  Far-LOD hits keep flat palette colors. Device creation now requires +
+  verifies Vulkan 1.2 descriptor indexing (clear error if absent) and
+  enables shaderSampledImageArrayDynamicIndexing +
+  shaderSampledImageArrayNonUniformIndexing.
+- Bindings: 8 = texture2D array (kVoxelTypeCount), 9 = sampler; pool
+  has SAMPLED_IMAGE/SAMPLER sizes; writes 10 total.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

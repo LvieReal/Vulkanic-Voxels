@@ -1,10 +1,13 @@
 #include "vulkan/VoxelResources.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "vulkan/BufferUtils.hpp"
 #include "vulkan/VulkanUtils.hpp"
+#include "voxel/VoxelTextures.hpp"
+#include "voxel/VoxelTypes.hpp"
 
 namespace vv::vulkan {
 
@@ -164,6 +167,313 @@ bool VoxelResources::createPalette(VkDevice device,
 	}
 	std::memcpy(mapped, palette.data(), palette.size() * sizeof(float));
 	vkUnmapMemory(device, m_paletteMemory);
+	return true;
+}
+
+bool VoxelResources::createVoxelTextures(VkDevice device,
+																				 VkPhysicalDevice physicalDevice,
+																				 VkCommandPool commandPool, VkQueue queue,
+																				 std::string& outError) {
+	if (!m_voxelTextureImages.empty()) {
+		return true;  // idempotent
+	}
+
+	const std::uint32_t count = vv::voxel::kVoxelTypeCount;
+	const std::uint32_t size = vv::voxel::kVoxelTextureSize;
+	// 32 -> 16 -> ... -> 1
+	const std::uint32_t mips =
+			static_cast<std::uint32_t>(std::log2(static_cast<float>(size))) + 1u;
+
+	std::vector<VkImage> images(count, VK_NULL_HANDLE);
+	std::vector<VkDeviceMemory> memory(count, VK_NULL_HANDLE);
+	std::vector<VkImageView> views(count, VK_NULL_HANDLE);
+	VkSampler sampler = VK_NULL_HANDLE;
+	auto destroyAll = [&]() {
+		for (VkImageView v : views) {
+			if (v != VK_NULL_HANDLE) {
+				vkDestroyImageView(device, v, nullptr);
+			}
+		}
+		for (VkImage i : images) {
+			if (i != VK_NULL_HANDLE) {
+				vkDestroyImage(device, i, nullptr);
+			}
+		}
+		for (VkDeviceMemory m : memory) {
+			if (m != VK_NULL_HANDLE) {
+				vkFreeMemory(device, m, nullptr);
+			}
+		}
+		if (sampler != VK_NULL_HANDLE) {
+			vkDestroySampler(device, sampler, nullptr);
+		}
+	};
+
+	// Staging: every type's level-0 data in one host-visible buffer.
+	const std::size_t texelBytes =
+			static_cast<std::size_t>(size) * size * 4u;
+	std::vector<std::uint8_t> texels;
+	texels.reserve(static_cast<std::size_t>(count) * texelBytes);
+	for (std::uint32_t type = 0; type < count; ++type) {
+		std::vector<std::uint8_t> rgba = vv::voxel::generateVoxelTextureRGBA(type);
+		texels.insert(texels.end(), rgba.begin(), rgba.end());
+	}
+
+	VkBuffer stagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	if (!utils::createBuffer(device, physicalDevice,
+													 static_cast<VkDeviceSize>(texels.size()),
+													 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+													 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+															 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+													 stagingBuffer, stagingMemory, outError)) {
+		return false;
+	}
+	void* mapped = nullptr;
+	VkResult r = vkMapMemory(device, stagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+	if (r != VK_SUCCESS || mapped == nullptr) {
+		outError = "Failed to map voxel texture staging memory.";
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+	std::memcpy(mapped, texels.data(), texels.size());
+	vkUnmapMemory(device, stagingMemory);
+
+	// Images (device-local, all mips allocated up front).
+	for (std::uint32_t type = 0; type < count; ++type) {
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		imageInfo.extent = {size, size, 1};
+		imageInfo.mipLevels = mips;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+											VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+											VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		r = vkCreateImage(device, &imageInfo, nullptr, &images[type]);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to create voxel texture image (" +
+								 utils::vkResultToString(r) + ").";
+			destroyAll();
+			vkDestroyBuffer(device, stagingBuffer, nullptr);
+			vkFreeMemory(device, stagingMemory, nullptr);
+			return false;
+		}
+		VkMemoryRequirements req{};
+		vkGetImageMemoryRequirements(device, images[type], &req);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = req.size;
+		allocInfo.memoryTypeIndex = utils::findMemoryTypeIndex(
+				physicalDevice, req.memoryTypeBits,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		r = vkAllocateMemory(device, &allocInfo, nullptr, &memory[type]);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to allocate voxel texture memory.";
+			destroyAll();
+			vkDestroyBuffer(device, stagingBuffer, nullptr);
+			vkFreeMemory(device, stagingMemory, nullptr);
+			return false;
+		}
+		vkBindImageMemory(device, images[type], memory[type], 0);
+	}
+
+	// One command buffer: upload level 0, blit the mip chain, transition
+	// to shader-read (one-time submit + wait, like the initial uploads).
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkCommandBufferAllocateInfo alloc{};
+	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	alloc.commandPool = commandPool;
+	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc.commandBufferCount = 1;
+	r = vkAllocateCommandBuffers(device, &alloc, &cmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to allocate voxel texture command buffer.";
+		destroyAll();
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+		outError = "Failed to begin voxel texture command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		destroyAll();
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+
+	auto imageBarrier = [&](std::uint32_t image, std::uint32_t baseMip,
+													std::uint32_t mipCount,
+													VkImageLayout oldLayout,
+													VkImageLayout newLayout,
+													VkAccessFlags srcAccess,
+													VkAccessFlags dstAccess) {
+		VkImageMemoryBarrier b{};
+		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		b.srcAccessMask = srcAccess;
+		b.dstAccessMask = dstAccess;
+		b.oldLayout = oldLayout;
+		b.newLayout = newLayout;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image = images[image];
+		b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		b.subresourceRange.baseMipLevel = baseMip;
+		b.subresourceRange.levelCount = mipCount;
+		b.subresourceRange.baseArrayLayer = 0;
+		b.subresourceRange.layerCount = 1;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+												 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+												 nullptr, 1, &b);
+	};
+
+	for (std::uint32_t type = 0; type < count; ++type) {
+		imageBarrier(type, 0, mips, VK_IMAGE_LAYOUT_UNDEFINED,
+								 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+								 VK_ACCESS_TRANSFER_WRITE_BIT);
+
+		VkBufferImageCopy region{};
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.mipLevel = 0;
+		region.imageSubresource.baseArrayLayer = 0;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent = {size, size, 1};
+		region.bufferOffset =
+				static_cast<VkDeviceSize>(type) * texelBytes;
+		vkCmdCopyBufferToImage(cmd, stagingBuffer, images[type],
+													 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+		// Blit chain: each mip is downsampled from the one above it.
+		for (std::uint32_t m = 1; m < mips; ++m) {
+			imageBarrier(type, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+									 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+									 VK_ACCESS_TRANSFER_WRITE_BIT,
+									 VK_ACCESS_TRANSFER_READ_BIT);
+			VkImageBlit blit{};
+			blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.srcSubresource.mipLevel = m - 1;
+			blit.srcSubresource.baseArrayLayer = 0;
+			blit.srcSubresource.layerCount = 1;
+			blit.srcOffsets[0] = {0, 0, 0};
+			blit.srcOffsets[1] = {static_cast<std::int32_t>(size >> (m - 1)),
+														static_cast<std::int32_t>(size >> (m - 1)), 1};
+			blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.dstSubresource.mipLevel = m;
+			blit.dstSubresource.baseArrayLayer = 0;
+			blit.dstSubresource.layerCount = 1;
+			blit.dstOffsets[0] = {0, 0, 0};
+			blit.dstOffsets[1] = {static_cast<std::int32_t>(size >> m),
+														static_cast<std::int32_t>(size >> m), 1};
+			vkCmdBlitImage(cmd, images[type],
+										 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[type],
+										 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+										 VK_FILTER_LINEAR);
+		}
+
+		// Final transition: mips 0..mips-2 come back from TRANSFER_SRC, the
+		// deepest one from TRANSFER_DST.
+		VkImageMemoryBarrier b[2]{};
+		b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		b[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b[0].image = images[type];
+		b[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		b[0].subresourceRange.baseMipLevel = 0;
+		b[0].subresourceRange.levelCount = mips - 1;
+		b[0].subresourceRange.baseArrayLayer = 0;
+		b[0].subresourceRange.layerCount = 1;
+		b[1] = b[0];
+		b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		b[1].subresourceRange.baseMipLevel = mips - 1;
+		b[1].subresourceRange.levelCount = 1;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+												 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+												 0, nullptr, 2, b);
+	}
+
+	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		outError = "Failed to end voxel texture command buffer.";
+		vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+		destroyAll();
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+		vkFreeMemory(device, stagingMemory, nullptr);
+		return false;
+	}
+
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &cmd;
+	r = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+	if (r == VK_SUCCESS && vkQueueWaitIdle(queue) != VK_SUCCESS) {
+		r = VK_ERROR_DEVICE_LOST;
+	}
+	vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+	vkDestroyBuffer(device, stagingBuffer, nullptr);
+	vkFreeMemory(device, stagingMemory, nullptr);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit voxel texture uploads.";
+		destroyAll();
+		return false;
+	}
+
+	// Views + one shared sampler (REPEAT tiling per voxel, linear
+	// filtering + trilinear mips; the shader passes an explicit LOD -
+	// ray divergence makes derivatives useless in a marcher).
+	for (std::uint32_t type = 0; type < count; ++type) {
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = images[type];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.baseMipLevel = 0;
+		viewInfo.subresourceRange.levelCount = mips;
+		viewInfo.subresourceRange.baseArrayLayer = 0;
+		viewInfo.subresourceRange.layerCount = 1;
+		r = vkCreateImageView(device, &viewInfo, nullptr, &views[type]);
+		if (r != VK_SUCCESS) {
+			outError = "Failed to create voxel texture view.";
+			destroyAll();
+			return false;
+		}
+	}
+
+	VkSamplerCreateInfo samplerInfo{};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_LINEAR;
+	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.minLod = 0.0f;
+	samplerInfo.maxLod = static_cast<float>(mips - 1);
+	r = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to create voxel texture sampler.";
+		destroyAll();
+		return false;
+	}
+
+	m_voxelTextureImages = std::move(images);
+	m_voxelTextureMemory = std::move(memory);
+	m_voxelTextureViews = std::move(views);
+	m_voxelSampler = sampler;
 	return true;
 }
 
@@ -750,6 +1060,28 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_fadeMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_fadeMemory, nullptr);
 		m_fadeMemory = VK_NULL_HANDLE;
+	}
+	for (VkImageView v : m_voxelTextureViews) {
+		if (v != VK_NULL_HANDLE) {
+			vkDestroyImageView(device, v, nullptr);
+		}
+	}
+	m_voxelTextureViews.clear();
+	for (VkImage i : m_voxelTextureImages) {
+		if (i != VK_NULL_HANDLE) {
+			vkDestroyImage(device, i, nullptr);
+		}
+	}
+	m_voxelTextureImages.clear();
+	for (VkDeviceMemory m : m_voxelTextureMemory) {
+		if (m != VK_NULL_HANDLE) {
+			vkFreeMemory(device, m, nullptr);
+		}
+	}
+	m_voxelTextureMemory.clear();
+	if (m_voxelSampler != VK_NULL_HANDLE) {
+		vkDestroySampler(device, m_voxelSampler, nullptr);
+		m_voxelSampler = VK_NULL_HANDLE;
 	}
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_farFence[k] != VK_NULL_HANDLE) {
