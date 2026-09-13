@@ -335,6 +335,7 @@ class VulkanRenderer final {
   vv::terrain::SunLightGrid m_sunGrid;
   std::unique_ptr<SunGridVoxels> m_sunVoxels;
   bool m_sunGridWanted = true;     // VV_SUN_GRID=0 requested it off
+  bool m_sunDebugField = false;    // VV_SUN_DEBUG: raw field view
   bool m_sunGridEnabled = false;   // resource failure: off (march fallback)
   bool m_sunGridReady = false;     // first field published (shader gate)
   bool m_sunUploadPending = false; // publish finished; record GPU copy

@@ -92,43 +92,44 @@ Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
 excluded from workspace snapshots — EVERY sandbox restart needs the
 rebuild + reconfigure of build/release and build/debug.
 
-## Current status (pass 26.2 — second fix round)
+## Current status (pass 26.3 — diagnostics + sampling proof)
 
-Owner reports on 26.1: Release+grid ON = immediate crash, no message;
-Release+grid OFF = no crash; Debug+grid ON = runs, "everything is
-shadowed still", "ray traced shadows remain, they should get disabled",
-shadows "projected sideways, laying on top of voxels".
+Owner report on 26.2: "no logs in release, just immediate crash" and
+"the shadows are quite literally still laying sideways - it's most
+likely the sampling in the shader itself".
 
-FIXED this round (both feed those symptoms):
-- Pre-existing pass-13 bug: m_streamActive was NEVER cleared on a normal
-  stream completion (only the teleport fallback cleared it), so
-  finishRegionMove() ran EVERY FRAME at rest - and with the pass-26 hook
-  that meant requestRebuild() every frame = a permanent light-grid
-  rebuild loop (3 ms/frame CPU forever). Now cleared in finishRegionMove.
-- The first light cycle RACED the async chunk streaming: it prepassed
-  columns while chunks were still installing, so late chunks were baked
-  as far-umbra virtual columns -> the first published field had huge
-  dark shapes draped over the terrain ("everything shadowed, sideways,
-  laying on top of voxels"). tickSunGrid now HOLDS new cycles while
-  m_streamActive (initial load + crossings); a running cycle still
-  finishes (coherent for its origin), install-triggered rebuild flags
-  accumulate, and until the first publish the shader keeps the exact
-  march (the "ray traced shadows" the owner saw ARE the pre-publish
-  fallback - they get replaced the moment a field publishes; in a -O0
-  Debug build the first publish takes MINUTES, so Debug always showed
-  the march).
-- Expected timeline in Release now: ~2-4 s region stream -> light build
-  ~3.2 s sliced -> first soft field at ~6-8 s.
+Both taken at face value; findings:
+- NO LOGS EXPLAINED: GameTarget.cmake links the Windows Release build
+  with -mwindows (GUI subsystem) - stderr is detached from any console,
+  so every fprintf(stderr) breadcrumb was invisible. Fixed with durable
+  telemetry: src/platform/CrashLog.{hpp,cpp} - crumbs append to
+  <exe dir>/vv-crash.log (truncated per run), a Win32
+  SetUnhandledExceptionFilter writes the exception code + address, and
+  main.cpp installs it first thing. Renderer crumbs: init steps, sun
+  grid init steps, cycle complete, publish recorded, frame heartbeats
+  (every 64 frames up to 1024, with the sun phase).
+- SAMPLING PROVEN (the demanded test): a bit-exact CPU emulation of the
+  whole GPU path - staging layout, vkCmdCopyBufferToImage semantics
+  into the ping-pong 3D texture, the shader's UVW math and trilinear
+  fetch, ported verbatim - now runs in testSunLightGrid: every fixture
+  air cell at its center samples EXACTLY its own field cell (117k
+  cells), interpolation midpoints average the correct world-axis
+  neighbors (343k checks - the 'sideways' detector), ping-pong half
+  selection and clamp-to-edge verified. The shader source as written
+  cannot produce axis-swapped sampling.
+- VV_SUN_DEBUG=1: shades surfaces by the RAW field (white = lit,
+  black = umbra) via a negative scene.misc.w (sign-encoded, still
+  constant = race-free). Visual ground truth for orientation.
+- Reminder: the owner's 'sideways' report was on 26.1, whose first
+  field was garbage (built mid-stream - fixed in 26.2, NOT yet tested
+  by the owner). Expected Release timeline now: ~2-4 s region stream
+  (exact march shadows until then), then the first soft field at
+  ~6-8 s.
 
-STILL OPEN: the Release-only immediate crash (grid on). Not reproduced
-in the sandbox (module+adapter ASAN/UBSAN-clean at renderer scale; the
-offscreen smoke run has no Vulkan device, so the publish/copy path is
-NOT exercised there either - Debug "works" possibly only because -O0
-never reaches the first publish). Breadcrumbs in place:
-"[vulkan] sun grid: resources created" (init) and
-"[vulkan] sun grid: first field published" (first copy). NEEDED from
-the owner: the Release console output (last [vulkan] lines before the
-crash) - the two lines above bracket init vs publish as the crash site.
+NEEDED from the owner after a Release crash: build/release/bin/
+vv-crash.log (or next to the exe wherever it is installed) - it holds
+the crumb trail + the exception record. Plus a VV_SUN_DEBUG=1 run to
+eyeball the field orientation.
 
 Workspace note: sandbox restarts can return a FRESH CLONE at the base
 commit with the working tree preserved (happened twice: before pass 24

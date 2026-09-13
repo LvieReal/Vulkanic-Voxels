@@ -522,7 +522,13 @@ float sunShadow(vec3 hitPosVox, vec3 n)
         const float dist01 =
             textureLod(sampler3D(sunField, sunSampler), uvw, 0.0).r;
         const float d = dist01 * 255.0;
-        return clamp(1.0 - d / scene.misc.w, 0.0, 1.0);
+        if (scene.misc.w < 0.0) {
+            // VV_SUN_DEBUG: the RAW field (white = lit, black = umbra,
+            // gradient = bleed direction) - makes the field orientation
+            // directly visible against the terrain.
+            return clamp(1.0 - d / 255.0, 0.0, 1.0);
+        }
+        return clamp(1.0 - d / abs(scene.misc.w), 0.0, 1.0);
     }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }

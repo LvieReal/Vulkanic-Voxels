@@ -2338,6 +2338,227 @@ void testSunLightGrid() {
 		drainGrid(g2, 1e9);
 		check(parityAt("moved-window parity") == 0,
 		      "light grid: moved-window parity (no stale band state)");
+
+		// --- GPU sampling-path emulation (bit-exact) ---
+		// The owner's "shadows laying sideways - it's the sampling in
+		// the shader" report demanded this: emulate EXACTLY what the GPU
+		// does - the renderer's staging layout, the vkCmdCopyBufferToImage
+		// into the ping-pong 3D texture, the shader's UVW math and the
+		// trilinear fetch - and prove each world position samples the
+		// field cell it claims to. field2 currently holds the build for
+		// origin (ox, oz).
+		{
+			const int W2 = C2, H2 = H, DIMZ = 2 * H2;
+			// The "3D texture": x + row*W2 + depth*W2*W2 (the copy's
+			// tight row/layer pitch), two halves along depth.
+			std::vector<std::uint8_t> img(std::size_t(W2) * W2 * DIMZ,
+			                              0xAB);
+			// Emulate the renderer's copy of the finished field into
+			// HALF 0 (offset z = 0, extent (W2, W2, H2)): staging texel
+			// (x, row, y) -> img(x + row*W2 + y*W2*W2). (Half 1 = 0xFF
+			// for the half-selection check below.)
+			for (int y = 0; y < H2; ++y) {
+				for (int row = 0; row < W2; ++row) {
+					for (int x = 0; x < W2; ++x) {
+						img[std::size_t(x) +
+						    std::size_t(row) * W2 +
+						    std::size_t(y) * W2 * W2] =
+						    field2[std::size_t(x) +
+						           std::size_t(row) * W2 +
+						           std::size_t(y) * W2 * W2];
+					}
+				}
+			}
+			for (int y = 0; y < H2; ++y) {
+				for (int row = 0; row < W2; ++row) {
+					for (int x = 0; x < W2; ++x) {
+						img[std::size_t(x) +
+						    std::size_t(row) * W2 +
+						    std::size_t(H2 + y) * W2 * W2] =
+						    0xFF;
+					}
+				}
+			}
+
+			const double miscW = 112.0;  // 8 * bleed budget 14
+			const auto ramp = [&](double d) {
+				return std::max(0.0, 1.0 - d * 0.125 / 14.0);
+			};
+			// The shader's fetch, ported VERBATIM from sunShadow()
+			// (enabled branch): push constants voxelSize.w = ox,
+			// region.y = oz, farParams.z = half, chunkSize.y = H2,
+			// kSunFieldXZ = W2; trilinear with clamp-to-edge.
+			const auto fetchLight = [&](double px, double py, double pz,
+			                            int halfSel) {
+				double u = (px - ox) * (1.0 / double(W2));
+				double v = (pz - oz) * (1.0 / double(W2));
+				double w =
+				    halfSel * 0.5 + py * (0.5 / double(H2));
+				const auto tap = [&](int tx, int tr, int td) {
+					return double(img[std::size_t(tx) +
+					                  std::size_t(tr) * W2 +
+					                  std::size_t(td) * W2 * W2]);
+				};
+				const auto axis = [&](double t, int dim, int& lo,
+				                      int& hi, double& f) {
+					const double tc = t * dim - 0.5;
+					const double fl = std::floor(tc);
+					lo = std::clamp(int(fl), 0, dim - 1);
+					hi = std::clamp(int(fl) + 1, 0, dim - 1);
+					f = tc - fl;
+				};
+				int x0, x1, r0, r1, d0, d1;
+				double fx, fr, fd;
+				axis(u, W2, x0, x1, fx);
+				axis(v, W2, r0, r1, fr);
+				axis(w, DIMZ, d0, d1, fd);
+				const double c00 =
+				    tap(x0, r0, d0) * (1 - fx) +
+				    tap(x1, r0, d0) * fx;
+				const double c10 =
+				    tap(x0, r1, d0) * (1 - fx) +
+				    tap(x1, r1, d0) * fx;
+				const double c01 =
+				    tap(x0, r0, d1) * (1 - fx) +
+				    tap(x1, r0, d1) * fx;
+				const double c11 =
+				    tap(x0, r1, d1) * (1 - fx) +
+				    tap(x1, r1, d1) * fx;
+				const double d =
+				    (c00 * (1 - fr) + c10 * fr) * (1 - fd) +
+				    (c01 * (1 - fr) + c11 * fr) * fd;
+				return std::clamp(1.0 - d / miscW, 0.0, 1.0);
+			};
+			const auto fieldAt = [&](int x, int y, int z) {
+				return double(field2[std::size_t(x - ox) +
+				                     std::size_t(z - oz) * C2 +
+				                     std::size_t(y) * C2 * R2]);
+			};
+
+			// (a) Every fixture air cell at its CENTER must sample
+			// exactly its own field cell (validates window origin,
+			// axes, half offset and texel-center alignment at once).
+			long long bad = 0, n = 0;
+			for (int z = 0; z < R; ++z) {
+				for (int x = 0; x < C; ++x) {
+					for (int y = 0; y < H; ++y) {
+						if (w.near.at(x, y, z) != 0) {
+							continue;
+						}
+						++n;
+						const double got =
+						    fetchLight(x + 0.5, y + 0.5,
+						               z + 0.5, 0);
+						const double want =
+						    ramp(fieldAt(x, y, z));
+						if (std::fabs(got - want) >
+						    1e-9) {
+							if (++bad <= 3) {
+								std::printf(
+								    "FAIL "
+								    "sample "
+								    "(%d,%d,%d):"
+								    " got %.4f "
+								    "want %.4f"
+								    "\n",
+								    x, y, z,
+								    got, want);
+							}
+						}
+					}
+				}
+			}
+			check(bad == 0, "light grid: GPU sampling maps world "
+			                "cells to their field cells");
+			std::printf("light grid: sampling parity on %lld cells "
+			            "(axes/origin/half/alignment)\n",
+			            n);
+
+			// (b) THE SIDEWAYS DETECTOR: interpolation between cells
+			// must run along the SAME world axis as the offset - a
+			// swapped axis in the shader mapping would average the
+			// wrong neighbors.
+			long long badAxis = 0, nAxis = 0;
+			for (int z = 0; z < R; ++z) {
+				for (int x = 0; x < C; ++x) {
+					for (int y = 0; y < H; ++y) {
+						if (w.near.at(x, y, z) != 0) {
+							continue;
+						}
+						if (x + 1 < C) {
+							++nAxis;
+							const double got =
+							    fetchLight(x + 1.0,
+							               y + 0.5,
+							               z + 0.5, 0);
+							const double want = ramp(
+							    (fieldAt(x, y, z) +
+							     fieldAt(x + 1, y,
+							             z)) *
+							    0.5);
+							if (std::fabs(got -
+							              want) >
+							    1e-9) {
+								++badAxis;
+							}
+						}
+						if (z + 1 < R) {
+							++nAxis;
+							const double got =
+							    fetchLight(x + 0.5,
+							               y + 0.5,
+							               z + 1.0, 0);
+							const double want = ramp(
+							    (fieldAt(x, y, z) +
+							     fieldAt(x, y,
+							             z + 1)) *
+							    0.5);
+							if (std::fabs(got -
+							              want) >
+							    1e-9) {
+								++badAxis;
+							}
+						}
+						if (y + 1 < H) {
+							++nAxis;
+							const double got =
+							    fetchLight(x + 0.5,
+							               y + 1.0,
+							               z + 0.5, 0);
+							const double want = ramp(
+							    (fieldAt(x, y, z) +
+							     fieldAt(x, y + 1,
+							             z)) *
+							    0.5);
+							if (std::fabs(got -
+							              want) >
+							    1e-9) {
+								++badAxis;
+							}
+						}
+					}
+				}
+			}
+			check(badAxis == 0,
+			      "light grid: trilinear interpolation runs along "
+			      "the correct world axes");
+			std::printf("light grid: axis checks on %lld midpoints\n",
+			            nAxis);
+
+			// (c) Half selection: farParams.z = 1 must read the
+			// second half (all 0xFF -> fully dark).
+			check(std::fabs(fetchLight(10.5, 20.5, 10.5, 1)) <
+			          1e-9,
+			      "light grid: ping-pong half selection");
+
+			// (d) Clamp-to-edge: sampling before the window's low-X
+			// edge returns the EDGE column's value (what the user
+			// saw pre-26.1 as a repeated band).
+			check(std::fabs(fetchLight(ox - 2.7, 20.5, 10.5, 0) -
+			                fetchLight(ox + 0.5, 20.5, 10.5, 0)) <
+			          1e-9,
+			      "light grid: window edge clamps (no wrap)");
+		}
 	}
 }
 

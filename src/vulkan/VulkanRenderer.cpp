@@ -12,6 +12,7 @@
 
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
+#include "platform/CrashLog.hpp"
 #include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
 #include "render/VoxelTextureFiles.hpp"
@@ -135,6 +136,15 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
       m_sunBuildBudgetMs = ms;
     }
   }
+  // VV_SUN_DEBUG: shade surfaces by the RAW light field (white = lit,
+  // black = umbra) instead of the shadow ramp - makes the field's
+  // orientation directly visible (pass 26.2).
+  m_sunDebugField = std::getenv("VV_SUN_DEBUG") != nullptr;
+  if (m_sunDebugField) {
+    std::fprintf(stderr, "[vulkan] VV_SUN_DEBUG: raw light-field view\n");
+  }
+  vv::platform::crashLogCrumb("init: starting (release console logs are "
+                              "detached: -mwindows; trail lives here)");
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
       !pickPhysicalDevice(outError) || !createDevice(outError) ||
       !createCommandPool(outError) || !createVoxelWorldAndUpload(outError) ||
@@ -204,14 +214,17 @@ void VulkanRenderer::drawFrame() {
   }
   // sceneFlags.z lands in scene.misc.w = the light-field ramp divisor
   // (8 x bleed budget; pass 26) - constant in practice, so the shared-UBO
-  // in-flight window can never observe a change.
-  m_sceneUniform.update(
-      m_camera, m_timeSeconds, m_lighting,
-      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
-                m_sunGridEnabled
-                    ? static_cast<float>(8u * kSunFillBudgetVoxels)
-                    : 0.0f,
-                0.0f));
+  // in-flight window can never observe a change. NEGATIVE = VV_SUN_DEBUG
+  // (the shader then shows the raw field instead of the ramp; the
+  // divisor is |misc.w|).
+  const float sunRamp =
+      m_sunGridEnabled ? static_cast<float>(8u * kSunFillBudgetVoxels)
+                       : 0.0f;
+  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
+                        glm::vec4(m_debugTerminators ? 1.0f : 0.0f,
+                                  farFade,
+                                  m_sunDebugField ? -sunRamp : sunRamp,
+                                  0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -304,6 +317,14 @@ void VulkanRenderer::drawFrame() {
     m_perfFarMs = 0.0;
     m_perfSunMs = 0.0;
     m_perfGpuMs = 0.0;
+  }
+  // Early-run heartbeat: pins "crashed at frame N, sun phase X" for the
+  // open Release-only crash (the release exe has no console).
+  if (m_frameCounter < 1024u && (m_frameCounter & 63u) == 0u) {
+    char crumb[96];
+    std::snprintf(crumb, sizeof(crumb), "frame %u, sun grid %s",
+                  m_frameCounter, m_sunGrid.phaseName());
+    vv::platform::crashLogCrumb(crumb);
   }
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
   ++m_frameCounter;
@@ -1254,6 +1275,7 @@ class VulkanRenderer::SunGridVoxels final
 bool VulkanRenderer::createSunGridResources() {
   if (!m_sunGridWanted) {
     std::fprintf(stderr, "[vulkan] sun grid disabled (VV_SUN_GRID=0)\n");
+    vv::platform::crashLogCrumb("sungrid: disabled (VV_SUN_GRID=0)");
     return true;  // explicitly disabled: march fallback
   }
   if (m_holeDebugX != kHoleDebugOff) {
@@ -1289,6 +1311,7 @@ bool VulkanRenderer::createSunGridResources() {
   // Persistently mapped staging buffer = the grid's publish target
   // (SunLightGrid::configure's fieldStorage; the publish phase memcpys
   // the finished field into it slice by slice).
+  vv::platform::crashLogCrumb("sungrid: init begin");
   VkBufferCreateInfo stagingInfo{};
   stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   stagingInfo.size = fieldBytes;
@@ -1326,6 +1349,7 @@ bool VulkanRenderer::createSunGridResources() {
   }
   std::memset(m_sunStagingMapped, 0, static_cast<std::size_t>(fieldBytes));
 
+  vv::platform::crashLogCrumb("sungrid: staging ok");
   // 3D texture: two ping-pong fields stacked along depth. GENERAL layout
   // for its whole lifetime (transfers + sampling without layout churn).
   VkImageCreateInfo imageInfo{};
@@ -1370,6 +1394,7 @@ bool VulkanRenderer::createSunGridResources() {
     return bail("3D image memory bind failed");
   }
 
+  vv::platform::crashLogCrumb("sungrid: image ok");
   VkImageViewCreateInfo viewInfo{};
   viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   viewInfo.image = m_sunImage;
@@ -1451,6 +1476,7 @@ bool VulkanRenderer::createSunGridResources() {
                kSunGridXZ, kSunGridXZ, m_voxelConfig.worldHeight,
                double(fieldBytes) / (1024.0 * 1024.0));
 
+  vv::platform::crashLogCrumb("sungrid: view+sampler+layout ok");
   m_sunVoxels = std::make_unique<SunGridVoxels>(this);
   const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
   m_sunDir[0] = sun.x;
@@ -1466,6 +1492,7 @@ bool VulkanRenderer::createSunGridResources() {
                "budget %u voxels, %.1f ms/frame build slice\n",
                kSunGridXZ, kSunGridXZ, height, kSunFillBudgetVoxels,
                m_sunBuildBudgetMs);
+  vv::platform::crashLogCrumb("sungrid: configured + enabled");
   return true;
 }
 
@@ -1572,6 +1599,12 @@ void VulkanRenderer::tickSunGrid() {
     // into the inactive texture half is recorded by the next
     // recordCommandBuffer (the GPU keeps serving the previous half).
     m_sunUploadPending = true;
+    char crumb[160];
+    std::snprintf(crumb, sizeof(crumb),
+                  "sungrid: cycle complete, origin (%d,%d), %llu lit",
+                  m_sunCycleOriginX, m_sunCycleOriginZ,
+                  static_cast<unsigned long long>(m_sunGrid.litCells()));
+    vv::platform::crashLogCrumb(crumb);
   }
 
   m_perfSunMs += std::chrono::duration<double, std::milli>(
@@ -2970,6 +3003,14 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   if (m_sunUploadPending) {
     m_sunUploadPending = false;
     const std::uint32_t target = 1u - m_sunFieldHalf;
+    {
+      char crumb[96];
+      std::snprintf(crumb, sizeof(crumb),
+                    "sungrid: publishing field half %u into texture "
+                    "(frame %u)",
+                    target, m_frameCounter);
+      vv::platform::crashLogCrumb(crumb);
+    }
     VkBufferImageCopy fieldCopy{};
     fieldCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     fieldCopy.imageOffset = {
