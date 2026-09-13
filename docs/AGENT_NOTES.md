@@ -92,49 +92,43 @@ Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
 excluded from workspace snapshots — EVERY sandbox restart needs the
 rebuild + reconfigure of build/release and build/debug.
 
-## Current status (pass 26.1 — fixing the first owner report)
+## Current status (pass 26.2 — second fix round)
 
-Owner report on pass 26: Debug runs but "everything is shadowed, edges
-softly lit, light grid oriented incorrectly"; Release crashes immediately
-with no message.
+Owner reports on 26.1: Release+grid ON = immediate crash, no message;
+Release+grid OFF = no crash; Debug+grid ON = runs, "everything is
+shadowed still", "ray traced shadows remain, they should get disabled",
+shadows "projected sideways, laying on top of voxels".
 
-FIXED (visual bug, reproduced + proven on real terrain in
-/home/user/sunprobe/probe.cpp): the light window (800) was the same width
-as the chunk region (800) but snap-offset from it, so (a) the snap math
-could not even cover the fog-visible range, and (b) the module's cone
-walk switched columns to far-LOD at the WINDOW edge while the exact march
-switches at the REGION edge -> conservative far max-heights shadowed
-bands up-sun of the window offset (spurious umbra + clamp-repeat =
-"everything shadowed, oriented incorrectly"). Fixes:
-- kSunGridXZ 800 -> 1088, kSunGridOriginSnap 256 -> 64. INVARIANT (must
-  hold for parity): the window always contains the region; worst case
-  o = floor((cam - W/2)/S)*S leaves margin 65 voxels of camera drift.
-- The renderer's SunGridVoxels adapter bounds near queries by the ACTIVE
-  chunk-table region (the march's resolveColumn grid); ring chunks
-  beyond it must NOT feed the seeding (the march tests far there).
-- No-data columns (window margin / unstreamed slots) are VIRTUAL far
-  columns: work 255, air bits above the far height (bleed passes
-  through, bits rewritten every cycle - the old early return left them
-  stale across window moves), but NO own seeds and NO border scan
-  (~50M band air cells cost 3.5x cycle time for invisible pixels; the
-  fog-cut sphere always fits inside the region, so nothing visible
-  samples the band).
-- Shader kSunFieldXZ 800 -> 1088 (sync with the renderer constant).
-- Cycle work on the sandbox: ~3.2 s total (1088^2 window; was 1.9 s at
-  800^2) - fine at high fps, slow at 60 (VV_SUN_MS knob).
-- Regression tests added: nonzero-origin window parity (exhaustive) +
-  moved-window parity + two-sentinel every-cell-written/determinism +
-  bleed-crossing checks; sunprobe parity 0 on two cycles with real
-  terrain, moved regions and far rings.
+FIXED this round (both feed those symptoms):
+- Pre-existing pass-13 bug: m_streamActive was NEVER cleared on a normal
+  stream completion (only the teleport fallback cleared it), so
+  finishRegionMove() ran EVERY FRAME at rest - and with the pass-26 hook
+  that meant requestRebuild() every frame = a permanent light-grid
+  rebuild loop (3 ms/frame CPU forever). Now cleared in finishRegionMove.
+- The first light cycle RACED the async chunk streaming: it prepassed
+  columns while chunks were still installing, so late chunks were baked
+  as far-umbra virtual columns -> the first published field had huge
+  dark shapes draped over the terrain ("everything shadowed, sideways,
+  laying on top of voxels"). tickSunGrid now HOLDS new cycles while
+  m_streamActive (initial load + crossings); a running cycle still
+  finishes (coherent for its origin), install-triggered rebuild flags
+  accumulate, and until the first publish the shader keeps the exact
+  march (the "ray traced shadows" the owner saw ARE the pre-publish
+  fallback - they get replaced the moment a field publishes; in a -O0
+  Debug build the first publish takes MINUTES, so Debug always showed
+  the march).
+- Expected timeline in Release now: ~2-4 s region stream -> light build
+  ~3.2 s sliced -> first soft field at ~6-8 s.
 
-OPEN (Release-only immediate crash, no message; Debug runs fine):
-not reproduced in the sandbox (module + adapter ASAN/UBSAN-clean at
-renderer scale, -O3 clean on Linux; no assert()/NDEBUG conditionals in
-src). Instrumentation added: "[vulkan] sun grid: resources created" and
-"first field published" log lines bracket the new init/frame paths.
-Next data needed from the owner: Release run from a console (stderr),
-whether the sun-grid log lines appear, and VV_SUN_GRID=0 as a
-differential (crashes too => the bug is outside the sun grid).
+STILL OPEN: the Release-only immediate crash (grid on). Not reproduced
+in the sandbox (module+adapter ASAN/UBSAN-clean at renderer scale; the
+offscreen smoke run has no Vulkan device, so the publish/copy path is
+NOT exercised there either - Debug "works" possibly only because -O0
+never reaches the first publish). Breadcrumbs in place:
+"[vulkan] sun grid: resources created" (init) and
+"[vulkan] sun grid: first field published" (first copy). NEEDED from
+the owner: the Release console output (last [vulkan] lines before the
+crash) - the two lines above bracket init vs publish as the crash site.
 
 Workspace note: sandbox restarts can return a FRESH CLONE at the base
 commit with the working tree preserved (happened twice: before pass 24

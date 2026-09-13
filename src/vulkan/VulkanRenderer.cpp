@@ -1010,10 +1010,15 @@ void VulkanRenderer::finishRegionMove() {
   // have a slot; an empty one is a real missing chunk).
   publishRegionTable(true);
 
+  // Stream COMPLETE (this was missing since pass 13 - only the teleport
+  // fallback cleared the flag, so the pump's finished-check kept calling
+  // this every frame at rest: harmless-ish before, but with the pass-26
+  // rebuild hook it meant a permanent light-grid rebuild loop).
+  m_streamActive = false;
+
   // The light grid window may have moved with the region; the new voxel
   // data needs a fresh build cycle (pass 26).
   m_sunGrid.requestRebuild();
-
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1552,7 +1557,17 @@ void VulkanRenderer::tickSunGrid() {
     m_sunCycleOriginZ = m_sunAppliedOriginZ;
   }
 
-  if (m_sunGrid.tick(m_sunBuildBudgetMs)) {
+  // No NEW cycle while the region streams (initial load or a crossing):
+  // columns whose chunks have not installed yet would seed from far-LOD
+  // max heights and publish a garbage-dark field (the pass-26.1 release
+  // report: 'everything is shadowed'). A RUNNING cycle finishes - it is
+  // coherent for its origin; install-triggered requestRebuild() flags
+  // accumulate while held. Until the first publish the shader keeps the
+  // exact-march shadows (enabled flag off), and during crossings the
+  // previously published field still covers the camera (the window is
+  // wider than the region), so nothing visible regresses.
+  const bool holding = m_sunGrid.idle() && m_streamActive;
+  if (!holding && m_sunGrid.tick(m_sunBuildBudgetMs)) {
     // A coherent field snapshot now sits in the staging buffer; the copy
     // into the inactive texture half is recorded by the next
     // recordCommandBuffer (the GPU keeps serving the previous half).
