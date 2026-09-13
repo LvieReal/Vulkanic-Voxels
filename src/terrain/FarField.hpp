@@ -71,16 +71,22 @@ struct FarField final {
 																 const TerrainGenerator& gen,
 																 std::vector<std::uint32_t>* outChangedIndices = nullptr);
 
-	// Builds the field centered on the given chunk (the box is centered on
-	// that chunk's center voxel so it always contains the full near region
-	// plus recenter hysteresis). Pure and thread-safe: only reads the
-	// (const) terrain generator.
+	// Builds the field centered on the given chunk, snapped to the
+	// world-aligned grid (see the .cpp). Pure and thread-safe: only reads
+	// the (const) terrain generator.
+	// When `previous` is given (same dim + cell footprint, world-aligned),
+	// cells that were already computed in the previous window are COPIED
+	// instead of recomputed - a recenter then only evaluates the newly
+	// exposed strips (~13% of the grid) instead of the whole field. This
+	// keeps recenter builds short enough to never disturb the frame loop
+	// (full builds took ~1 s of background CPU).
 	static FarField build(const TerrainGenerator& gen,
 												std::int32_t centerChunkX,
 												std::int32_t centerChunkZ,
 												std::uint32_t radiusChunks,
 												std::uint32_t cellVoxels,
-												std::uint32_t chunkSize);
+												std::uint32_t chunkSize,
+												const FarField* previous = nullptr);
 };
 
 }  // namespace vv::terrain

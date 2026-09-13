@@ -884,6 +884,23 @@ void testFarField() {
 	check(field.originVoxX == 0 - 64 && field.originVoxZ == 0 - 64,
 				"far: origin = snapped center - dim*cell/2");
 
+	// Incremental recenter: a build seeded with the previous window must
+	// produce EXACTLY the same cells as a fresh build (window reuse copies,
+	// exposed strips recompute - values must not diverge).
+	{
+		const auto fresh = vv::terrain::FarField::build(gen, 3, 2, 2, cell, chunk);
+		auto seeded = vv::terrain::FarField::build(gen, 3, 2, 2, cell, chunk,
+																							 &field);
+		check(fresh.dim == seeded.dim && fresh.originVoxX == seeded.originVoxX &&
+						fresh.originVoxZ == seeded.originVoxZ,
+					"far: incremental recenter geometry matches");
+		bool same = fresh.cells.size() == seeded.cells.size();
+		for (std::size_t k = 0; same && k < fresh.cells.size(); ++k) {
+				same = fresh.cells[k] == seeded.cells[k];
+		}
+		check(same, "far: incremental recenter cells identical to fresh build");
+	}
+
 	bool heightsOk = true;
 	bool typesOk = true;
 	for (std::uint32_t j = 0; j < field.dim; ++j) {

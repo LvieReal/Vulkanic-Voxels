@@ -232,6 +232,8 @@ class VulkanRenderer final {
   // Pending coords, sorted WORST-first (pop_back() = highest priority:
   // frustum-facing, near). Coords already in m_slotOf are excluded.
   std::vector<vv::voxel::ChunkCoord> m_streamPending;
+  // Generate-only coords for the far seam patch (r+1 ring; no slots).
+  std::vector<vv::voxel::ChunkCoord> m_streamRingPending;
   // Async generation worker (see pumpRegionStreaming).
   std::thread m_genThread;
   std::mutex m_genMutex;
@@ -250,7 +252,11 @@ class VulkanRenderer final {
   bool m_perfEnabled = false;
   std::chrono::steady_clock::time_point m_perfLastFrame{};
   std::chrono::steady_clock::time_point m_perfLastLog{};
-  double m_perfStreamMs = 0.0;
+  double m_perfWorldMs = 0.0;
+  double m_perfPumpMs = 0.0;
+  double m_perfSyncMs = 0.0;
+  double m_perfFarMs = 0.0;
+  double m_perfGpuMs = 0.0;
   std::int32_t m_holeDebugX = 0x7FFFFFFF;
   std::int32_t m_holeDebugZ = 0x7FFFFFFF;
 

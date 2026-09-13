@@ -80,11 +80,12 @@ std::size_t FarField::patchRegion(std::vector<std::uint32_t>& cells,
 }
 
 FarField FarField::build(const TerrainGenerator& gen,
-												 std::int32_t centerChunkX,
-												 std::int32_t centerChunkZ,
-												 std::uint32_t radiusChunks,
-												 std::uint32_t cellVoxels,
-												 std::uint32_t chunkSize) {
+															 std::int32_t centerChunkX,
+															 std::int32_t centerChunkZ,
+															 std::uint32_t radiusChunks,
+															 std::uint32_t cellVoxels,
+															 std::uint32_t chunkSize,
+															 const FarField* previous) {
 	FarField field;
 	field.dim = radiusChunks > 0 ? (2 * radiusChunks * chunkSize) / cellVoxels
 															 : 0;
@@ -128,6 +129,35 @@ FarField FarField::build(const TerrainGenerator& gen,
 	// footprint, and consistent with the near-region silhouette at the seam
 	// to within the existing far quantization. heightAtF is const and
 	// thread-safe.
+	// Window reuse: with a world-aligned grid, a recenter only shifts the
+	// window; cells at the same world position carry the same values (the
+	// field is a pure function of position), so they are copied from the
+	// previous field and only the exposed strips are recomputed.
+	const FarField* prev = nullptr;
+	std::int64_t shiftI = 0;
+	std::int64_t shiftJ = 0;
+	if (previous != nullptr && previous->dim == field.dim &&
+			previous->cellVoxels == field.cellVoxels &&
+			previous->cells.size() ==
+					static_cast<std::size_t>(previous->dim) * previous->dim &&
+			(previous->originVoxX - field.originVoxX) %
+							static_cast<std::int64_t>(cellVoxels) ==
+					0 &&
+			(previous->originVoxZ - field.originVoxZ) %
+							static_cast<std::int64_t>(cellVoxels) ==
+					0) {
+		shiftI = (previous->originVoxX - field.originVoxX) /
+						 static_cast<std::int64_t>(cellVoxels);
+		shiftJ = (previous->originVoxZ - field.originVoxZ) /
+						 static_cast<std::int64_t>(cellVoxels);
+		if (shiftI > -static_cast<std::int64_t>(field.dim) &&
+				shiftI < static_cast<std::int64_t>(field.dim) &&
+				shiftJ > -static_cast<std::int64_t>(field.dim) &&
+				shiftJ < static_cast<std::int64_t>(field.dim)) {
+			prev = previous;
+		}
+	}
+
 	field.cells.assign(static_cast<std::size_t>(field.dim) * field.dim, 0u);
 	for (std::uint32_t j = 0; j < field.dim; ++j) {
 		// Cooperative yield: this runs on a background thread and takes
@@ -141,6 +171,24 @@ FarField FarField::build(const TerrainGenerator& gen,
 				static_cast<std::int64_t>(field.originVoxZ) +
 				static_cast<std::int64_t>(j) * cellVoxels + cellVoxels / 2);
 		for (std::uint32_t i = 0; i < field.dim; ++i) {
+			// Window reuse: copy the previous field's cell at this world
+			// position when it exists (the window shifted by (shiftI,
+			// shiftJ) cells); only exposed strips fall through to the
+			// estimate below.
+			if (prev != nullptr) {
+				const std::int64_t si = static_cast<std::int64_t>(i) + shiftI;
+				const std::int64_t sj = static_cast<std::int64_t>(j) + shiftJ;
+				if (si >= 0 && sj >= 0 &&
+						si < static_cast<std::int64_t>(field.dim) &&
+						sj < static_cast<std::int64_t>(field.dim)) {
+					field.cells[static_cast<std::size_t>(i) +
+											static_cast<std::size_t>(j) * field.dim] =
+							prev->cells[static_cast<std::size_t>(si) +
+													static_cast<std::size_t>(sj) *
+															prev->dim];
+					continue;
+				}
+			}
 			const float wx = static_cast<float>(
 					static_cast<std::int64_t>(field.originVoxX) +
 					static_cast<std::int64_t>(i) * cellVoxels + cellVoxels / 2);

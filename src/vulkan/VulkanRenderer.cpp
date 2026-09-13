@@ -41,7 +41,7 @@ constexpr std::size_t kStreamChunksPerFrame = 1;
 // frames. This REPLACES the old >2-chunk synchronous catch-up, which
 // generated everything at once (25 chunks per crossed row x 2.8 ms = 70 ms+
 // hitches every couple of frames - the sprint stutter).
-constexpr std::size_t kStreamSprintChunks = 4;
+constexpr std::size_t kStreamSprintChunks = 8;
 // How many chunks the generation worker may run ahead of the upload pump
 // (bounds worker memory: N x 128 KB of staged voxel data).
 constexpr std::size_t kGenBacklog = 3;
@@ -152,8 +152,14 @@ void VulkanRenderer::drawFrame() {
     return;
   }
 
-  vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE,
-                  UINT64_MAX);
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE,
+                    UINT64_MAX);
+    m_perfGpuMs = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  }
 
   // Fog density follows the camera: the cut distance is the current distance
   // to the nearest region side face (see fogCutDistance()). The shader cuts
@@ -231,20 +237,29 @@ void VulkanRenderer::drawFrame() {
 
   if (m_perfEnabled) {
     const auto now = std::chrono::steady_clock::now();
+    const bool firstFrame =
+        m_perfLastFrame.time_since_epoch().count() == 0;
     const double frameMs =
-        std::chrono::duration<double, std::milli>(now - m_perfLastFrame)
-            .count();
-    if (frameMs > 25.0 &&
+        firstFrame
+            ? 0.0
+            : std::chrono::duration<double, std::milli>(now - m_perfLastFrame)
+                  .count();
+    if (!firstFrame && frameMs > 25.0 &&
         std::chrono::duration<double, std::milli>(now - m_perfLastLog)
                 .count() > 250.0) {
       std::fprintf(stderr,
-                   "[perf] frame %u: %.1f ms total, stream/world %.1f ms "
-                   "(generation is on the worker thread)\n",
-                   m_frameCounter, frameMs, m_perfStreamMs);
+                   "[perf] frame %u: %.1f ms | world %.1f (pump %.1f, "
+                   "sync %.1f, far %.1f) | gpu-wait %.1f\n",
+                   m_frameCounter, frameMs, m_perfWorldMs, m_perfPumpMs,
+                   m_perfSyncMs, m_perfFarMs, m_perfGpuMs);
       m_perfLastLog = now;
     }
     m_perfLastFrame = now;
-    m_perfStreamMs = 0.0;
+    m_perfWorldMs = 0.0;
+    m_perfPumpMs = 0.0;
+    m_perfSyncMs = 0.0;
+    m_perfFarMs = 0.0;
+    m_perfGpuMs = 0.0;
   }
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
   ++m_frameCounter;
@@ -360,6 +375,18 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
 }
 
 void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
+  // Whole-body timing for VV_PERF (the pass-13 log only covered the pump,
+  // and the actual hitch lived in an untimed bucket).
+  struct ScopedTimer {
+    VulkanRenderer& r;
+    std::chrono::steady_clock::time_point t0 =
+        std::chrono::steady_clock::now();
+    ~ScopedTimer() {
+      r.m_perfWorldMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+    }
+  } timer{*this};
   // Not streaming: discard any straggling worker results (the sync paths
   // generated their own data; keeping these would block a later stream's
   // completion check).
@@ -416,16 +443,20 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
     // into sprint mode (see kStreamSprintChunks), which drains the deficit
     // within a few frames instead of hitching. Teleports still take the
     // fallback above.
-    if (m_perfEnabled) {
+    {
       const auto t0 = std::chrono::steady_clock::now();
       pumpRegionStreaming();
-      m_perfStreamMs = std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - t0)
-                           .count();
-    } else {
-      pumpRegionStreaming();
+      m_perfPumpMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
     }
-    ensureFarField(chunkX, chunkZ);
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      ensureFarField(chunkX, chunkZ);
+      m_perfFarMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    }
     return;
   }
 
@@ -506,6 +537,27 @@ void VulkanRenderer::rebuildStreamPending() {
       }
     }
   }
+  // Generate-only ring: the (r+1) hysteresis ring around the target, for
+  // the far-LOD seam patch. Those chunks get NO atlas slot - they exist so
+  // the seam band (region edge + one chunk beyond) is patched from REAL
+  // column tops instead of the estimate, which under-shoots folded
+  // mountain terrain by up to ~25 voxels (the "missing chunks at the
+  // render-distance edge" holes).
+  m_streamRingPending.clear();
+  if (m_world != nullptr) {
+    for (int32_t dz = -r - 1; dz <= r + 1; ++dz) {
+      for (int32_t dx = -r - 1; dx <= r + 1; ++dx) {
+        if (dx >= -r && dx <= r && dz >= -r && dz <= r) {
+          continue;  // region cell: slot-bound above
+        }
+        const vv::voxel::ChunkCoord coord{m_streamTarget.x + dx,
+                                          m_streamTarget.z + dz};
+        if (m_world->findChunk(coord) == nullptr) {
+          m_streamRingPending.push_back(coord);
+        }
+      }
+    }
+  }
   const glm::vec3 pos = m_camera.position();
   const glm::vec3 fwd = m_camera.forward();
   std::sort(m_streamPending.begin(), m_streamPending.end(),
@@ -583,14 +635,28 @@ void VulkanRenderer::pumpRegionStreaming() {
       gen.types.clear();  // streaming aborted: discard (never re-queue)
       continue;
     }
-    const bool stale =
-        std::abs(gen.coord.x - m_streamTarget.x) > r ||
-        std::abs(gen.coord.z - m_streamTarget.z) > r ||
-        m_slotOf.find(gen.coord) != m_slotOf.end() ||
-        std::find(m_streamPending.begin(), m_streamPending.end(),
-                  gen.coord) == m_streamPending.end();
-    if (stale) {
+    const bool wanted =
+        m_slotOf.find(gen.coord) == m_slotOf.end() &&
+        (std::find(m_streamPending.begin(), m_streamPending.end(),
+                   gen.coord) != m_streamPending.end() ||
+         std::find(m_streamRingPending.begin(), m_streamRingPending.end(),
+                   gen.coord) != m_streamRingPending.end());
+    const bool inRange =
+        std::abs(gen.coord.x - m_streamTarget.x) <= r + 1 &&
+        std::abs(gen.coord.z - m_streamTarget.z) <= r + 1;
+    if (!wanted || !inRange) {
       gen.types.clear();  // not wanted: discard (never re-queue)
+      continue;
+    }
+    // Ring chunks (generate-only, for the far seam patch): install into
+    // the world, no slot, no upload, not capped (a move + map insert).
+    if (std::find(m_streamRingPending.begin(), m_streamRingPending.end(),
+                  gen.coord) != m_streamRingPending.end()) {
+      m_world->installChunk(gen.coord, std::move(gen.types));
+      m_streamRingPending.erase(std::remove(m_streamRingPending.begin(),
+                                            m_streamRingPending.end(),
+                                            gen.coord),
+                                m_streamRingPending.end());
       continue;
     }
     if (uploaded >= uploadCap) {
@@ -632,7 +698,7 @@ void VulkanRenderer::pumpRegionStreaming() {
   // 3) Top up the worker's queue from the pending set.
   {
     std::lock_guard<std::mutex> lock(m_genMutex);
-    for (const vv::voxel::ChunkCoord& coord : m_streamPending) {
+    const auto tryQueue = [&](const vv::voxel::ChunkCoord& coord) {
       const bool queued =
           std::find(m_genRequests.begin(), m_genRequests.end(), coord) !=
               m_genRequests.end() ||
@@ -640,9 +706,16 @@ void VulkanRenderer::pumpRegionStreaming() {
                       [&](const GeneratedChunk& g) {
                         return g.coord == coord;
                       });
-      if (!queued && m_genRequests.size() + m_genResults.size() < kGenBacklog) {
+      if (!queued &&
+          m_genRequests.size() + m_genResults.size() < kGenBacklog) {
         m_genRequests.push_back(coord);
       }
+    };
+    for (const vv::voxel::ChunkCoord& coord : m_streamPending) {
+      tryQueue(coord);
+    }
+    for (const vv::voxel::ChunkCoord& coord : m_streamRingPending) {
+      tryQueue(coord);
     }
     m_genCV.notify_one();
   }
@@ -651,8 +724,8 @@ void VulkanRenderer::pumpRegionStreaming() {
   bool finished = false;
   {
     std::lock_guard<std::mutex> lock(m_genMutex);
-    finished = m_streamPending.empty() && m_genRequests.empty() &&
-               m_genResults.empty();
+    finished = m_streamPending.empty() && m_streamRingPending.empty() &&
+               m_genRequests.empty() && m_genResults.empty();
   }
   if (finished && m_streamActive) {
     finishRegionMove();
@@ -769,10 +842,29 @@ void VulkanRenderer::launchFarFieldBuild(int32_t centerChunkX,
   const uint32_t radius = m_voxelConfig.farLodRadiusChunks;
   const uint32_t cell = m_voxelConfig.farLodCellVoxels;
   const uint32_t chunkSize = m_voxelConfig.chunkSizeX;
+  // Snapshot the active field for window reuse: the thread only READS
+  // this copy while the main thread may keep patching m_farCells. With a
+  // world-aligned grid a recenter only shifts the window, so the build
+  // copies ~87% of the cells and recomputes just the exposed strips.
+  bool havePrev = m_farFieldActive && m_farDim != 0;
+  vv::terrain::FarField prev;
+  if (havePrev) {
+    prev.dim = m_farDim;
+    prev.cellVoxels = m_farCell;
+    prev.originVoxX = m_farOriginVoxX;
+    prev.originVoxZ = m_farOriginVoxZ;
+    prev.centerVoxX = m_farOriginVoxX +
+                      static_cast<std::int32_t>(m_farDim * m_farCell / 2u);
+    prev.centerVoxZ = m_farOriginVoxZ +
+                      static_cast<std::int32_t>(m_farDim * m_farCell / 2u);
+    prev.cells = m_farCells;  // ~4 MB copy, launch-time only
+  }
   m_farThread = std::thread(
-      [gen, centerChunkX, centerChunkZ, radius, cell, chunkSize, this]() {
+      [gen, centerChunkX, centerChunkZ, radius, cell, chunkSize, havePrev,
+       prev = std::move(prev), this]() mutable {
         m_farPending = vv::terrain::FarField::build(
-            *gen, centerChunkX, centerChunkZ, radius, cell, chunkSize);
+            *gen, centerChunkX, centerChunkZ, radius, cell, chunkSize,
+            havePrev ? &prev : nullptr);
         m_farPendingReady.store(true, std::memory_order_release);
       });
 }
@@ -809,13 +901,12 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       };
       m_farCenterChunkX = voxToChunk(m_farPending.centerVoxX);
       m_farCenterChunkZ = voxToChunk(m_farPending.centerVoxZ);
-      // New far grid: reset the seam-patch extent so the next patch scans
-      // the whole region, then patch the CPU mirror BEFORE uploading -
-      // the estimate alone under-shoots folded terrain at the seam.
-      m_farPatchMinX = 0;
-      m_farPatchMinZ = 0;
-      m_farPatchMaxX = -1;
-      m_farPatchMaxZ = -1;
+      // Patch the CPU mirror BEFORE uploading - the estimate alone
+      // under-shoots folded terrain at the seam. The patch extent is NOT
+      // reset: cells keep their world positions across a (world-aligned)
+      // window shift, so previously patched cells are still exact and the
+      // patch only scans the newly entered ring (a full-region rescan on
+      // every activation cost tens of ms - one of the perf-log hitches).
       {
         std::vector<std::pair<uint32_t, uint32_t>> patchRuns;
         std::vector<uint32_t> patchValues;
@@ -857,13 +948,27 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
   // (quarter of the radius, >= 4 chunks). The old field keeps rendering
   // until the new one is uploaded.
   if (!m_farBuildRunning.load()) {
-    const int32_t threshold = std::max<int32_t>(
-        4, static_cast<int32_t>(m_voxelConfig.farLodRadiusChunks) / 4);
-    const int32_t dx = centerChunkX - m_farCenterChunkX;
-    const int32_t dz = centerChunkZ - m_farCenterChunkZ;
-    const bool needsRebuild = !m_farFieldActive ||
-                              std::abs(dx) > threshold ||
-                              std::abs(dz) > threshold;
+    // Recenter rule with the world-aligned snap: the camera's SNAP CELL
+    // (512-voxel grid) must match the field's, otherwise the window has
+    // fallen behind. Comparing raw chunk distance to the SNAPPED center
+    // never fired (the snap keeps the apparent distance <= ~8 chunks
+    // forever - the field never moved after startup; found via the
+    // owner's perf log showing exactly one activation).
+    const std::int32_t chunkVox =
+        static_cast<std::int32_t>(m_voxelConfig.chunkSizeX);
+    const std::int32_t camVoxX = centerChunkX * chunkVox + chunkVox / 2;
+    const std::int32_t camVoxZ = centerChunkZ * chunkVox + chunkVox / 2;
+    const auto snapCell = [chunkVox](std::int32_t v) {
+      const std::int32_t grid = 512;
+      const std::int32_t rem = ((v % grid) + grid) % grid;
+      return v - rem;
+    };
+    const bool needsRebuild =
+        !m_farFieldActive ||
+        snapCell(camVoxX) != snapCell(m_farCenterChunkX * chunkVox +
+                                      chunkVox / 2) ||
+        snapCell(camVoxZ) != snapCell(m_farCenterChunkZ * chunkVox +
+                                      chunkVox / 2);
     if (needsRebuild) {
       launchFarFieldBuild(centerChunkX, centerChunkZ);
     }
@@ -887,10 +992,14 @@ bool VulkanRenderer::patchFarFieldWithRegion(
   const auto& cfg = m_voxelConfig;
   const int32_t r = static_cast<int32_t>(cfg.renderRadiusChunks);
 
-  // Chunks in the region that are outside the patched extent box.
+  // Cached chunks in the (r+1) square that are outside the patched
+  // extent box. The +1 ring matters: the first chunk row BEYOND the
+  // region edge is rendered by far cells, and without real data there
+  // the estimate's under-shoot in folded columns showed as chunk-shaped
+  // holes exactly at the render-distance edge (owner-observed).
   std::vector<vv::terrain::FarField::RegionChunkHeights> chunks;
-  for (int32_t dz = -r; dz <= r; ++dz) {
-    for (int32_t dx = -r; dx <= r; ++dx) {
+  for (int32_t dz = -r - 1; dz <= r + 1; ++dz) {
+    for (int32_t dx = -r - 1; dx <= r + 1; ++dx) {
       const int32_t cx = m_regionCenter.x + dx;
       const int32_t cz = m_regionCenter.z + dz;
       if (m_farPatchMaxX >= m_farPatchMinX && cx >= m_farPatchMinX &&
@@ -947,10 +1056,10 @@ bool VulkanRenderer::patchFarFieldWithRegion(
 
 void VulkanRenderer::extendFarPatchExtent() {
   const int32_t r = static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
-  const int32_t minX = m_regionCenter.x - r;
-  const int32_t maxX = m_regionCenter.x + r;
-  const int32_t minZ = m_regionCenter.z - r;
-  const int32_t maxZ = m_regionCenter.z + r;
+  const int32_t minX = m_regionCenter.x - r - 1;
+  const int32_t maxX = m_regionCenter.x + r + 1;
+  const int32_t minZ = m_regionCenter.z - r - 1;
+  const int32_t maxZ = m_regionCenter.z + r + 1;
   if (m_farPatchMaxX < m_farPatchMinX) {
     m_farPatchMinX = minX;
     m_farPatchMaxX = maxX;
@@ -1526,8 +1635,23 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
 bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
                                         int32_t centerChunkZ,
                                         std::string& outError) {
+  const auto perfT0 = std::chrono::steady_clock::now();
   const uint32_t radius = m_voxelConfig.renderRadiusChunks;
   const int32_t r = static_cast<int32_t>(radius);
+  struct SyncLog {
+    VulkanRenderer& r;
+    std::chrono::steady_clock::time_point t0;
+    std::size_t generated = 0;
+    ~SyncLog() {
+      r.m_perfSyncMs += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      if (r.m_perfEnabled) {
+        std::fprintf(stderr, "[perf] SYNC region rebuild: %zu chunks, %.1f ms\n",
+                     generated, r.m_perfSyncMs);
+      }
+    }
+  } syncLog{*this, perfT0};
 
   // Synchronous path (initial region, teleport fallback): a full drain is
   // acceptable here - it also retires every frame that could reference
@@ -1549,7 +1673,12 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
 
   std::vector<const vv::voxel::Chunk*> newChunks;
   std::vector<vv::voxel::ChunkCoord> evicted;
-  m_world->ensureRegion(centerChunkX, centerChunkZ, radius, newChunks, evicted);
+  // radius + 1: the seam-patch ring (see rebuildStreamPending) must be
+  // generated here too - the far cells one chunk beyond the region edge
+  // need real column tops or folded terrain shows holes there.
+  m_world->ensureRegion(centerChunkX, centerChunkZ, radius + 1, newChunks,
+                        evicted);
+  syncLog.generated = newChunks.size();
 
   for (const vv::voxel::ChunkCoord& coord : evicted) {
     const auto it = m_slotOf.find(coord);

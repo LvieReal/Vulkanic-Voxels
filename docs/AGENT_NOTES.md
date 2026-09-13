@@ -84,21 +84,29 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 13)
+## Current status (pass 14)
 
-Verified by owner: pass 9 stable base (no TAA); pass 12 wait-free swaps
-kept the world correct. Open issues, one at a time:
+Owner-verified: pass 9 stable base (no TAA/SSAA). The pass-13 perf log
+plus the owner's observation ("holes vary on X, stay at 13; renderRadius
+is 12 - something at the edges") pinned both open issues down:
 
-1. **Sprint hitch** — persists with a regular rhythm. Remaining suspect:
-   per-frame chunk *generation* on the render thread (3–4 × ~3 ms bursts
-   after each crossing). Pass 13 moves generation to a worker thread;
-   `VV_PERF=1` logs any frame > 25 ms with the stream bucket if anything
-   still hitches.
-2. **Hole at chunk (0,13)** (near spawn, beyond the +Z region edge, fills
-   in after re-flying). Table is complete (no TABLE HOLE logs), far data
-   verified correct by CPU probes, far-march replica hits 100% of aimed
-   rays — not reproducible locally. Run with `VV_DEBUG_HOLE=0,13`, look
-   at the hole, and report the color (magenta/cyan/yellow — see above).
+1. **Edge holes** - chunk row 13 = first row BEYOND the region, rendered
+   by far cells that were never seam-patched (the patch covered region
+   chunks only); the estimate under-shoots folded columns by up to ~25
+   voxels -> chunk-shaped notches varying with X. Pass 14: the seam
+   patch covers the r+1 ring with REAL data - streaming generates ring
+   chunks on the worker (generate-only, no slots), sync paths call
+   ensureRegion(r+1).
+2. **Sprint hitch** - big frames (0.4-1.5 s) showed stream 0.0 ms: the
+   old timing only covered the pump. Found + fixed: (a) the far field
+   NEVER recentered (snap-cell vs chunk-distance threshold bug); recent
+   -ers now trigger on snap-cell change and are INCREMENTAL (window
+   shift + strip recompute, ~13% of the grid, unit-tested identical to
+   a fresh build); (b) the activation patch keeps its extent across
+   world-aligned shifts (only the new ring is scanned); (c) VV_PERF now
+   times every bucket (world total / pump / sync / far / gpu-wait) and
+   rebuildChunkRegion logs "SYNC region rebuild: N chunks, X ms" - if
+   any hitch remains, the next log names it.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites
