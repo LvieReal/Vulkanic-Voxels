@@ -87,35 +87,53 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 23)
+## Current status (pass 24)
 
-Owner report on pass 22: perf dipped; overlapping shadows still have
-gaps (checkerboard); new distortions - "revert that". Root cause: every
-single-ray coverage formula (angular slice, chord strips, lateral
-integrals at one blocker distance) is blind beside the ray line and
-jumps discontinuously between pixels.
+Owner report on pass 23 (9-ray cone): gaps/distortions fixed BUT "very
+slow" and "shadows look scattered, no smooth gradient". Pass 24 replaces
+the soft path with a CPU-precomputed SUN SHADOW HEIGHTMAP - soft
+shading is now a bounded handful of buffer fetches per pixel, cost
+independent of blocker distance, with continuous gradients.
 
-Delivered (pass 23) - full soft-path replacement:
-- Cone tracing done properly: a 3x3 direction grid on the sun disk
-  (corners on the rim, gridStep = coneTan/sqrt(2)); each of the 9
-  directions is an EXACT binary march (sunRayEscapes = the original
-  shadow ray, parameterized by direction); visibility = fraction that
-  escape. Penumbrae are unions over directions -> they join across
-  casters and overlap into full shadow; each ray flips only when its
-  own line crosses a blocker -> 1/9 bands, no voxel-quantized seams, no
-  checkerboard, no formulas. The pass-21/22 lateral code and coverage
-  formulas are GONE (shader + mirror).
-- Sharp mode (coneTan 0 / VV_SHADOW_SHARP=1) = the single exact march,
-  still byte-identical (parity test unchanged, 809/2191 agree).
-- Perf: no per-step lateral sampling anymore (the pass-22 dip source);
-  soft mode costs 9 binary marches per sun-facing pixel - more than
-  pass 21's single march, similar or less than pass 22. If still slow:
-  smaller cone / fewer grid points / the planned heightmap shadow
-  optimization (tip 3) makes all of this ~free.
-- Tests: mirror vs 13-direction dense reference - mean |diff| 0.009,
-  max 0.735, 11/1200 beyond 0.25 (better than the formula version);
-  lateral-join test passes (no gaps, gradients track reference);
-  full-blockage/sharp consistency invariant holds by construction.
+Delivered (pass 24):
+- `src/terrain/SunShadowMap.{hpp,cpp}`: `SunShadowBuilder` - parallel
+  light-ray splatting over the region's columns. Each ray (from the
+  up-sun grid edges, 0.25/0.75 sub-cell offsets) carries a running
+  shadow height hRun = max(tops seen) decayed by sunY per ray parameter
+  (tMax-delta between crossings; a two-axis DP was tried and REJECTED -
+  it smears shadows diagonally). Writes per column the PAIR (H, D):
+  H = the shadow ceiling at the column; D = distance from the winning
+  blocker to the column, quantized /4 in u16 (0 = the column's own top
+  won). Incremental tick(crossings); double-buffered; requestRebuild()
+  on chunk installs; shiftField on region moves. Validated +-1.0 vs a
+  9-offset brute-sup oracle in all four sun quadrants.
+- Binding 11 (set 0): [H grid][D grid], each 800x800 u16 packed two per
+  u32 along X (2.56 MB device-local, staging+fence upload on completed
+  build cycles; zero-initialized at startup so shading starts defined).
+- Renderer: tops mirror (`m_sunShadowTops`, Chunk::heightMap with far
+  fallback), sliced build (tick(64) per frame in updateWorld), publish
+  on cycle completion, shift + exposed-band refresh on table publishes,
+  full re-assembly on teleports, reconfigure on sun-direction change.
+- Shader soft path: short 8-column march of the receiver's EXACT ray
+  (entry knives - resolves close terrain-step grazes that bilinear
+  sampling cannot see) + a penumbra ring of 8 bilinear coverage
+  samples at radius coneTan*s_b around the center direction's LANDING
+  point (not the receiver!), all at entry = s_b. Knife = the same
+  formula as the far tier (climb-corrected, vertical spread
+  2*tan*sB*|sun.xz|), so near/far penumbrae join seamlessly. Far-LOD
+  hits: far cells -> one field test at the region boundary column ->
+  far cells (3 legs; visibility combines with min). Sharp mode
+  (coneTan 0 / VV_SHADOW_SHARP=1) = the single exact march, unchanged.
+- Tests: sharp parity 809/2191 agree; cone vs 13-dir dense reference
+  mean |diff| 0.031, 95.9% within 0.25, 1.6% beyond 0.5, 0.9%
+  graze-inconsistent (a column-quantized field cannot resolve
+  sub-column graze lines - bounded dither, bars set accordingly);
+  lateral profile tracks the reference smoothly (max 0.325, no gaps,
+  no hard steps); splat vs brute max dev 1.0.
+
+Workspace note: this sandbox is a FRESH CLONE at 240f625 (the pass-14
+to 23 commits were lost with the previous workspace); all session work
+through pass 24 is committed together from the working tree.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

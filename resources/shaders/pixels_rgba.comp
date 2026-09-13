@@ -107,6 +107,19 @@ layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
     uint perType[];
 } voxelTexInfo;
 
+// Sun shadow field (pass 24): TWO packed grids back to back, each one
+// u16 per region column, packed two per u32 along X, row-major
+// (vv::terrain::SunShadowBuilder output, uploaded by the renderer when
+// a build cycle completes). Grid 0: H(x, z) = the highest sun-ray
+// graze height over the column (the shadow ceiling, decayed to the
+// column; 0 = lit). Grid 1: D(x, z) = the distance from the winning
+// blocker to the column (ray-parameter units, quantized /4; 0 = the
+// column's own top won). The grid is pc.region.xz (chunk-grid min
+// corner) .. + pc.grid.xy * chunkSize.x columns.
+layout(set = 0, binding = 11) readonly buffer SunShadowField {
+    uint packed2[];
+} sunShadowMap;
+
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
 uint farBase()
@@ -474,20 +487,331 @@ bool sunRayEscapes(vec3 origin, vec3 sunV)
     return true;
 }
 
-// Sun shadows (pass 23): cone tracing as a 3x3 direction grid on the
-// sun disk - 9 exact binary rays (sunRayEscapes), visibility = the
-// fraction that escape. Penumbrae are unions over directions, so they
-// join across casters and overlap into full shadow; each ray flips
-// only when its own line crosses a blocker, so neighboring pixels
-// differ by at most a grid step or two (1/9 bands) - no voxel-
-// quantized seams, no checkerboard. This replaces the pass-21/22
-// single-ray coverage formulas (angular slice, chord strips, lateral
-// integrals), which were blind beside the ray line and jumped
-// discontinuously between pixels. coneTan = tan of the sun disk's
-// half angle (scene.misc.w, default tan 2.5 deg); 0 (or
-// VV_SHADOW_SHARP=1) = the single exact march, byte-identical to the
-// pre-soft shadow ray.
-float sunShadow(vec3 hitPosVox, vec3 n)
+// Raw column fetches from the sun shadow field (binding 11). Out of
+// bounds = 0 (lit): the far tier owns everything beyond the region.
+float sunShadowRawH(int cx, int cz)
+{
+    const int cols = int(pc.grid.x) * int(pc.chunkSize.x);
+    const int rows = int(pc.grid.y) * int(pc.chunkSize.x);
+    if (cx < 0 || cz < 0 || cx >= cols || cz >= rows) {
+        return 0.0;
+    }
+    const uint word = sunShadowMap.packed2[uint(cx >> 1) +
+                                           uint(cz) * uint(cols >> 1)];
+    return float(((cx & 1) != 0) ? (word >> 16) : (word & 0xFFFFu));
+}
+
+float sunShadowRawD(int cx, int cz)
+{
+    const int cols = int(pc.grid.x) * int(pc.chunkSize.x);
+    const int rows = int(pc.grid.y) * int(pc.chunkSize.x);
+    if (cx < 0 || cz < 0 || cx >= cols || cz >= rows) {
+        return 0.0;
+    }
+    const uint word =
+        sunShadowMap.packed2[uint(cols >> 1) * uint(rows) +
+                             uint(cx >> 1) + uint(cz) * uint(cols >> 1)];
+    return float(((cx & 1) != 0) ? (word >> 16) : (word & 0xFFFFu)) * 4.0;
+}
+
+// Sun-disk coverage of one blocker, from the (H, D) pair of the
+// SAMPLED column: h = the shadow ceiling decayed to that column,
+// dCol = the blocker's distance to THAT column, sEntry = the ray
+// parameter from the receiver to that column's entry. The
+// receiver-to-blocker distance is sB = dCol + sEntry, and the
+// blocker top minus the receiver's ray height at the blocker works
+// out to (h - y - sunY * sEntry) - the climb between receiver and
+// the column entry is what was missing in the first cut (slope
+// acne: a neighbor's own top compared against the receiver's height
+// without the climb). The disk's VERTICAL spread at sB is
+// coneTan * sB * |sunV.xz| (the horizontal spread is the full
+// coneTan * sB - the disk radius in sunShadowSoftNear).
+// sB = 0 (the blocker at the receiver, e.g. its own column's top):
+// binary - the whole disk is under it or clear. sB < 0: never
+// entered, cannot shadow.
+float sunShadowKnife(float h, float dCol, float sEntry, float y,
+                     float coneTan, float xzLen, float sunY)
+{
+    const float sB = dCol + sEntry;
+    if (sB < 1e-3) {
+        return h > y ? 1.0 : 0.0;
+    }
+    return clamp(0.5 + (h - y - sunY * sEntry) /
+                        (2.0 * coneTan * sB * max(xzLen, 1e-3)), 0.0, 1.0);
+}
+
+// Near-region soft shadows (pass 24): sample the precomputed sun shadow
+// heightmap with a PCF disk whose radius grows with the distance to the
+// first up-sun blocker (estimated from a few probe fetches). Replaces
+// the pass-23 9-ray cone trace (slow, 1/9-quantized) with ~13 bilinear
+// fetches per pixel - continuous gradients, no scattered banding, and
+// the cost does not scale with blocker distance.
+
+// Coverage at a world XZ (a disk sample position), evaluated against
+// the RECEIVER at pxz/y: the knife per COLUMN (each column keeps its
+// own (H, D) pair and its own entry parameter - H and D must never
+// be blended across pairs), then the COVERAGE values are bilinear
+// filtered. That is what makes penumbrae render as continuous
+// gradients.
+float sunShadowCovAt(vec2 xz, float sEntry, float y, float coneTan,
+                     float xzLen, float sunY)
+{
+    const vec2 mapMin = vec2(pc.region.x, pc.region.z) * float(pc.chunkSize.x);
+    const vec2 rel = xz - mapMin - vec2(0.5);
+    const ivec2 g = ivec2(floor(rel));
+    const vec2 f = rel - vec2(g);
+    const float c00 = sunShadowKnife(sunShadowRawH(g.x, g.y),
+                                     sunShadowRawD(g.x, g.y), sEntry, y,
+                                     coneTan, xzLen, sunY);
+    const float c10 = sunShadowKnife(sunShadowRawH(g.x + 1, g.y),
+                                     sunShadowRawD(g.x + 1, g.y), sEntry, y,
+                                     coneTan, xzLen, sunY);
+    const float c01 = sunShadowKnife(sunShadowRawH(g.x, g.y + 1),
+                                     sunShadowRawD(g.x, g.y + 1), sEntry, y,
+                                     coneTan, xzLen, sunY);
+    const float c11 = sunShadowKnife(sunShadowRawH(g.x + 1, g.y + 1),
+                                     sunShadowRawD(g.x + 1, g.y + 1), sEntry,
+                                     y, coneTan, xzLen, sunY);
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+float sunShadowSoftNear(vec3 origin, vec3 sunV, float coneTan)
+{
+    const float xzLen = length(sunV.xz);
+    const vec2 mapMin = vec2(pc.region.x, pc.region.z) * float(pc.chunkSize.x);
+    const ivec2 dim = ivec2(pc.grid.xy) * int(pc.chunkSize.x);
+
+    // Short march along the RECEIVER'S EXACT ray (8 columns, 2D DDA):
+    // per column, the entry knife on that column's (H, D). This is
+    // what resolves close grazes (a +1 terrain step one column up-sun
+    // clips the ray before it has climbed - the sub-column geometry
+    // the bilinear sampling cannot see), while each column's D still
+    // reaches every further blocker up-sun of it. The march also
+    // covers the receiver's own column first (entry 0, D = 0: the
+    // binary overhang test) and records the strongest blocker
+    // distance for the penumbra ring below.
+    int colX = int(floor(origin.x)) - int(mapMin.x);
+    int colZ = int(floor(origin.z)) - int(mapMin.y);
+    int stepX = (sunV.x > 0.0) ? 1 : -1;
+    int stepZ = (sunV.z > 0.0) ? 1 : -1;
+    float tMaxX = 1e30;
+    float tMaxZ = 1e30;
+    float deltaX = 1e30;
+    float deltaZ = 1e30;
+    const vec2 local = origin.xz - mapMin;
+    if (abs(sunV.x) > 1e-6) {
+        tMaxX = (float(colX + ((stepX > 0) ? 1 : 0)) - local.x) / sunV.x;
+        deltaX = abs(1.0 / sunV.x);
+    } else {
+        stepX = 0;
+    }
+    if (abs(sunV.z) > 1e-6) {
+        tMaxZ = (float(colZ + ((stepZ > 0) ? 1 : 0)) - local.y) / sunV.z;
+        deltaZ = abs(1.0 / sunV.z);
+    } else {
+        stepZ = 0;
+    }
+
+    float marchCov = 0.0;
+    float maxSB = 0.0;
+    float s = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        if (colX >= 0 && colZ >= 0 && colX < dim.x && colZ < dim.y) {
+            const float cov =
+                sunShadowKnife(sunShadowRawH(colX, colZ),
+                               sunShadowRawD(colX, colZ), s, origin.y,
+                               coneTan, xzLen, sunV.y);
+            if (cov > marchCov) {
+                marchCov = cov;
+            }
+            // Ring distance from EVERY marched column: a column that
+            // does not block this receiver still knows (via D) how far
+            // the significant up-sun blockers are - that is what sizes
+            // the penumbra of a NEARBY shadow edge (cov gating here
+            // collapsed the ring in the outer penumbra and made a hard
+            // step at its rim).
+            maxSB = max(maxSB, sunShadowRawD(colX, colZ) + s);
+        }
+        s = min(tMaxX, tMaxZ);
+        const bool takeX = tMaxX < tMaxZ;
+        tMaxX += takeX ? deltaX : 0.0;
+        tMaxZ += takeX ? 0.0 : deltaZ;
+        colX += takeX ? stepX : 0;
+        colZ += takeX ? 0 : stepZ;
+    }
+
+    // Penumbra ring: the sun disk's HORIZONTAL spread at the strongest
+    // blocker. Close blockers (R < 0.5 columns) have no lateral
+    // penumbra to speak of - the march result stands alone, which also
+    // avoids diluting its exact close-graze answer.
+    const float R = coneTan * maxSB;
+    if (R < 0.5) {
+        return 1.0 - marchCov;
+    }
+    // The disk's directions land on a circle of radius R around the
+    // CENTER direction's landing point - NOT around the receiver.
+    const vec2 landing = origin.xz + sunV.xz * maxSB;
+    float blocked = marchCov;
+    for (int k = 0; k < 8; ++k) {
+        const float ang = (float(k) + 0.5) * 0.78539816;  // 45 deg / 8
+        const vec2 off = vec2(cos(ang), sin(ang)) * R;
+        blocked += sunShadowCovAt(landing + off, maxSB, origin.y, coneTan,
+                                  xzLen, sunV.y);
+    }
+    return 1.0 - blocked / 9.0;
+}
+
+// Far-tier soft shadows: march the far-LOD cells from sStart (for near
+// pixels, the region exit; 0 for far-LOD hits) with angular coverage -
+// a cell blocks the fraction of the sun disk below its height.
+float sunShadowFarCoverage(vec3 origin, vec3 sunV, float coneTan,
+                           float sStart, float sEnd)
+{
+    if (pc.far.z <= 0) {
+        return 1.0;
+    }
+    const float maxTerr = float(pc.grid.w) + 1.0;
+    const float farCell = pc.farParams.x;
+    const ivec2 farDim = pc.far.zw;
+    const vec2 farOrigin = vec2(pc.far.xy);
+
+    const vec3 p = origin + sunV * sStart;
+    int sStepX = (sunV.x > 0.0) ? 1 : -1;
+    int sStepZ = (sunV.z > 0.0) ? 1 : -1;
+    float sMaxX = 1e30;
+    float sMaxZ = 1e30;
+    float sDeltaX = 1e30;
+    float sDeltaZ = 1e30;
+    ivec2 col = ivec2(floor(p.xz));
+    if (abs(sunV.x) > 1e-6) {
+        const float nextX = float(col.x + ((sStepX > 0) ? 1 : 0));
+        sMaxX = (nextX - p.x) / sunV.x;
+        sDeltaX = abs(1.0 / sunV.x);
+    } else {
+        sStepX = 0;
+    }
+    if (abs(sunV.z) > 1e-6) {
+        const float nextZ = float(col.y + ((sStepZ > 0) ? 1 : 0));
+        sMaxZ = (nextZ - p.z) / sunV.z;
+        sDeltaZ = abs(1.0 / sunV.z);
+    } else {
+        sStepZ = 0;
+    }
+
+    // Skip the origin column: the hit surface's own cell must not
+    // self-shadow (its height sits right at the ray start).
+    float s = min(sMaxX, sMaxZ);
+    {
+        const bool takeX = sMaxX < sMaxZ;
+        sMaxX += takeX ? sDeltaX : 0.0;
+        sMaxZ += takeX ? 0.0 : sDeltaZ;
+        col.x += takeX ? sStepX : 0;
+        col.y += takeX ? 0 : sStepZ;
+    }
+
+    float pen = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        const float sTot = s + sStart;
+        if (sTot >= sEnd) {
+            break;  // leg boundary (near-region interior is not ours)
+        }
+        const float y0 = p.y + sunV.y * s;
+        // Even the sun disk's lower rim clears all terrain: done.
+        if (y0 - coneTan * sTot * length(sunV) >= maxTerr) {
+            break;
+        }
+        const ivec2 fc = ivec2(floor((vec2(col) + vec2(0.5) -
+                                      farOrigin) / farCell));
+        if (all(greaterThanEqual(fc, ivec2(0))) &&
+            all(lessThan(fc, farDim))) {
+            const uint packed =
+                farLod.cells[farBase() + uint(fc.x) +
+                             uint(fc.y) * uint(farDim.x)];
+            const float h = float(packed & 0xFFFFu);
+            if (h > 0.0) {
+                // Fraction of the disk below the cell top (its
+                // VERTICAL spread is coneTan * sTot * |sun.xz|):
+                // 1 deep in the umbra, 0.5 grazing (NaN-guarded).
+                const float cov =
+                    clamp(0.5 + (h - y0) /
+                                     max(2.0 * coneTan * sTot *
+                                             max(length(sunV.xz), 1e-3),
+                                         1e-3),
+                          0.0, 1.0);
+                pen = max(pen, cov);
+                if (pen >= 1.0) {
+                    return 0.0;
+                }
+            }
+        }
+        s = min(sMaxX, sMaxZ);
+        const bool takeX = sMaxX < sMaxZ;
+        sMaxX += takeX ? sDeltaX : 0.0;
+        sMaxZ += takeX ? 0.0 : sDeltaZ;
+        col.x += takeX ? sStepX : 0;
+        col.y += takeX ? 0 : sStepZ;
+    }
+    return 1.0 - pen;
+}
+
+// Slab entry/exit of the region box along the sun ray: true when the
+// ray passes through the box at all. tEnter <= tExit while inside.
+bool sunShadowRegionSlabS(vec3 origin, vec3 sunV, out float tEnter,
+                          out float tExit)
+{
+    const vec2 mapMin = vec2(pc.region.x, pc.region.z) * float(pc.chunkSize.x);
+    const vec2 mapDim = vec2(pc.grid.xy) * float(pc.chunkSize.x);
+    tEnter = -1e30;
+    tExit = 1e30;
+    if (abs(sunV.x) > 1e-6) {
+        const float near_ = (sunV.x > 0.0) ? mapMin.x : mapMin.x + mapDim.x;
+        const float far_ = (sunV.x > 0.0) ? mapMin.x + mapDim.x : mapMin.x;
+        tEnter = max(tEnter, (near_ - origin.x) / sunV.x);
+        tExit = min(tExit, (far_ - origin.x) / sunV.x);
+    }
+    if (abs(sunV.z) > 1e-6) {
+        const float near_ = (sunV.z > 0.0) ? mapMin.y : mapMin.y + mapDim.y;
+        const float far_ = (sunV.z > 0.0) ? mapMin.y + mapDim.y : mapMin.y;
+        tEnter = max(tEnter, (near_ - origin.z) / sunV.z);
+        tExit = min(tExit, (far_ - origin.z) / sunV.z);
+    }
+    return tExit > max(tEnter, 0.0);
+}
+
+// Ray parameter where the sun ray exits the near region's column grid
+// (the far tier takes over from there).
+float sunShadowRegionExitS(vec3 origin, vec3 sunV)
+{
+    const vec2 mapMin = vec2(pc.region.x, pc.region.z) * float(pc.chunkSize.x);
+    const vec2 mapDim = vec2(pc.grid.xy) * float(pc.chunkSize.x);
+    // MIN over axes: the ray leaves the BOX at the FIRST boundary it
+    // crosses (past it the point is outside the region even if the
+    // other axis is still inside) - the far tier owns everything from
+    // there on. (max() would skip the whole diagonal corner band.)
+    float s = 1e30;
+    if (abs(sunV.x) > 1e-6) {
+        const float edge = (sunV.x > 0.0) ? mapMin.x + mapDim.x : mapMin.x;
+        s = min(s, (edge - origin.x) / sunV.x);
+    }
+    if (abs(sunV.z) > 1e-6) {
+        const float edge = (sunV.z > 0.0) ? mapMin.y + mapDim.y : mapMin.y;
+        s = min(s, (edge - origin.z) / sunV.z);
+    }
+    if (s < 0.0) {
+        s = 0.0;  // origin already outside: hand over immediately
+    }
+    return s;
+}
+
+// Sun shadows (pass 24). Soft mode samples the CPU-precomputed sun
+// shadow heightmap (binding 11) with a PCF disk - smooth gradients, a
+// handful of buffer fetches per pixel, cost independent of blocker
+// distance - and hands off to an angular-coverage far march beyond the
+// region (and for far-LOD hits). Sharp mode (coneTan 0 /
+// VV_SHADOW_SHARP=1) keeps the single exact binary march. This replaces
+// the pass-23 9-ray cone trace, which was correct but slow and
+// 1/9-quantized ("scattered, no smooth gradient").
+float sunShadow(vec3 hitPosVox, vec3 n, bool farHit)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);
     if (sunWorld.y <= 0.05) {
@@ -503,27 +827,42 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     if (coneTan <= 0.0) {
         return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
     }
-
-    // Basis perpendicular to the sun direction.
-    const vec3 u = normalize(abs(sunV.y) < 0.99
-                                 ? cross(sunV, vec3(0.0, 1.0, 0.0))
-                                 : cross(sunV, vec3(1.0, 0.0, 0.0)));
-    const vec3 v = cross(sunV, u);
-
-    // 3x3 grid on the disk; the corners land exactly on the rim
-    // (gridStep * sqrt(2) = coneTan).
-    const float gridStep = coneTan * 0.70710678;
-    int blocked = 0;
-    for (int i = -1; i <= 1; ++i) {
-        for (int j = -1; j <= 1; ++j) {
-            const vec3 dir =
-                normalize(sunV + (u * float(i) + v * float(j)) * gridStep);
-            if (!sunRayEscapes(origin, dir)) {
-                ++blocked;
-            }
+    const float xzLen = length(sunV.xz);
+    if (farHit) {
+        // Far-LOD surface: far cells up to the region boundary, ONE
+        // field test at the boundary column (its (H, D) aggregates
+        // every blocker up-sun through the region), far cells again
+        // past the far boundary. (Marching only far cells missed the
+        // near columns a ray from outside the region crosses.)
+        float tEnter = 0.0;
+        float tExit = 0.0;
+        if (sunShadowRegionSlabS(origin, sunV, tEnter, tExit) &&
+            tExit > tEnter) {
+            // farCoverage returns VISIBILITY: the legs combine with min.
+            float visF = sunShadowFarCoverage(origin, sunV, coneTan, 0.0,
+                                              max(tEnter, 0.0));
+            const vec2 mapMin =
+                vec2(pc.region.x, pc.region.z) * float(pc.chunkSize.x);
+            const vec2 pIn = origin.xz + sunV.xz * (tEnter + 0.01) - mapMin;
+            const ivec2 cIn = ivec2(floor(pIn));
+            visF = min(visF,
+                       1.0 - sunShadowKnife(sunShadowRawH(cIn.x, cIn.y),
+                                            sunShadowRawD(cIn.x, cIn.y), 0.0,
+                                            origin.y + sunV.y * tEnter,
+                                            coneTan, xzLen, sunV.y));
+            visF = min(visF, sunShadowFarCoverage(origin, sunV, coneTan,
+                                                  tExit + 0.01, 1e30));
+            return visF;
         }
+        return sunShadowFarCoverage(origin, sunV, coneTan, 0.0, 1e30);
     }
-    return 1.0 - float(blocked) / 9.0;
+    const float nearVis = sunShadowSoftNear(origin, sunV, coneTan);
+    if (nearVis <= 0.0) {
+        return 0.0;
+    }
+    const float sExit = sunShadowRegionExitS(origin, sunV) + 0.01;
+    return min(nearVis, sunShadowFarCoverage(origin, sunV, coneTan, sExit,
+                                             1e30));
 }
 
 float fogAmount(float dist)
@@ -599,7 +938,7 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
     // at full sun while the near terrain right next to it sat in shade.
     float shadow = 1.0;
     if (ndl > 0.0) {
-        shadow = sunShadow(hitPos, n);
+        shadow = sunShadow(hitPos, n, sFarHit);
     }
 
     // Lighting model ported from the owner's WGSL reference renderer:

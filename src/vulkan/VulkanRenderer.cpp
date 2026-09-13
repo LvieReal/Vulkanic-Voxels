@@ -443,6 +443,29 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
                        .count();
   }
 
+  // Sun shadow heightmap (pass 24): reconfigure on sun-direction change,
+  // advance the sliced ray-splat build, publish completed cycles.
+  if (m_sunShadowReady) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
+    if (sun != m_sunShadowSun) {
+      m_sunShadow.configure(m_sunShadow.width(), m_sunShadow.height(),
+                            static_cast<double>(sun.x),
+                            static_cast<double>(std::max(sun.y, 0.05f)),
+                            static_cast<double>(sun.z));
+      m_sunShadowSun = sun;
+      m_sunShadow.setTops(m_sunShadowTops.data());
+      sunShadowAssembleTops();
+      m_sunShadow.requestRebuild();
+    }
+    if (m_sunShadow.tick(64)) {
+      sunShadowPublishField();
+    }
+    m_perfFarMs += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+  }
+
   // Chunk fade-in alphas (binding 7): age every tracked slot, finalize
   // finished fades, publish the whole (tiny) array via mapped memory.
   if (!m_slotFadeStart.empty()) {
@@ -796,6 +819,10 @@ void VulkanRenderer::pumpRegionStreaming() {
         m_world->installChunk(gen.coord, std::move(gen.types));
     m_slotOf[gen.coord] = slot;
     m_slotFadeStart[slot] = std::chrono::steady_clock::now();
+    // Sun shadow tops (pass 24): patch this chunk's columns; the next
+    // build cycle picks them up (requestRebuild is a cheap flag).
+    sunShadowWriteChunkTops(gen.coord.x, gen.coord.z);
+    m_sunShadow.requestRebuild();
     std::string error;
     if (!m_voxelResources.uploadChunksStreaming(
             m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
@@ -910,9 +937,77 @@ void VulkanRenderer::publishRegionTable(bool logHoles) {
     std::fprintf(stderr, "[vulkan] region table publish failed\n");
     return;
   }
+  const std::int32_t prevOriginX = m_tableOriginX;
+  const std::int32_t prevOriginZ = m_tableOriginZ;
   m_tableHalf = nextHalf;
   m_tableOriginX = m_streamTarget.x;
   m_tableOriginZ = m_streamTarget.z;
+
+  // Sun shadow tops/field follow the table grid (pass 24): shift by the
+  // origin delta, refresh the exposed bands, schedule a rebuild. Rays
+  // read tops live, so mid-stream publishes just keep converging.
+  if (m_sunShadowReady &&
+      (m_tableOriginX != prevOriginX || m_tableOriginZ != prevOriginZ)) {
+    const std::int32_t gw = static_cast<std::int32_t>(m_sunShadow.width());
+    const std::int32_t gh =
+        static_cast<std::int32_t>(m_sunShadow.height());
+    const std::int32_t cs =
+        static_cast<std::int32_t>(m_voxelConfig.chunkSizeX);
+    const std::int32_t dxC =
+        (m_tableOriginX - prevOriginX) * cs;
+    const std::int32_t dzC =
+        (m_tableOriginZ - prevOriginZ) * cs;
+    const std::size_t cells =
+        static_cast<std::size_t>(gw) * static_cast<std::size_t>(gh);
+    if (!m_sunShadowAssembled ||
+        std::abs(dxC) >= gw || std::abs(dzC) >= gh) {
+      // First assembly, or a teleport: the old grid is meaningless.
+      sunShadowAssembleTops();
+      m_sunShadow.shiftField(dxC, dzC);  // teleports zero the field
+    } else {
+      std::vector<std::uint16_t> shifted(cells, 0);
+      for (std::int32_t z = 0; z < gh; ++z) {
+        const std::int32_t sz = z + dzC;
+        if (sz < 0 || sz >= gh) {
+          continue;
+        }
+        for (std::int32_t x = 0; x < gw; ++x) {
+          const std::int32_t sx = x + dxC;
+          if (sx < 0 || sx >= gw) {
+            continue;
+          }
+          shifted[static_cast<std::size_t>(x) +
+                  static_cast<std::size_t>(z) * gw] =
+              m_sunShadowTops[static_cast<std::size_t>(sx) +
+                              static_cast<std::size_t>(sz) * gw];
+        }
+      }
+      m_sunShadowTops = std::move(shifted);
+      m_sunShadow.shiftField(dxC, dzC);
+      // Refresh only the exposed bands (an L-shape of chunks).
+      const std::int32_t r =
+          static_cast<std::int32_t>(m_voxelConfig.renderRadiusChunks);
+      const std::int32_t gwC =
+          static_cast<std::int32_t>(m_voxelConfig.gridWidth());
+      const std::int32_t ghC =
+          static_cast<std::int32_t>(m_voxelConfig.gridHeight());
+      const std::int32_t dchX = dxC / cs;
+      const std::int32_t dchZ = dzC / cs;
+      for (std::int32_t gz = 0; gz < ghC; ++gz) {
+        for (std::int32_t gx = 0; gx < gwC; ++gx) {
+          const bool exposedX =
+              (dchX > 0 && gx >= gwC - dchX) || (dchX < 0 && gx < -dchX);
+          const bool exposedZ =
+              (dchZ > 0 && gz >= ghC - dchZ) || (dchZ < 0 && gz < -dchZ);
+          if (exposedX || exposedZ) {
+            sunShadowWriteChunkTops(m_tableOriginX - r + gx,
+                                    m_tableOriginZ - r + gz);
+          }
+        }
+      }
+    }
+    m_sunShadow.requestRebuild();
+  }
 
   if (logHoles) {
     std::size_t holes = 0;
@@ -1242,6 +1337,152 @@ std::size_t VulkanRenderer::drainFarPatch() {
                  error.c_str());
   }
   return chunks.size();
+}
+void VulkanRenderer::sunShadowConfigure() {
+  const std::uint32_t cols =
+      m_voxelConfig.gridWidth() * m_voxelConfig.chunkSizeX;
+  const std::uint32_t rows =
+      m_voxelConfig.gridHeight() * m_voxelConfig.chunkSizeZ;
+  const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
+  // sun.y clamped so rays stay finite even for a below-horizon light (the
+  // shader treats y <= 0.05 as fully lit anyway).
+  m_sunShadow.configure(cols, rows, static_cast<double>(sun.x),
+                        static_cast<double>(std::max(sun.y, 0.05f)),
+                        static_cast<double>(sun.z));
+  m_sunShadowSun = sun;
+  m_sunShadowTops.assign(static_cast<std::size_t>(cols) * rows, 0);
+  // Layout: [H grid][D grid], each rows * (cols/2) words (u16 pairs).
+  m_sunShadowPacked.assign(
+      static_cast<std::size_t>(cols / 2u) * rows * 2u, 0);
+  m_sunShadow.setTops(m_sunShadowTops.data());
+  m_sunShadowReady = true;
+  m_sunShadowAssembled = false;
+  // The GPU buffer is device-local: upload the zeroed field once so the
+  // shader starts from a defined (shadow-free) state; real fields arrive
+  // as build cycles complete.
+  std::string error;
+  if (!m_voxelResources.uploadSunShadowField(
+          m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+          m_sunShadowPacked, error)) {
+    std::fprintf(stderr, "[vulkan] sun shadow field init failed: %s\n",
+                 error.c_str());
+  }
+}
+
+std::uint16_t VulkanRenderer::sunShadowFarTop(std::int32_t voxX,
+                                              std::int32_t voxZ) const {
+  if (!m_farFieldActive || m_farDim == 0 || m_farCells.empty()) {
+    return 0;
+  }
+  const std::int32_t fx = static_cast<std::int32_t>(std::floor(
+      (static_cast<double>(voxX) + 0.5 - m_farOriginVoxX) / m_farCell));
+  const std::int32_t fz = static_cast<std::int32_t>(std::floor(
+      (static_cast<double>(voxZ) + 0.5 - m_farOriginVoxZ) / m_farCell));
+  if (fx < 0 || fz < 0 || fx >= static_cast<std::int32_t>(m_farDim) ||
+      fz >= static_cast<std::int32_t>(m_farDim)) {
+    return 0;
+  }
+  // height | type << 16 (u32); clamp so 0xFFFF "no data" cannot leak in.
+  return static_cast<std::uint16_t>(std::min<std::uint32_t>(
+      m_farCells[static_cast<std::size_t>(fx) +
+                 static_cast<std::size_t>(fz) * m_farDim] &
+          0xFFFFu,
+      m_voxelConfig.worldHeight));
+}
+
+void VulkanRenderer::sunShadowWriteChunkTops(std::int32_t cx,
+                                             std::int32_t cz) {
+  if (!m_sunShadowReady || !m_world) {
+    return;
+  }
+  const std::int32_t r =
+      static_cast<std::int32_t>(m_voxelConfig.renderRadiusChunks);
+  const std::int32_t gx = cx - (m_tableOriginX - r);
+  const std::int32_t gz = cz - (m_tableOriginZ - r);
+  const std::int32_t gw = static_cast<std::int32_t>(m_sunShadow.width());
+  const std::int32_t gh = static_cast<std::int32_t>(m_sunShadow.height());
+  if (gx < 0 || gz < 0 || gx >= gw || gz >= gh) {
+    return;
+  }
+  const std::uint32_t cs = m_voxelConfig.chunkSizeX;
+  const vv::voxel::Chunk* chunk =
+      m_world->findChunk(vv::voxel::ChunkCoord{cx, cz});
+  const std::uint16_t* heights =
+      chunk != nullptr ? chunk->heightMap().data() : nullptr;
+  const std::int32_t voxX0 = cx * static_cast<std::int32_t>(cs);
+  const std::int32_t voxZ0 = cz * static_cast<std::int32_t>(cs);
+  const std::int32_t baseX = gx * static_cast<std::int32_t>(cs);
+  const std::int32_t baseZ = gz * static_cast<std::int32_t>(cs);
+  for (std::uint32_t lz = 0; lz < cs; ++lz) {
+    for (std::uint32_t lx = 0; lx < cs; ++lx) {
+      std::uint16_t top = 0;
+      if (heights != nullptr) {
+        top = heights[lx + lz * cs];
+        if (top == 0xFFFFu) {
+          top = 0;  // "no data" chunk column: treat as empty
+        }
+        top = static_cast<std::uint16_t>(std::min<std::uint32_t>(
+            top, m_voxelConfig.worldHeight));
+      } else {
+        top = sunShadowFarTop(voxX0 + static_cast<std::int32_t>(lx),
+                              voxZ0 + static_cast<std::int32_t>(lz));
+      }
+      m_sunShadowTops[static_cast<std::size_t>(baseX + lx) +
+                      static_cast<std::size_t>(baseZ + lz) * gw] = top;
+    }
+  }
+}
+
+void VulkanRenderer::sunShadowAssembleTops() {
+  if (!m_sunShadowReady) {
+    return;
+  }
+  const std::int32_t r =
+      static_cast<std::int32_t>(m_voxelConfig.renderRadiusChunks);
+  for (std::int32_t dz = -r; dz <= r; ++dz) {
+    for (std::int32_t dx = -r; dx <= r; ++dx) {
+      sunShadowWriteChunkTops(m_tableOriginX + dx, m_tableOriginZ + dz);
+    }
+  }
+  m_sunShadowAssembled = true;
+}
+
+void VulkanRenderer::sunShadowPublishField() {
+  if (!m_sunShadowReady) {
+    return;
+  }
+  const auto& field = m_sunShadow.heightField();
+  if (field.empty()) {
+    return;
+  }
+  const auto& dist = m_sunShadow.distField();
+  if (dist.size() != field.size()) {
+    return;
+  }
+  const std::uint32_t cols = m_sunShadow.width();
+  const std::uint32_t rows = m_sunShadow.height();
+  const std::uint32_t wordsPerRow = cols / 2u;
+  const std::size_t gridWords =
+      static_cast<std::size_t>(wordsPerRow) * rows;
+  for (std::uint32_t row = 0; row < rows; ++row) {
+    const std::size_t src = static_cast<std::size_t>(row) * cols;
+    const std::size_t dst = static_cast<std::size_t>(row) * wordsPerRow;
+    for (std::uint32_t wx = 0; wx < wordsPerRow; ++wx) {
+      m_sunShadowPacked[dst + wx] =
+          static_cast<std::uint32_t>(field[src + wx * 2u]) |
+          (static_cast<std::uint32_t>(field[src + wx * 2u + 1u]) << 16u);
+      m_sunShadowPacked[gridWords + dst + wx] =
+          static_cast<std::uint32_t>(dist[src + wx * 2u]) |
+          (static_cast<std::uint32_t>(dist[src + wx * 2u + 1u]) << 16u);
+    }
+  }
+  std::string error;
+  if (!m_voxelResources.uploadSunShadowField(
+          m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+          m_sunShadowPacked, error)) {
+    std::fprintf(stderr, "[vulkan] sun shadow field upload failed: %s\n",
+                 error.c_str());
+  }
 }
 
 glm::vec3 VulkanRenderer::spawnPosition() const {
@@ -1755,15 +1996,21 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   texInfoBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   texInfoBinding.descriptorCount = 1;
   texInfoBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutBinding sunShadowBinding{};
+  sunShadowBinding.binding = 11;
+  sunShadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  sunShadowBinding.descriptorCount = 1;
+  sunShadowBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
-      textureArrayBinding, textureSamplerBinding, texInfoBinding};
+      textureArrayBinding, textureSamplerBinding, texInfoBinding,
+      sunShadowBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 11;
+  info.bindingCount = 12;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1865,6 +2112,10 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
       return false;
     }
   }
+
+  // Sun shadow heightmap (binding 11): builder + zeroed GPU field; the
+  // tops fill in as chunks stream (each install patches its columns).
+  sunShadowConfigure();
 
   m_slotOf.clear();
   m_freeSlots.clear();
@@ -2149,7 +2400,7 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 8;  // voxel atlas, output, chunk table,
+  poolSizes[0].descriptorCount = 10;  // voxel atlas, output, chunk table,
                                      // palette, column heights, far LOD,
                                      // chunk fade, texture info table
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -2222,7 +2473,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[11] = {};
+  VkWriteDescriptorSet writes[12] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2327,7 +2578,18 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[10].pBufferInfo = &texInfoInfo;
 
-  vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
+  VkDescriptorBufferInfo sunShadowInfo{};
+  sunShadowInfo.buffer = m_voxelResources.sunShadowBuffer();
+  sunShadowInfo.offset = 0;
+  sunShadowInfo.range = VK_WHOLE_SIZE;
+  writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[11].dstSet = m_descriptorSet;
+  writes[11].dstBinding = 11;
+  writes[11].descriptorCount = 1;
+  writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[11].pBufferInfo = &sunShadowInfo;
+
+  vkUpdateDescriptorSets(m_device, 12, writes, 0, nullptr);
   return true;
 }
 

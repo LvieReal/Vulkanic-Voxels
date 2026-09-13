@@ -135,12 +135,23 @@ class VoxelResources final {
 	// whatever is behind them (far LOD / sky / another chunk).
 	void writeChunkFade(const std::vector<float>& alphas);
 
+	// Sun shadow height field (binding 11): one u16 per region column
+	// (800x800 at the default config), packed two-per-u32 along X,
+	// row-major. Produced by vv::terrain::SunShadowBuilder on the CPU
+	// and uploaded whenever a build cycle completes. The first upload
+	// also initializes the buffer (zero = no shadow).
+	bool uploadSunShadowField(VkDevice device, VkPhysicalDevice physicalDevice,
+														VkCommandPool commandPool, VkQueue queue,
+														const std::vector<std::uint32_t>& packed,
+														std::string& outError);
+
 	void cleanup(VkDevice device);
 
 	VkBuffer voxelBuffer() const { return m_voxelBuffer; }
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
 	VkBuffer fadeBuffer() const { return m_fadeBuffer; }
+	VkBuffer sunShadowBuffer() const { return m_sunShadowBuffer; }
 
 	// Bindless texture array (one image per texture FILE plus the white
 	// dummy at index 0; see createVoxelTextures). Empty until created.
@@ -178,6 +189,19 @@ class VoxelResources final {
 	VkBuffer m_fadeBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_fadeMemory = VK_NULL_HANDLE;
 	void* m_mappedFade = nullptr;
+
+	// Sun shadow height field (binding 11; see uploadSunShadowField).
+	VkBuffer m_sunShadowBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_sunShadowMemory = VK_NULL_HANDLE;
+	std::uint32_t m_sunShadowCols = 0;
+	std::uint32_t m_sunShadowRows = 0;
+	std::uint32_t m_sunShadowWordsPerRow = 0;
+	VkBuffer m_sunShadowStaging = VK_NULL_HANDLE;
+	VkDeviceMemory m_sunShadowStagingMemory = VK_NULL_HANDLE;
+	void* m_sunShadowStagingMapped = nullptr;
+	VkCommandBuffer m_sunShadowCmd = VK_NULL_HANDLE;
+	VkFence m_sunShadowFence = VK_NULL_HANDLE;
+	bool m_sunShadowFencePending = false;
 
 	// Bindless voxel textures (see createVoxelTextures): one image per
 	// texture FILE plus a shared REPEAT/nearest-texel sampler.

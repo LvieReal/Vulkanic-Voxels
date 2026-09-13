@@ -20,6 +20,7 @@
 #include "render/LightingConfig.hpp"
 #include "render/SceneUniform.hpp"
 #include "terrain/FarField.hpp"
+#include "terrain/SunShadowMap.hpp"
 #include "voxel/VoxelConfig.hpp"
 #include "voxel/World.hpp"
 #include "vulkan/VoxelResources.hpp"
@@ -85,6 +86,15 @@ class VulkanRenderer final {
   // extent grows only over chunks actually scanned. Folded mountains can
   // under-estimate by 20+ voxels -> holes at the seam without this.
   std::size_t drainFarPatch();
+
+  // Sun shadow heightmap (pass 24). The CPU ray-splat builder produces a
+  // per-region-column shadow height (binding 11); these keep the tops it
+  // reads in sync with streamed chunks and publish completed cycles.
+  void sunShadowConfigure();
+  std::uint16_t sunShadowFarTop(std::int32_t voxX, std::int32_t voxZ) const;
+  void sunShadowWriteChunkTops(std::int32_t cx, std::int32_t cz);
+  void sunShadowAssembleTops();
+  void sunShadowPublishField();
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
@@ -293,6 +303,16 @@ class VulkanRenderer final {
   std::uint32_t m_tableHalf = 0;
   std::int32_t m_tableOriginX = 0;
   std::int32_t m_tableOriginZ = 0;
+  // Sun shadow heightmap (pass 24): builder state + the region-column
+  // tops it reads (Chunk::heightMap values, far-LOD fallback for cells
+  // without a chunk). m_sunShadowPacked is the staging view of the last
+  // completed field (two u16 per u32, row-major).
+  vv::terrain::SunShadowBuilder m_sunShadow;
+  std::vector<std::uint16_t> m_sunShadowTops;
+  std::vector<std::uint32_t> m_sunShadowPacked;
+  glm::vec3 m_sunShadowSun{0.0f, 0.0f, 0.0f};
+  bool m_sunShadowReady = false;
+  bool m_sunShadowAssembled = false;
   // Slots released by a region swap, waiting until no in-flight frame can
   // reference them (two frames) before rejoining the free list.
   std::vector<std::pair<std::uint32_t, std::uint32_t>> m_slotCooldown;
