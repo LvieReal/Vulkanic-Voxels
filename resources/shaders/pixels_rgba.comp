@@ -85,15 +85,26 @@ layout(set = 0, binding = 7) readonly buffer ChunkFade {
     float alpha[];
 } chunkFade;
 
-// Bindless per-type voxel detail textures (pass 20): one image per
-// VoxelType - NO atlas. Grayscale detail in [0.55, 1.0], multiplied into
-// the palette albedo at hit time (colors stay data-driven, see
-// kVoxelTypeInfo). Indexed non-uniformly: the type varies per ray. The
-// sampler (binding 9) is REPEAT (world-space UVs tile it per voxel) with
-// trilinear mips; the LOD is explicit because ray divergence makes
-// derivatives useless in a marcher.
-layout(set = 0, binding = 8) uniform texture2D voxelTextures[7];
+// Bindless voxel textures (passes 20/21): one image per texture FILE
+// (loaded from resources/textures/voxels; NO atlas). The array is
+// indexed through the per-type face table (binding 10); the sampled
+// image is the face's ALBEDO when the type has files, and types
+// without files fall back to the palette colors (voxelColor). The
+// sampler (binding 9) is REPEAT (world-space UVs tile it per voxel)
+// with NEAREST texel filtering and linear mip blends; the LOD is
+// explicit because ray divergence makes derivatives useless in a
+// marcher.
+layout(set = 0, binding = 8) uniform texture2D
+    voxelTextures[48];  // = kMaxVoxelTextures (voxel/VoxelTextures.hpp)
 layout(set = 0, binding = 9) uniform sampler voxelSampler;
+
+// Per-type face table: 8 u32 per VoxelType. Words 0..5 = image index
+// for face id 0..5 (0 = +Y, 1 = -Y, 2 = +X, 3 = -X, 4 = +Z, 5 = -Z);
+// 0xFFFFFFFF = no texture for that face (palette color). Word 6 =
+// nominal texture size (the explicit-LOD estimate), word 7 unused.
+layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
+    uint perType[];
+} voxelTexInfo;
 
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
@@ -364,12 +375,31 @@ float calculateAO(ivec3 voxel, vec3 n, vec3 hitPos)
 // beyond. Cheap because the sun is high: the ray ascends past all terrain
 // within a few dozen columns and the march ends there. Returns 1.0 lit /
 // 0.0 shadowed.
+// Sun shadows (pass 21): one ascending column march toward the sun -
+// the same 2D DDA + height-bound voxel walk that is pinned by the CPU
+// parity mirror in tests/terrain_world_tests.cpp - where every blocker
+// contributes a soft ANGULAR coverage instead of a binary hit:
+//
+//   cov = clamp(0.5 + (blockerTop - y) / (2 * coneTan * s), 0, 1)
+//
+// i.e. the blocker's top, at march distance s, covers that fraction of
+// the sun disk's angular diameter (coneTan = tan of the disk's half
+// angle, scene.misc.w; default tan 2.5 deg). The answer is 1 minus the
+// WORST blocker's coverage: a smooth penumbra that widens with
+// distance, while a surface the ray barely clears self-cancels (the
+// numerator shrinks as fast as the ray climbs). With coneTan = 0 (or
+// VV_SHADOW_SHARP=1) every coverage clamps to 0 or 1 and the march is
+// EXACTLY the old binary shadow ray - same columns, same voxel walks.
+// Single-march approximation: the disk's azimuthal extent is ignored
+// (occluders beside the ray lighten the penumbra slightly).
 float sunShadow(vec3 hitPosVox, vec3 n)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);
     if (sunWorld.y <= 0.05) {
         return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
     }
+    const float coneTan = scene.misc.w;
+    const bool soft = coneTan > 0.0;
     const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
     const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
     // Lift off the surface (along the normal, then along the sun) to avoid
@@ -404,15 +434,19 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     const ivec2 farDim = pc.far.zw;
     const vec2 farOrigin = vec2(pc.far.xy);
     float s = 0.0;  // world-unit parameter along sunV
+    float pen = 0.0;  // worst blocker coverage so far
 
     // A high sun lifts the ray above maxTerrain quickly; 256 columns covers
     // every realistic caster (and bounds the worst case for low suns).
     for (int i = 0; i < 256; ++i) {
         const float sExit = min(sMaxX, sMaxZ);
         const float y0 = origin.y + sunV.y * s;       // ascending (sun up)
+        // In soft mode the disk dips below the ray by coneTan * s; blockers
+        // down to that line can still cover part of the disk.
+        const float dip = soft ? coneTan * s : 0.0;
 
-        if (y0 >= maxTerr) {
-            return 1.0;  // above all possible terrain: lit from here on
+        if (y0 - dip >= maxTerr) {
+            return 1.0 - pen;  // whole disk above all possible terrain
         }
 
         uint slot = 0u;
@@ -421,19 +455,34 @@ float sunShadow(vec3 hitPosVox, vec3 n)
             // Near region: the height bound says whether a blocker can
             // exist in this column at all.
             const uint bound = columnHeightBound(col.x, col.y);
-            if (bound != kNoHeightData && float(bound) > y0) {
-                // Walk only the cells the segment occupies below the bound
-                // (ascending: from the entry cell up).
+            if (bound != kNoHeightData && float(bound) > y0 - dip) {
+                // Walk only the cells the segment (widened by the dip in
+                // soft mode) occupies below the bound, ascending.
                 const float y1 = origin.y + sunV.y * sExit;
                 const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
                                      int(pc.chunkSize.y) - 1);
                 const uint colBase = uint(local.x) +
                                      uint(local.y) *
                                          (pc.chunkSize.x * pc.chunkSize.y);
-                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
+                for (int y = max(int(floor(y0 - dip)), 0); y <= yTop; ++y) {
                     if (fetchVoxel(slot,
                                    colBase + uint(y) * pc.chunkSize.x) != 0u) {
-                        return 0.0;
+                        // Solid cell [y, y+1): its top at distance s covers
+                        // this fraction of the sun disk (soft), or blocks
+                        // outright (sharp - identical to the old march).
+                        float cov;
+                        if (soft) {
+                            cov = clamp(
+                                0.5 + (float(y) + 1.0 - y0) /
+                                          (2.0 * coneTan * max(s, 1e-4)),
+                                0.0, 1.0);
+                        } else {
+                            cov = 1.0;
+                        }
+                        pen = max(pen, cov);
+                        if (pen >= 1.0) {
+                            return 0.0;
+                        }
                     }
                 }
             }
@@ -448,8 +497,16 @@ float sunShadow(vec3 hitPosVox, vec3 n)
                     farLod.cells[farBase() + uint(fc.x) +
                                  uint(fc.y) * uint(farDim.x)];
                 const float h = float(packed & 0xFFFFu);
-                if (h > 0.0 && y0 < h) {
-                    return 0.0;
+                if (h > 0.0 && h > y0 - dip) {
+                    const float cov = soft
+                        ? clamp(0.5 + (h - y0) /
+                                          (2.0 * coneTan * max(s, 1e-4)),
+                                0.0, 1.0)
+                        : 1.0;
+                    pen = max(pen, cov);
+                    if (pen >= 1.0) {
+                        return 0.0;
+                    }
                 }
             }
         }
@@ -462,7 +519,7 @@ float sunShadow(vec3 hitPosVox, vec3 n)
         col.x += takeX ? sStepX : 0;
         col.y += takeX ? 0 : sStepZ;
     }
-    return 1.0;
+    return 1.0 - pen;
 }
 
 float fogAmount(float dist)
@@ -485,11 +542,26 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
     vec3 n = normalize(sNormal);
     vec3 sunDir = normalize(scene.lightDir.xyz);
     float ndl = max(dot(n, sunDir), 0.0);
-    vec3 base = voxelColor(sType, sNormal);
 
-    // Detail texture (near hits only - the far LOD keeps the flat
-    // palette color, which is what the mip chain averages to anyway).
-    if (!sFarHit) {
+    // Albedo: the face's texture file when the type has one (binding 10
+    // face table -> bindless image), else the palette color. Applies to
+    // far-LOD hits too: deep mips average to the texture's mean color,
+    // which keeps the near/far seam consistent.
+    vec3 base;
+    uint texIdx = 0xFFFFFFFFu;
+    float nominal = 32.0;
+    if (sType < 7u) {
+        const uint fid = (sNormal.y > 0.5) ? 0u
+            : (sNormal.y < -0.5) ? 1u
+            : (sNormal.x > 0.5) ? 2u
+            : (sNormal.x < -0.5) ? 3u
+            : (sNormal.z > 0.5) ? 4u : 5u;
+        texIdx = voxelTexInfo.perType[sType * 8u + fid];
+        nominal = float(voxelTexInfo.perType[sType * 8u + 6u]);
+    }
+    if (texIdx == 0xFFFFFFFFu) {
+        base = voxelColor(sType, sNormal);  // plain colors (no files)
+    } else {
         // World-space UV on the hit face: the two axes tangent to it.
         // REPEAT addressing tiles the texture per voxel (1 uv unit).
         const vec2 uv = abs(sNormal.y) > 0.5
@@ -497,15 +569,15 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
             : (abs(sNormal.x) > 0.5 ? hitPos.zy : hitPos.xy);
         // Explicit LOD from the texel footprint: texels per pixel =
         // texRes * worldUnitsPerPixel, worldUnitsPerPixel at distance d
-        // = d * 2 * tanHalfFov / screenHeight.
+        // = d * 2 * tanHalfFov / screenHeight. Clamped to the mip chain.
         const float texelsPerPixel =
-            32.0 * (sTEntryOffset + sTHit) * 2.0 * pc.camera.x /
+            nominal * (sTEntryOffset + sTHit) * 2.0 * pc.camera.x /
             float(pc.screen.y);
-        const float lod = log2(max(texelsPerPixel, 1.0));
-        const float detail = textureLod(
-            sampler2D(voxelTextures[nonuniformEXT(sType)], voxelSampler),
-            uv, lod).r;
-        base *= detail;
+        float lod = log2(max(texelsPerPixel, 1.0));
+        lod = min(lod, log2(max(nominal, 1.0)));
+        base = textureLod(
+            sampler2D(voxelTextures[nonuniformEXT(texIdx)], voxelSampler),
+            uv, lod).rgb;
     }
 
     // Per-vertex simulated AO on the hit face (from the owner's WGSL

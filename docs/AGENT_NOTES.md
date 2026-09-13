@@ -62,6 +62,7 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   far cell (data hole), cyan = data present but ray passed over (height
   too low), yellow = march never crossed the chunk.
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
+- VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation
@@ -86,33 +87,40 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 20)
+## Current status (pass 21)
 
-Owner-verified pass 19 (fade-in works, no adjustments). Pass 20 asks:
-fix two run scripts still on build/bin/, add voxel TEXTURES via
-BINDLESS textures (no atlas), and traversal-optimization TIPS only (no
-optimization work this pass).
+Owner-verified pass 20 (textures seamless). Pass 21 asks: (1) load
+textures from resources/textures/voxels (files on the owner's machine;
+plain-color fallback here), (2) nearest sampling by default, (3) three
+texture definition modes (uniform / side-uniform / custom), (4) soft
+shadows via CONE TRACING (chosen over flood-fill and opacity grid).
 
 Delivered:
-- run.bat / run.sh (repo root) + a stale tests comment now use
-  build/release/bin/game(.exe).
-- Bindless per-type detail textures: one 32x32 mip-chained RGBA8 image
-  per VoxelType (binding 8, sampled-image array indexed
-  nonuniformEXT(type); shared REPEAT/trilinear sampler at binding 9; NO
-  atlas). Images are generated deterministically on the CPU
-  (src/voxel/VoxelTextures.{hpp,cpp}: tileable lattice noise, grayscale
-  detail in [0.55, 1.0], per-type recipes; unit tested), uploaded and
-  mip-blitted in one one-time submit (VoxelResources::
-  createVoxelTextures). Shader multiplies the detail into the palette
-  albedo (colors stay data-driven) with world-space face UVs (tile per
-  voxel) and an EXPLICIT LOD: texelsPerPixel = 32 * dist * 2 *
-  tanHalfFov / screenH (derivatives are useless under ray divergence).
-  Far-LOD hits keep flat palette colors. Device creation now requires +
-  verifies Vulkan 1.2 descriptor indexing (clear error if absent) and
-  enables shaderSampledImageArrayDynamicIndexing +
-  shaderSampledImageArrayNonUniformIndexing.
-- Bindings: 8 = texture2D array (kVoxelTypeCount), 9 = sampler; pool
-  has SAMPLED_IMAGE/SAMPLER sizes; writes 10 total.
+- File textures: Qt loader (src/render/VoxelTextureFiles.*) reads
+  <name>.png (uniform, all 6 faces), <name>_top/_bottom/_side.png
+  (side-uniform) or <name>_top/_bottom/_px/_nx/_pz/_nz.png (custom);
+  most specific complete set wins, missing -> plain palette colors.
+  Search: executableDir()/resources/textures/voxels then CWD (run
+  scripts launch from repo root -> new files work without rebuild).
+  Binding 8 = image array (capacity kMaxVoxelTextures=48, unused slots
+  bound to a 1x1 white dummy), binding 9 = sampler (NEAREST texels,
+  linear mips), binding 10 = per-type table SSBO (6 face image indices
+  or 0xFFFFFFFF = plain, word 6 = nominal size for the explicit LOD).
+  Textured faces use the file as ALBEDO; far-LOD hits sample deep mips
+  (average color) so the near/far seam stays consistent. The pass-20
+  procedural generator is GONE (replaced by files + plain fallback).
+- Soft sun shadows, cone-traced: ONE march (same column DDA + voxel
+  walk as the sharp march) where each blocker contributes an ANGULAR
+  coverage: cov = clamp(0.5 + (blockerTop - y)/(2*coneTan*s), 0, 1);
+  vis = 1 - worst coverage. coneTan = scene.misc.w (default tan 2.5
+  deg = 0.0437); VV_SHADOW_SHARP=1 (or 0) -> exact binary march
+  (byte-identical behavior, pinned by the parity test). Vertical-slice
+  approximation: azimuthal disk extent ignored (occluders beside the
+  ray lighten penumbrae slightly).
+- Tests: texture mode/suffix/face-map tables; shadow cone mirror vs an
+  independent 13-direction dense reference (mean |diff| 0.012, >=97%
+  within 0.25, quantization-graze outliers <=1% and only where the
+  exact sharp march also blocks - consistency invariant checked).
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

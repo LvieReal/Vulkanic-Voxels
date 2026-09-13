@@ -1449,13 +1449,18 @@ struct ShadowWorld {
 	}
 };
 
-// Mirror of the shader's sunShadow (same offsets, clamps, tie-breaks, cap).
-bool sunLitMirror(const ShadowWorld& w, const double origin[3],
-									const double n[3], const double sun[3]) {
+// Mirror of the shader's sunShadow (pass 21): one ascending column
+// march; each blocker contributes an angular coverage of the sun disk
+// (see the shader comment). coneTan = 0 reproduces the exact binary
+// march (same offsets, clamps, tie-breaks, cap).
+double sunVisMarch(const ShadowWorld& w, const double origin[3],
+									 const double n[3], const double sun[3],
+									 double coneTan) {
 	if (sun[1] <= 0.05) {
-		return true;
+		return 1.0;
 	}
 	const double EPS = 1e-6;
+	const bool soft = coneTan > 0.0;
 	double o[3];
 	for (int a = 0; a < 3; ++a) {
 		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
@@ -1479,36 +1484,56 @@ bool sunLitMirror(const ShadowWorld& w, const double origin[3],
 	}
 
 	double s = 0.0;
+	double pen = 0.0;
+	auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
 	for (int i = 0; i < 256; ++i) {
 		const double sExit = std::min(tMaxX, tMaxZ);
 		const double y0 = o[1] + sun[1] * s;
-		if (y0 >= w.maxTerr) {
-			return true;
+		const double dip = soft ? coneTan * s : 0.0;
+		if (y0 - dip >= w.maxTerr) {
+			return 1.0 - pen;
 		}
 		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
 												colZ < w.near.wz;
 		if (inNear) {
 			const unsigned bound = w.near.boundAt(colX, colZ);
-			if (bound != 0xFFFFu && double(bound) > y0) {
+			if (bound != 0xFFFFu && double(bound) > y0 - dip) {
 				const double y1 = o[1] + sun[1] * sExit;
 				const int yTop = std::min(
 						int(std::floor(std::min(y1, double(bound) - 1.0))),
 						w.near.wh - 1);
-				for (int y = std::max(int(std::floor(y0)), 0); y <= yTop; ++y) {
+				for (int y = std::max(int(std::floor(y0 - dip)), 0); y <= yTop;
+						 ++y) {
 					if (w.near.at(colX, y, colZ) != 0) {
-						return false;
+						const double cov =
+								soft ? clamp01(0.5 + (double(y) + 1.0 - y0) /
+																				 (2.0 * coneTan *
+																					std::max(s, 1e-4)))
+											: 1.0;
+						pen = std::max(pen, cov);
+						if (pen >= 1.0) {
+							return 0.0;
+						}
 					}
 				}
 			}
 		} else {
 			const int fcX = int(std::floor((double(colX) + 0.5 - w.farOrigin) /
-																		w.farCell));
+																		 w.farCell));
 			const int fcZ = int(std::floor((double(colZ) + 0.5 - w.farOrigin) /
-																		w.farCell));
+																		 w.farCell));
 			const unsigned packed = w.farAt(fcX, fcZ);
 			const double h = double(packed & 0xFFFFu);
-			if (h > 0.0 && y0 < h) {
-				return false;
+			if (h > 0.0 && h > y0 - dip) {
+				const double cov =
+						soft ? clamp01(0.5 + (h - y0) /
+																 (2.0 * coneTan *
+																	std::max(s, 1e-4)))
+								 : 1.0;
+				pen = std::max(pen, cov);
+				if (pen >= 1.0) {
+					return 0.0;
+				}
 			}
 		}
 		s = std::min(tMaxX, tMaxZ);
@@ -1518,7 +1543,13 @@ bool sunLitMirror(const ShadowWorld& w, const double origin[3],
 		colX += takeX ? stepX : 0;
 		colZ += takeX ? 0 : stepZ;
 	}
-	return true;
+	return 1.0 - pen;
+}
+
+// Binary sharp march = the cone march at coneTan = 0.
+bool sunLitMirror(const ShadowWorld& w, const double origin[3],
+									const double n[3], const double sun[3]) {
+	return sunVisMarch(w, origin, n, sun, 0.0) >= 0.5;
 }
 
 // Brute force: dense sampling along the sun ray with identical semantics
@@ -1562,7 +1593,10 @@ bool sunLitBrute(const ShadowWorld& w, const double origin[3],
 	return true;
 }
 
-void testSunShadowMarch() {
+// Shared world for both shadow tests: rolling near terrain + a tall
+// wall + a tower, over a far field with a ridge taller than the near
+// terrain (so far terrain can shadow near terrain).
+ShadowWorld makeShadowWorld() {
 	ShadowWorld w;
 	w.near.cells.assign(std::size_t(w.near.wx) * w.near.wh * w.near.wz, 0);
 	for (int z = 0; z < w.near.wz; ++z) {
@@ -1593,8 +1627,7 @@ void testSunShadowMarch() {
 	}
 	w.near.recomputeHeights();
 
-	// Far field: rolling hills + a ridge taller than the near terrain (so
-	// far terrain can shadow near terrain).
+	// Far field: rolling hills + the ridge.
 	w.farCells.assign(std::size_t(w.farDim) * w.farDim, 0u);
 	for (unsigned j = 0; j < w.farDim; ++j) {
 		for (unsigned i = 0; i < w.farDim; ++i) {
@@ -1606,10 +1639,21 @@ void testSunShadowMarch() {
 					std::uint32_t(std::max(1.0, h)) | (1u << 16u);
 		}
 	}
+	return w;
+}
 
-	// Sun: normalize(0.5, 1.0, 0.5) - same shape as the game default.
+// Sun: normalize(0.5, 1.0, 0.5) - same shape as the game default.
+void shadowSun(double out[3]) {
 	const double len = std::sqrt(0.25 + 1.0 + 0.25);
-	const double sun[3] = {0.5 / len, 1.0 / len, 0.5 / len};
+	out[0] = 0.5 / len;
+	out[1] = 1.0 / len;
+	out[2] = 0.5 / len;
+}
+
+void testSunShadowMarch() {
+	ShadowWorld w = makeShadowWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
 
 	std::uint64_t rng = 0x9e3779b97f4a7c15ull;
 	auto next01 = [&rng]() {
@@ -1673,66 +1717,302 @@ void testSunShadowMarch() {
 	std::printf("shadow march: %d lit / %d shadowed agree\n", lit, shadowed);
 }
 
+// ---------------------------------------------------------------------------
+// Soft sun shadows (pass 21): the shader's sunShadow with a cone
+// (per-blocker coverage of the sun disk's vertical slice, worst blocker
+// wins) is mirrored in sunVisMarch above and checked here against an
+// independent reference: 13 directions spread over the sun disk, each
+// marched densely. Both estimate the fraction of the sun disk NOT
+// blocked; they must agree within a tolerance (the march approximates
+// the disk by its vertical slice and ignores the azimuthal extent -
+// occluders beside the ray lighten the penumbra). The march-vs-brute
+// test above pins the coneTan -> 0 limit exactly.
+// ---------------------------------------------------------------------------
+
+// Point-inside-terrain test for the dense reference. NOTE: the world
+// ceiling applies to the NEAR voxel test only - far cells in this test
+// world tower above the near world height (the ridge, up to 130 vs
+// wh = 48), exactly like the game's far LOD can exceed nothing (its
+// heights are clamped to maxTerrain <= worldHeight-1) but this test
+// world's are not.
+double conePointBlockedMirror(const ShadowWorld& w, double x, double y,
+															double z) {
+	const int cx = int(std::floor(x));
+	const int cz = int(std::floor(z));
+	if (cx >= 0 && cx < w.near.wx && cz >= 0 && cz < w.near.wz) {
+		if (y < 0.0 || y > double(w.near.wh - 1)) {
+			return 0.0;
+		}
+		return w.near.at(cx, int(std::floor(y)), cz) != 0 ? 1.0 : 0.0;
+	}
+	const int fcX = int(std::floor((double(cx) + 0.5 - w.farOrigin) /
+																 w.farCell));
+	const int fcZ = int(std::floor((double(cz) + 0.5 - w.farOrigin) /
+																 w.farCell));
+	const unsigned packed = w.farAt(fcX, fcZ);
+	const double h = double(packed & 0xFFFFu);
+	return (h > 0.0 && y < h) ? 1.0 : 0.0;
+}
+
+void coneBasis(const double dir[3], double u[3], double v[3]) {
+	double ref[3];
+	if (std::abs(dir[1]) < 0.99) {
+		ref[0] = 0.0;
+		ref[1] = 1.0;
+		ref[2] = 0.0;
+	} else {
+		ref[0] = 1.0;
+		ref[1] = 0.0;
+		ref[2] = 0.0;
+	}
+	u[0] = dir[1] * ref[2] - dir[2] * ref[1];
+	u[1] = dir[2] * ref[0] - dir[0] * ref[2];
+	u[2] = dir[0] * ref[1] - dir[1] * ref[0];
+	const double ul = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+	for (int a = 0; a < 3; ++a) {
+		u[a] /= ul;
+	}
+	v[0] = dir[1] * u[2] - dir[2] * u[1];
+	v[1] = dir[2] * u[0] - dir[0] * u[2];
+	v[2] = dir[0] * u[1] - dir[1] * u[0];
+}
+
+// Reference: 13 directions over the sun disk (center + 4 azimuths at 3
+// radii), each marched densely; visibility = fraction that escape.
+bool dirLitDense(const ShadowWorld& w, const double o[3],
+								 const double d[3]) {
+	for (double s = 0.0; s < 768.0; s += 0.2) {
+		const double y = o[1] + d[1] * s;
+		if (y >= w.maxTerr) {
+			return true;
+		}
+		if (conePointBlockedMirror(w, o[0] + d[0] * s, y,
+															 o[2] + d[2] * s) > 0.0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+double sunVisReference(const ShadowWorld& w, const double origin[3],
+											 const double n[3], const double sun[3],
+											 double coneTan) {
+	if (sun[1] <= 0.05) {
+		return 1.0;
+	}
+	double o[3];
+	for (int a = 0; a < 3; ++a) {
+		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 0.05;
+	}
+	double u[3], v[3];
+	coneBasis(sun, u, v);
+	int litCount = 0;
+	int dirs = 0;
+	for (int rad = 0; rad < 4; ++rad) {
+		const double rr = coneTan * double(rad) / 3.0;
+		const int azimuths = (rad == 0) ? 1 : 4;
+		for (int az = 0; az < azimuths; ++az) {
+			const double ang = 2.0 * 3.14159265358979323846 * double(az) /
+												 double(azimuths);
+			double d[3] = {
+					sun[0] + u[0] * rr * std::cos(ang) + v[0] * rr * std::sin(ang),
+					sun[1] + u[1] * rr * std::cos(ang) + v[1] * rr * std::sin(ang),
+					sun[2] + u[2] * rr * std::cos(ang) + v[2] * rr * std::sin(ang)};
+			const double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+			for (int a = 0; a < 3; ++a) {
+				d[a] /= dl;
+			}
+			++dirs;
+			if (dirLitDense(w, o, d)) {
+				++litCount;
+			}
+		}
+	}
+	return double(litCount) / double(dirs);
+}
+
+void testSunShadowCone() {
+	ShadowWorld w = makeShadowWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+	const double coneTan = 0.0437;  // game default (tan 2.5 deg)
+
+	std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int tested = 0;
+	int beyondTolerance = 0;
+	int beyondHard = 0;
+	int beyondHalf = 0;
+	int inconsistent = 0;  // soft fully blocked but sharp march lit
+	double maxDiff = 0.0;
+	double sumDiff = 0.0;
+	int penumbral = 0;  // points where 0 < ref < 1 (real penumbra exercised)
+	for (int i = 0; i < 1200; ++i) {
+		double origin[3], n[3] = {0.0, 1.0, 0.0};
+		if (i % 3 == 0) {
+			origin[0] = next01() * 64.0;
+			origin[2] = next01() * 64.0;
+			const unsigned bound =
+					w.near.boundAt(int(std::floor(origin[0])),
+												 int(std::floor(origin[2])));
+			origin[1] = bound == 0xFFFFu ? 10.0 : double(bound);
+		} else if (i % 3 == 1) {
+			origin[0] = 20.0;
+			origin[1] = next01() * 40.0;
+			origin[2] = next01() * 64.0;
+			n[0] = -1.0;
+			n[1] = 0.0;
+		} else {
+			origin[0] = -60.0 + next01() * 180.0;
+			origin[2] = -60.0 + next01() * 180.0;
+			const int fcX = int(std::floor(origin[0] + 64.0) / 4.0);
+			const int fcZ = int(std::floor(origin[2] + 64.0) / 4.0);
+			const unsigned packed =
+					w.farAt(fcX < 0 ? -1 : fcX, fcZ < 0 ? -1 : fcZ);
+			origin[1] = double(packed & 0xFFFFu);
+			if (origin[1] == 0.0) {
+				continue;
+			}
+		}
+		const double visCone = sunVisMarch(w, origin, n, sun, coneTan);
+		const double visRef = sunVisReference(w, origin, n, sun, coneTan);
+		++tested;
+		if (visCone < 0.0 || visCone > 1.0 || visRef < 0.0 || visRef > 1.0) {
+			check(false, "shadow cone: visibility within [0, 1]");
+			break;
+		}
+		if (visRef > 0.0 && visRef < 1.0) {
+			++penumbral;
+		}
+		const double diff = std::fabs(visCone - visRef);
+		maxDiff = std::max(maxDiff, diff);
+		sumDiff += diff;
+		if (diff > 0.25) {
+			++beyondTolerance;
+		}
+		if (diff > 0.4) {
+			++beyondHard;
+		}
+		if (diff > 0.5) {
+			++beyondHalf;
+		}
+		// Invariant: full soft blockage must agree with the exact sharp
+		// march (a coverage of 1 means a blocker angularly covers the
+		// whole disk - the sharp ray hits it too).
+		if (visCone <= 0.0 && sunLitMirror(w, origin, n, sun)) {
+			++inconsistent;
+		}
+	}
+	check(inconsistent == 0,
+				"shadow cone: full blockage agrees with the sharp march");
+	check(sumDiff / std::max(tested, 1) <= 0.03,
+				"shadow cone: mean |diff| vs reference <= 0.03");
+	check(beyondTolerance * 100 <= tested * 3,
+				"shadow cone: >=97% within the 0.25 band");
+	// Points beyond 0.5 are quantization grazes: the shadow ray clips
+	// INSIDE a solid voxel (the exact sharp march blocks there too - the
+	// consistency check above), while most reference directions dodge
+	// over the voxelized step. A model difference, not a bug - bounded.
+	check(beyondHalf * 100 <= tested,
+				"shadow cone: <=1% graze points beyond 0.5");
+	check(penumbral > 50,
+				"shadow cone: penumbra points actually exercised");
+	std::printf("shadow cone: %d pts, mean |diff| %.3f, max %.3f, %d "
+							"penumbral, %d beyond 0.25\n",
+							tested, sumDiff / std::max(tested, 1), maxDiff, penumbral,
+							beyondTolerance);
+}
+
 }  // namespace
 }  // namespace
 
 
 static void testVoxelTextures() {
-	using vv::voxel::kVoxelTextureSize;
-	using vv::voxel::kVoxelTypeCount;
+	using vv::voxel::VoxelTextureMode;
+	namespace vt = vv::voxel;
 
-	const std::size_t texels =
-			static_cast<std::size_t>(kVoxelTextureSize) * kVoxelTextureSize;
-
-	// Determinism: two runs must be byte-identical for every type.
-	bool deterministic = true;
-	// Range + character: grayscale, alpha opaque, in-range detail, and
-	// actual variance for every material (a flat texture would be a
-	// regression in the recipes).
-	bool grayscaleOpaque = true;
-	bool inRange = true;
-	bool variance = true;
-	for (std::uint32_t type = 0; type < kVoxelTypeCount; ++type) {
-		const std::vector<std::uint8_t> a =
-				vv::voxel::generateVoxelTextureRGBA(type);
-		const std::vector<std::uint8_t> b =
-				vv::voxel::generateVoxelTextureRGBA(type);
-		if (a.size() != texels * 4 || a != b) {
-			deterministic = false;
+	// Type file names: 7 entries, non-empty, distinct, air first.
+	bool namesOk = vt::kVoxelTypeNames[0] == std::string("air");
+	std::vector<std::string> seen;
+	for (std::uint32_t t = 0; t < vt::kVoxelTypeCount; ++t) {
+		const std::string n = vt::kVoxelTypeNames[t];
+		if (n.empty()) {
+			namesOk = false;
 		}
-		if (type == 0) {
-			continue;  // Air is a never-sampled placeholder.
-		}
-		float lo = 1.0f;
-		float hi = 0.0f;
-		for (std::size_t i = 0; i < texels; ++i) {
-			const std::uint8_t r = a[i * 4 + 0];
-			const std::uint8_t g = a[i * 4 + 1];
-			const std::uint8_t bl = a[i * 4 + 2];
-			const std::uint8_t al = a[i * 4 + 3];
-			if (r != g || g != bl || al != 255) {
-				grayscaleOpaque = false;
-			}
-			const float d = static_cast<float>(r) / 255.0f;
-			lo = d < lo ? d : lo;
-			hi = d > hi ? d : hi;
-			if (d < 0.54f || d > 1.0f) {
-				inRange = false;
+		for (const std::string& o : seen) {
+			if (o == n) {
+				namesOk = false;
 			}
 		}
-		if (hi - lo < 0.05f) {
-			variance = false;  // every material needs visible character
-		}
-		// Tileability: edge texels are free values (lattice wrap), so
-		// just sanity-check the size contract here; the seam test would
-		// need the noise internals.
+		seen.push_back(n);
 	}
-	check(deterministic, "textures: generator is deterministic");
-	check(grayscaleOpaque, "textures: grayscale RGB, opaque alpha");
-	check(inRange, "textures: detail within [0.55, 1.0]");
-	check(variance, "textures: every material has detail variance");
-}
+	check(namesOk, "textures: per-type file names unique, air first");
 
+	// Mode file counts: uniform 1, side-uniform 3, custom 6.
+	check(vt::voxelTextureFileCount(VoxelTextureMode::Uniform) == 1u,
+				"textures: uniform mode uses 1 file");
+	check(vt::voxelTextureFileCount(VoxelTextureMode::SideUniform) == 3u,
+				"textures: side-uniform mode uses 3 files");
+	check(vt::voxelTextureFileCount(VoxelTextureMode::Custom) == 6u,
+				"textures: custom mode uses 6 files");
+
+	// Suffix tables.
+	check(std::string(vt::voxelTextureSuffix(VoxelTextureMode::Uniform, 0)) ==
+					"",
+				"textures: uniform suffix empty");
+	bool sideSuffixes =
+			std::string(vt::voxelTextureSuffix(VoxelTextureMode::SideUniform, 0)) ==
+					"_top" &&
+			std::string(vt::voxelTextureSuffix(VoxelTextureMode::SideUniform, 1)) ==
+					"_bottom" &&
+			std::string(vt::voxelTextureSuffix(VoxelTextureMode::SideUniform, 2)) ==
+					"_side";
+	check(sideSuffixes, "textures: side-uniform suffixes top/bottom/side");
+	const char* customWant[6] = {"_top", "_bottom", "_px", "_nx", "_pz",
+															"_nz"};
+	bool customSuffixes = true;
+	for (std::uint32_t f = 0; f < 6; ++f) {
+		if (std::string(vt::voxelTextureSuffix(VoxelTextureMode::Custom, f)) !=
+				customWant[f]) {
+			customSuffixes = false;
+		}
+	}
+	check(customSuffixes, "textures: custom suffixes per face");
+
+	// Face -> file mapping for all three modes over all 6 faces.
+	bool faceMapOk = true;
+	for (std::uint32_t face = 0; face < 6; ++face) {
+		if (vt::faceTextureFile(VoxelTextureMode::Uniform, face) != 0u) {
+			faceMapOk = false;
+		}
+		const std::uint32_t sideWant =
+				face == 0 ? 0u : (face == 1 ? 1u : 2u);
+		if (vt::faceTextureFile(VoxelTextureMode::SideUniform, face) !=
+				sideWant) {
+			faceMapOk = false;
+		}
+		if (vt::faceTextureFile(VoxelTextureMode::Custom, face) != face) {
+			faceMapOk = false;
+		}
+	}
+	check(faceMapOk, "textures: face->file mapping per mode");
+
+	// Default set = plain colors (the sandbox/CI fallback).
+	const vv::voxel::VoxelTextureSet plain{};
+	bool plainOk = !plain.textured && plain.nominalSize == 32u;
+	for (std::uint32_t f = 0; f < 6; ++f) {
+		if (plain.faceIndex[f] != vv::voxel::kNoFaceTexture) {
+			plainOk = false;
+		}
+	}
+	check(plainOk, "textures: default set is plain colors");
+}
 
 int main() {
 	testVertexAO();
@@ -1753,6 +2033,7 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testSunShadowCone();
 	testVoxelTextures();
 
 	if (g_failures == 0) {

@@ -303,6 +303,11 @@ class VulkanRenderer final {
   std::vector<float> m_slotFadeScratch;
   bool m_farEverActivated = false;
   std::chrono::steady_clock::time_point m_farFadeStart{};
+
+  // Sun-shadow softness (pass 21): tan of the cone half-angle traced
+  // toward the sun (default tan(2.5 deg) - soft penumbrae). 0 = the
+  // exact single-ray march (VV_SHADOW_SHARP=1). Lands in scene.misc.w.
+  float m_shadowConeTan = 0.0437f;
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
   std::int32_t m_farCenterChunkZ = 0;

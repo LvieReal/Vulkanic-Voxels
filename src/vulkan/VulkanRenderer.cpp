@@ -14,6 +14,7 @@
 #include "core/ShaderLoader.hpp"
 #include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
+#include "render/VoxelTextureFiles.hpp"
 #include "vulkan/VulkanUtils.hpp"
 #include "voxel/VoxelTypes.hpp"
 
@@ -118,11 +119,17 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
   }
+  if (std::getenv("VV_SHADOW_SHARP")) {
+    m_shadowConeTan = 0.0f;
+    std::fprintf(stderr,
+                 "[vulkan] VV_SHADOW_SHARP: sun shadows use the exact "
+                 "single-ray march (no cone)\n");
+  }
 
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
       !pickPhysicalDevice(outError) || !createDevice(outError) ||
-      !createDescriptorSetLayout(outError) || !createCommandPool(outError) ||
-      !createVoxelWorldAndUpload(outError) || !createSceneResources(outError)) {
+      !createCommandPool(outError) || !createVoxelWorldAndUpload(outError) ||
+      !createDescriptorSetLayout(outError) || !createSceneResources(outError)) {
     cleanup();
     return false;
   }
@@ -183,7 +190,8 @@ void VulkanRenderer::drawFrame() {
   }
   m_sceneUniform.update(
       m_camera, m_timeSeconds, m_lighting,
-      glm::vec2(m_debugTerminators ? 1.0f : 0.0f, farFade));
+      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade, m_shadowConeTan,
+                0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -1726,28 +1734,36 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   fadeBinding.descriptorCount = 1;
   fadeBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  // Bindless voxel textures (pass 20): one sampled image per VoxelType,
-  // indexed non-uniformly per ray; separate sampler at binding 9.
+  // Bindless voxel textures (pass 20/21): one sampled image per texture
+  // FILE, indexed non-uniformly per ray. The array is declared at
+  // CAPACITY (kMaxVoxelTextures); the descriptor write binds the loaded
+  // images and fills the rest with the white dummy view. Sampler at
+  // binding 9; per-type face table (which image serves which face, or
+  // the plain-color sentinel) at binding 10.
   VkDescriptorSetLayoutBinding textureArrayBinding{};
   textureArrayBinding.binding = 8;
   textureArrayBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-  textureArrayBinding.descriptorCount =
-      vv::voxel::kVoxelTypeCount;
+  textureArrayBinding.descriptorCount = vv::voxel::kMaxVoxelTextures;
   textureArrayBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   VkDescriptorSetLayoutBinding textureSamplerBinding{};
   textureSamplerBinding.binding = 9;
   textureSamplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
   textureSamplerBinding.descriptorCount = 1;
   textureSamplerBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutBinding texInfoBinding{};
+  texInfoBinding.binding = 10;
+  texInfoBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  texInfoBinding.descriptorCount = 1;
+  texInfoBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
-      textureArrayBinding, textureSamplerBinding};
+      textureArrayBinding, textureSamplerBinding, texInfoBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 10;
+  info.bindingCount = 11;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1808,10 +1824,46 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
                                outError)) {
     return false;
   }
-  if (!m_voxelResources.createVoxelTextures(
-          m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
-          outError)) {
-    return false;
+  // Voxel textures from resources/textures/voxels (user's machine);
+  // missing files fall back to plain palette colors (see
+  // vv::render::loadVoxelTextureFiles + resources/textures/voxels/README).
+  // Two candidate directories: the runtime copy next to the executable
+  // (refreshed at build time) and the working directory (the run scripts
+  // launch from the repo root, so freshly added files work without a
+  // rebuild).
+  {
+    std::vector<vv::voxel::VoxelTextureImage> textureImages;
+    std::vector<vv::voxel::VoxelTextureSet> textureSets;
+    std::string textureLog;
+    std::error_code cwdError;
+    const auto cwd = std::filesystem::current_path(cwdError);
+    const std::vector<std::filesystem::path> textureDirs = {
+        vv::core::executableDir() / "resources" / "textures" / "voxels",
+        cwdError ? std::filesystem::path{}
+                 : cwd / "resources" / "textures" / "voxels"};
+    bool anyTextured = false;
+    for (const auto& textureDir : textureDirs) {
+      if (!vv::render::loadVoxelTextureFiles(textureDir, textureImages,
+                                             textureSets, textureLog)) {
+        outError = textureLog;
+        return false;
+      }
+      anyTextured = std::any_of(
+          textureSets.begin(), textureSets.end(),
+          [](const vv::voxel::VoxelTextureSet& set) { return set.textured; });
+      if (anyTextured || !textureLog.empty()) {
+        std::fprintf(stderr, "[vulkan] textures from %s:\n%s\n",
+                     textureDir.string().c_str(), textureLog.c_str());
+      }
+      if (anyTextured) {
+        break;  // first directory with real files wins
+      }
+    }
+    if (!m_voxelResources.createVoxelTextures(
+            m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+            textureImages, textureSets, outError)) {
+      return false;
+    }
   }
 
   m_slotOf.clear();
@@ -2097,14 +2149,14 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 7;  // voxel atlas, output, chunk table,
+  poolSizes[0].descriptorCount = 8;  // voxel atlas, output, chunk table,
                                      // palette, column heights, far LOD,
-                                     // chunk fade
+                                     // chunk fade, texture info table
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   poolSizes[2].descriptorCount =
-      vv::voxel::kVoxelTypeCount;  // bindless texture array
+      vv::voxel::kMaxVoxelTextures;  // bindless texture array capacity
   poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
   poolSizes[3].descriptorCount = 1;
 
@@ -2170,7 +2222,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[10] = {};
+  VkWriteDescriptorSet writes[11] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2234,18 +2286,22 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
 
   // Bindless voxel textures: one image view per VoxelType (binding 8)
   // plus the shared sampler (binding 9).
+  // Bind the loaded images; unused capacity slots get the white dummy
+  // view so every array element is a valid descriptor.
+  const uint32_t textureCount = m_voxelResources.voxelTextureCount();
   std::vector<VkDescriptorImageInfo> textureInfos(
-      vv::voxel::kVoxelTypeCount);
-  for (uint32_t type = 0; type < vv::voxel::kVoxelTypeCount; ++type) {
-    textureInfos[type].sampler = VK_NULL_HANDLE;
-    textureInfos[type].imageView = m_voxelResources.voxelTextureView(type);
-    textureInfos[type].imageLayout =
+      vv::voxel::kMaxVoxelTextures);
+  for (uint32_t i = 0; i < vv::voxel::kMaxVoxelTextures; ++i) {
+    textureInfos[i].sampler = VK_NULL_HANDLE;
+    textureInfos[i].imageView = m_voxelResources.voxelTextureView(
+        i < textureCount ? i : 0u);
+    textureInfos[i].imageLayout =
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
   writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[8].dstSet = m_descriptorSet;
   writes[8].dstBinding = 8;
-  writes[8].descriptorCount = vv::voxel::kVoxelTypeCount;
+  writes[8].descriptorCount = vv::voxel::kMaxVoxelTextures;
   writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   writes[8].pImageInfo = textureInfos.data();
 
@@ -2260,7 +2316,18 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
   writes[9].pImageInfo = &samplerInfo;
 
-  vkUpdateDescriptorSets(m_device, 10, writes, 0, nullptr);
+  VkDescriptorBufferInfo texInfoInfo{};
+  texInfoInfo.buffer = m_voxelResources.voxelTexInfoBuffer();
+  texInfoInfo.offset = 0;
+  texInfoInfo.range = VK_WHOLE_SIZE;
+  writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[10].dstSet = m_descriptorSet;
+  writes[10].dstBinding = 10;
+  writes[10].descriptorCount = 1;
+  writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[10].pBufferInfo = &texInfoInfo;
+
+  vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
   return true;
 }
 

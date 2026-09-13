@@ -170,36 +170,53 @@ bool VoxelResources::createPalette(VkDevice device,
 	return true;
 }
 
-bool VoxelResources::createVoxelTextures(VkDevice device,
-																				 VkPhysicalDevice physicalDevice,
-																				 VkCommandPool commandPool, VkQueue queue,
-																				 std::string& outError) {
+bool VoxelResources::createVoxelTextures(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		VkQueue queue, const std::vector<vv::voxel::VoxelTextureImage>& images,
+		const std::vector<vv::voxel::VoxelTextureSet>& sets, std::string& outError) {
 	if (!m_voxelTextureImages.empty()) {
 		return true;  // idempotent
 	}
 
-	const std::uint32_t count = vv::voxel::kVoxelTypeCount;
-	const std::uint32_t size = vv::voxel::kVoxelTextureSize;
-	// 32 -> 16 -> ... -> 1
-	const std::uint32_t mips =
-			static_cast<std::uint32_t>(std::log2(static_cast<float>(size))) + 1u;
+	// Slot 0 is a 1x1 opaque-white dummy: it keeps the sampled-image
+	// array valid even when no texture files exist. The shader never
+	// samples it - untextured types carry the kNoFaceTexture sentinel
+	// and use the palette colors. Caller indices shift by +1.
+	std::vector<vv::voxel::VoxelTextureImage> all;
+	all.reserve(images.size() + 1);
+	vv::voxel::VoxelTextureImage dummy;
+	dummy.width = 1;
+	dummy.height = 1;
+	dummy.rgba = {255, 255, 255, 255};
+	all.push_back(std::move(dummy));
+	all.insert(all.end(), images.begin(), images.end());
 
-	std::vector<VkImage> images(count, VK_NULL_HANDLE);
-	std::vector<VkDeviceMemory> memory(count, VK_NULL_HANDLE);
+	const std::uint32_t count = static_cast<std::uint32_t>(all.size());
+	std::vector<std::uint32_t> mips(count, 1);
+	for (std::uint32_t i = 0; i < count; ++i) {
+		const std::uint32_t largest = std::max(all[i].width, all[i].height);
+		mips[i] = static_cast<std::uint32_t>(
+								 std::log2(static_cast<float>(largest))) + 1u;
+	}
+
+	std::vector<VkImage> vkImages(count, VK_NULL_HANDLE);
+	std::vector<VkDeviceMemory> vkMemory(count, VK_NULL_HANDLE);
 	std::vector<VkImageView> views(count, VK_NULL_HANDLE);
 	VkSampler sampler = VK_NULL_HANDLE;
+	VkBuffer texInfoBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory texInfoMemory = VK_NULL_HANDLE;
 	auto destroyAll = [&]() {
 		for (VkImageView v : views) {
 			if (v != VK_NULL_HANDLE) {
 				vkDestroyImageView(device, v, nullptr);
 			}
 		}
-		for (VkImage i : images) {
+		for (VkImage i : vkImages) {
 			if (i != VK_NULL_HANDLE) {
 				vkDestroyImage(device, i, nullptr);
 			}
 		}
-		for (VkDeviceMemory m : memory) {
+		for (VkDeviceMemory m : vkMemory) {
 			if (m != VK_NULL_HANDLE) {
 				vkFreeMemory(device, m, nullptr);
 			}
@@ -207,16 +224,25 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 		if (sampler != VK_NULL_HANDLE) {
 			vkDestroySampler(device, sampler, nullptr);
 		}
+		if (texInfoBuffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, texInfoBuffer, nullptr);
+		}
+		if (texInfoMemory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, texInfoMemory, nullptr);
+		}
 	};
 
-	// Staging: every type's level-0 data in one host-visible buffer.
-	const std::size_t texelBytes =
-			static_cast<std::size_t>(size) * size * 4u;
+	// Staging: every image's level-0 data in one host-visible buffer.
+	std::size_t totalTexels = 0;
+	for (const auto& img : all) {
+		totalTexels += img.rgba.size();
+	}
 	std::vector<std::uint8_t> texels;
-	texels.reserve(static_cast<std::size_t>(count) * texelBytes);
-	for (std::uint32_t type = 0; type < count; ++type) {
-		std::vector<std::uint8_t> rgba = vv::voxel::generateVoxelTextureRGBA(type);
-		texels.insert(texels.end(), rgba.begin(), rgba.end());
+	texels.reserve(totalTexels);
+	std::vector<VkDeviceSize> imageOffsets(count, 0);
+	for (std::uint32_t i = 0; i < count; ++i) {
+		imageOffsets[i] = static_cast<VkDeviceSize>(texels.size());
+		texels.insert(texels.end(), all[i].rgba.begin(), all[i].rgba.end());
 	}
 
 	VkBuffer stagingBuffer = VK_NULL_HANDLE;
@@ -241,13 +267,13 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 	vkUnmapMemory(device, stagingMemory);
 
 	// Images (device-local, all mips allocated up front).
-	for (std::uint32_t type = 0; type < count; ++type) {
+	for (std::uint32_t i = 0; i < count; ++i) {
 		VkImageCreateInfo imageInfo{};
 		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 		imageInfo.imageType = VK_IMAGE_TYPE_2D;
 		imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-		imageInfo.extent = {size, size, 1};
-		imageInfo.mipLevels = mips;
+		imageInfo.extent = {all[i].width, all[i].height, 1};
+		imageInfo.mipLevels = mips[i];
 		imageInfo.arrayLayers = 1;
 		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -255,7 +281,7 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 											VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
 											VK_IMAGE_USAGE_SAMPLED_BIT;
 		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		r = vkCreateImage(device, &imageInfo, nullptr, &images[type]);
+		r = vkCreateImage(device, &imageInfo, nullptr, &vkImages[i]);
 		if (r != VK_SUCCESS) {
 			outError = "Failed to create voxel texture image (" +
 								 utils::vkResultToString(r) + ").";
@@ -265,14 +291,14 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 			return false;
 		}
 		VkMemoryRequirements req{};
-		vkGetImageMemoryRequirements(device, images[type], &req);
+		vkGetImageMemoryRequirements(device, vkImages[i], &req);
 		VkMemoryAllocateInfo allocInfo{};
 		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 		allocInfo.allocationSize = req.size;
 		allocInfo.memoryTypeIndex = utils::findMemoryTypeIndex(
 				physicalDevice, req.memoryTypeBits,
 				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-		r = vkAllocateMemory(device, &allocInfo, nullptr, &memory[type]);
+		r = vkAllocateMemory(device, &allocInfo, nullptr, &vkMemory[i]);
 		if (r != VK_SUCCESS) {
 			outError = "Failed to allocate voxel texture memory.";
 			destroyAll();
@@ -280,7 +306,7 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 			vkFreeMemory(device, stagingMemory, nullptr);
 			return false;
 		}
-		vkBindImageMemory(device, images[type], memory[type], 0);
+		vkBindImageMemory(device, vkImages[i], vkMemory[i], 0);
 	}
 
 	// One command buffer: upload level 0, blit the mip chain, transition
@@ -325,7 +351,7 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 		b.newLayout = newLayout;
 		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b.image = images[image];
+		b.image = vkImages[image];
 		b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		b.subresourceRange.baseMipLevel = baseMip;
 		b.subresourceRange.levelCount = mipCount;
@@ -336,8 +362,8 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 												 nullptr, 1, &b);
 	};
 
-	for (std::uint32_t type = 0; type < count; ++type) {
-		imageBarrier(type, 0, mips, VK_IMAGE_LAYOUT_UNDEFINED,
+	for (std::uint32_t i = 0; i < count; ++i) {
+		imageBarrier(i, 0, mips[i], VK_IMAGE_LAYOUT_UNDEFINED,
 								 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
 								 VK_ACCESS_TRANSFER_WRITE_BIT);
 
@@ -346,63 +372,77 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 		region.imageSubresource.mipLevel = 0;
 		region.imageSubresource.baseArrayLayer = 0;
 		region.imageSubresource.layerCount = 1;
-		region.imageExtent = {size, size, 1};
-		region.bufferOffset =
-				static_cast<VkDeviceSize>(type) * texelBytes;
-		vkCmdCopyBufferToImage(cmd, stagingBuffer, images[type],
+		region.imageExtent = {all[i].width, all[i].height, 1};
+		region.bufferOffset = imageOffsets[i];
+		vkCmdCopyBufferToImage(cmd, stagingBuffer, vkImages[i],
 													 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
 		// Blit chain: each mip is downsampled from the one above it.
-		for (std::uint32_t m = 1; m < mips; ++m) {
-			imageBarrier(type, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		// Dimensions floor at 1 so non-power-of-two sizes stay valid.
+		for (std::uint32_t m = 1; m < mips[i]; ++m) {
+			imageBarrier(i, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 									 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 									 VK_ACCESS_TRANSFER_WRITE_BIT,
 									 VK_ACCESS_TRANSFER_READ_BIT);
+			const auto srcW = static_cast<std::int32_t>(
+					std::max<std::uint32_t>(all[i].width >> (m - 1), 1u));
+			const auto srcH = static_cast<std::int32_t>(
+					std::max<std::uint32_t>(all[i].height >> (m - 1), 1u));
+			const auto dstW = static_cast<std::int32_t>(
+					std::max<std::uint32_t>(all[i].width >> m, 1u));
+			const auto dstH = static_cast<std::int32_t>(
+					std::max<std::uint32_t>(all[i].height >> m, 1u));
 			VkImageBlit blit{};
 			blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			blit.srcSubresource.mipLevel = m - 1;
 			blit.srcSubresource.baseArrayLayer = 0;
 			blit.srcSubresource.layerCount = 1;
 			blit.srcOffsets[0] = {0, 0, 0};
-			blit.srcOffsets[1] = {static_cast<std::int32_t>(size >> (m - 1)),
-														static_cast<std::int32_t>(size >> (m - 1)), 1};
+			blit.srcOffsets[1] = {srcW, srcH, 1};
 			blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			blit.dstSubresource.mipLevel = m;
 			blit.dstSubresource.baseArrayLayer = 0;
 			blit.dstSubresource.layerCount = 1;
 			blit.dstOffsets[0] = {0, 0, 0};
-			blit.dstOffsets[1] = {static_cast<std::int32_t>(size >> m),
-														static_cast<std::int32_t>(size >> m), 1};
-			vkCmdBlitImage(cmd, images[type],
-										 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[type],
-										 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			blit.dstOffsets[1] = {dstW, dstH, 1};
+			vkCmdBlitImage(cmd, vkImages[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+										 vkImages[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
 										 VK_FILTER_LINEAR);
 		}
 
 		// Final transition: mips 0..mips-2 come back from TRANSFER_SRC, the
-		// deepest one from TRANSFER_DST.
-		VkImageMemoryBarrier b[2]{};
-		b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-		b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		b[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b[0].image = images[type];
-		b[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		b[0].subresourceRange.baseMipLevel = 0;
-		b[0].subresourceRange.levelCount = mips - 1;
-		b[0].subresourceRange.baseArrayLayer = 0;
-		b[0].subresourceRange.layerCount = 1;
-		b[1] = b[0];
-		b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		b[1].subresourceRange.baseMipLevel = mips - 1;
-		b[1].subresourceRange.levelCount = 1;
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-												 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-												 0, nullptr, 2, b);
+		// deepest one from TRANSFER_DST (a single barrier covers mips == 1).
+		if (mips[i] > 1) {
+			VkImageMemoryBarrier b[2]{};
+			b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			b[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			b[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b[0].image = vkImages[i];
+			b[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			b[0].subresourceRange.baseMipLevel = 0;
+			b[0].subresourceRange.levelCount = mips[i] - 1;
+			b[0].subresourceRange.baseArrayLayer = 0;
+			b[0].subresourceRange.layerCount = 1;
+			b[1] = b[0];
+			b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			b[1].subresourceRange.baseMipLevel = mips[i] - 1;
+			b[1].subresourceRange.levelCount = 1;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+													 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+													 0, nullptr, 2, b);
+		} else {
+			imageBarrier(i, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+									 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+									 VK_ACCESS_TRANSFER_WRITE_BIT,
+									 VK_ACCESS_SHADER_READ_BIT);
+			// imageBarrier pipelines TOP_OF_PIPE -> TRANSFER; the final
+			// visibility to compute is guaranteed by the queue idle below.
+		}
 	}
 
 	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
@@ -431,21 +471,22 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 		return false;
 	}
 
-	// Views + one shared sampler (REPEAT tiling per voxel, linear
-	// filtering + trilinear mips; the shader passes an explicit LOD -
-	// ray divergence makes derivatives useless in a marcher).
-	for (std::uint32_t type = 0; type < count; ++type) {
+	// Views + one shared sampler (REPEAT tiling per voxel; NEAREST texel
+	// sampling by default - the crisp voxel look; mips blend linearly).
+	// The shader passes an explicit LOD - ray divergence makes
+	// derivatives useless in a marcher.
+	for (std::uint32_t i = 0; i < count; ++i) {
 		VkImageViewCreateInfo viewInfo{};
 		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		viewInfo.image = images[type];
+		viewInfo.image = vkImages[i];
 		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
 		viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
 		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		viewInfo.subresourceRange.baseMipLevel = 0;
-		viewInfo.subresourceRange.levelCount = mips;
+		viewInfo.subresourceRange.levelCount = mips[i];
 		viewInfo.subresourceRange.baseArrayLayer = 0;
 		viewInfo.subresourceRange.layerCount = 1;
-		r = vkCreateImageView(device, &viewInfo, nullptr, &views[type]);
+		r = vkCreateImageView(device, &viewInfo, nullptr, &views[i]);
 		if (r != VK_SUCCESS) {
 			outError = "Failed to create voxel texture view.";
 			destroyAll();
@@ -455,14 +496,14 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 
 	VkSamplerCreateInfo samplerInfo{};
 	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-	samplerInfo.magFilter = VK_FILTER_LINEAR;
-	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.magFilter = VK_FILTER_NEAREST;
+	samplerInfo.minFilter = VK_FILTER_NEAREST;
 	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	samplerInfo.minLod = 0.0f;
-	samplerInfo.maxLod = static_cast<float>(mips - 1);
+	samplerInfo.maxLod = 16.0f;
 	r = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to create voxel texture sampler.";
@@ -470,10 +511,53 @@ bool VoxelResources::createVoxelTextures(VkDevice device,
 		return false;
 	}
 
-	m_voxelTextureImages = std::move(images);
-	m_voxelTextureMemory = std::move(memory);
+	// Per-type face table (binding 10): 8 u32 per type. Face image
+	// indices shift by +1 (the white dummy occupies 0); kNoFaceTexture
+	// stays as the plain-color sentinel. Word 6 = nominal size.
+	{
+		const VkDeviceSize texInfoBytes =
+				static_cast<VkDeviceSize>(vv::voxel::kVoxelTypeCount) * 8u * 4u;
+		if (!utils::createBuffer(device, physicalDevice, texInfoBytes,
+														 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+																 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+														 texInfoBuffer, texInfoMemory, outError)) {
+			destroyAll();
+			return false;
+		}
+		void* infoMapped = nullptr;
+		r = vkMapMemory(device, texInfoMemory, 0, VK_WHOLE_SIZE, 0, &infoMapped);
+		if (r != VK_SUCCESS || infoMapped == nullptr) {
+			outError = "Failed to map the voxel texture info buffer.";
+			destroyAll();
+			return false;
+		}
+		std::vector<std::uint32_t> words(
+				static_cast<std::size_t>(vv::voxel::kVoxelTypeCount) * 8u, 0u);
+		for (std::uint32_t t = 0; t < vv::voxel::kVoxelTypeCount; ++t) {
+			const vv::voxel::VoxelTextureSet plain{};
+			const vv::voxel::VoxelTextureSet& set =
+					t < sets.size() ? sets[t] : plain;
+			for (std::uint32_t f = 0; f < 6; ++f) {
+				words[static_cast<std::size_t>(t) * 8u + f] =
+						(set.textured &&
+						 set.faceIndex[f] != vv::voxel::kNoFaceTexture)
+								? set.faceIndex[f] + 1u
+								: vv::voxel::kNoFaceTexture;
+			}
+			words[static_cast<std::size_t>(t) * 8u + 6u] =
+					set.textured ? set.nominalSize : 32u;
+		}
+		std::memcpy(infoMapped, words.data(), words.size() * 4u);
+		vkUnmapMemory(device, texInfoMemory);
+	}
+
+	m_voxelTextureImages = std::move(vkImages);
+	m_voxelTextureMemory = std::move(vkMemory);
 	m_voxelTextureViews = std::move(views);
 	m_voxelSampler = sampler;
+	m_texInfoBuffer = texInfoBuffer;
+	m_texInfoMemory = texInfoMemory;
 	return true;
 }
 
@@ -1082,6 +1166,14 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_voxelSampler != VK_NULL_HANDLE) {
 		vkDestroySampler(device, m_voxelSampler, nullptr);
 		m_voxelSampler = VK_NULL_HANDLE;
+	}
+	if (m_texInfoBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_texInfoBuffer, nullptr);
+		m_texInfoBuffer = VK_NULL_HANDLE;
+	}
+	if (m_texInfoMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_texInfoMemory, nullptr);
+		m_texInfoMemory = VK_NULL_HANDLE;
 	}
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_farFence[k] != VK_NULL_HANDLE) {

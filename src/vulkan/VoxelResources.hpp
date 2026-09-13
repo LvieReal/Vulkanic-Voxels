@@ -8,6 +8,7 @@
 
 #include "voxel/Chunk.hpp"
 #include "voxel/VoxelConfig.hpp"
+#include "voxel/VoxelTextures.hpp"
 
 namespace vv::vulkan {
 
@@ -28,8 +29,9 @@ namespace vv::vulkan {
 //    for any future voxel content (overhangs, edits).
 //
 //  - voxel palette: small buffer with per-type, per-face base colors, filled
-//    from vv::voxel::kVoxelTypeInfo. Placeholder until the texturing pass;
-//    the plan is a bindless texture array with real per-type albedo textures.
+//    from vv::voxel::kVoxelTypeInfo. Now the FALLBACK look: types with
+//    texture files (resources/textures/voxels) use those instead (see
+//    createVoxelTextures + binding 10's per-type face table).
 class VoxelResources final {
  public:
 	struct ChunkUpload {
@@ -48,13 +50,19 @@ class VoxelResources final {
 	bool create(VkDevice device, VkPhysicalDevice physicalDevice,
 							const vv::voxel::VoxelConfig& config, std::string& outError);
 
-	// Bindless per-type voxel detail textures (bindings 8/9): one
-	// mip-mapped RGBA8 image per VoxelType (no atlas), generated
-	// deterministically on the CPU (vv::voxel::generateVoxelTextureRGBA),
-	// uploaded + mip-chained with one one-time submit. Idempotent.
-	bool createVoxelTextures(VkDevice device, VkPhysicalDevice physicalDevice,
-													 VkCommandPool commandPool, VkQueue queue,
-													 std::string& outError);
+	// Bindless voxel textures (bindings 8/9/10): one mip-mapped RGBA8
+	// image per texture FILE (no atlas; a 1x1 white dummy keeps the
+	// array non-empty), uploaded + mip-chained with one one-time
+	// submit. `sets` (from vv::render::loadVoxelTextureFiles) maps each
+	// type's faces to image indices; it is published to the shader via
+	// a small per-type SSBO (binding 10). Nearest texel sampling by
+	// default. Idempotent.
+	bool createVoxelTextures(
+			VkDevice device, VkPhysicalDevice physicalDevice,
+			VkCommandPool commandPool, VkQueue queue,
+			const std::vector<vv::voxel::VoxelTextureImage>& images,
+			const std::vector<vv::voxel::VoxelTextureSet>& sets,
+			std::string& outError);
 
 	// Batch-uploads chunk data into their slots (single staging buffer + one
 	// one-time submit; waits for the queue so in-flight frames never read a
@@ -134,11 +142,12 @@ class VoxelResources final {
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
 	VkBuffer fadeBuffer() const { return m_fadeBuffer; }
 
-	// Bindless texture array (one image per VoxelType, see
-	// createVoxelTextures). Empty until created.
+	// Bindless texture array (one image per texture FILE plus the white
+	// dummy at index 0; see createVoxelTextures). Empty until created.
 	std::uint32_t voxelTextureCount() const {
 		return static_cast<std::uint32_t>(m_voxelTextureViews.size());
 	}
+	VkBuffer voxelTexInfoBuffer() const { return m_texInfoBuffer; }
 	VkImageView voxelTextureView(std::uint32_t type) const {
 		return type < m_voxelTextureViews.size() ? m_voxelTextureViews[type]
 																					 : VK_NULL_HANDLE;
@@ -171,11 +180,18 @@ class VoxelResources final {
 	void* m_mappedFade = nullptr;
 
 	// Bindless voxel textures (see createVoxelTextures): one image per
-	// VoxelType plus a shared REPEAT/linear/mip sampler.
+	// texture FILE plus a shared REPEAT/nearest-texel sampler.
 	std::vector<VkImage> m_voxelTextureImages;
 	std::vector<VkDeviceMemory> m_voxelTextureMemory;
 	std::vector<VkImageView> m_voxelTextureViews;
 	VkSampler m_voxelSampler = VK_NULL_HANDLE;
+
+	// Per-type face table for the shader (binding 10): 8 u32 per
+	// VoxelType - words 0..5 = face image indices (0xFFFFFFFF = plain
+	// palette colors), word 6 = nominal texture size (explicit-LOD
+	// estimate), word 7 unused. Written once at creation.
+	VkBuffer m_texInfoBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_texInfoMemory = VK_NULL_HANDLE;
 
 	VkBuffer m_farBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;
