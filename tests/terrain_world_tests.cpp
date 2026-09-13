@@ -1449,151 +1449,73 @@ struct ShadowWorld {
 	}
 };
 
-// Mirror of the shader's sunShadow (pass 21 + the pass-22 lateral
-// fix): one ascending column march; each blocker contributes an angular
-// coverage of the sun disk, plus per-step near lateral samples (gap
-// closing) and a lateral sweep at the worst blocker's distance (full
-// penumbra width). coneTan = 0 reproduces the exact binary march (same
-// offsets, clamps, tie-breaks, cap).
-double sunVisMarch(const ShadowWorld& w, const double origin[3],
-									 const double n[3], const double sun[3],
-									 double coneTan) {
-	if (sun[1] <= 0.05) {
-		return 1.0;
+void coneBasis(const double dir[3], double u[3], double v[3]) {
+	double ref[3];
+	if (std::abs(dir[1]) < 0.99) {
+		ref[0] = 0.0;
+		ref[1] = 1.0;
+		ref[2] = 0.0;
+	} else {
+		ref[0] = 1.0;
+		ref[1] = 0.0;
+		ref[2] = 0.0;
+	}
+	u[0] = dir[1] * ref[2] - dir[2] * ref[1];
+	u[1] = dir[2] * ref[0] - dir[0] * ref[2];
+	u[2] = dir[0] * ref[1] - dir[1] * ref[0];
+	const double ul = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+	for (int a = 0; a < 3; ++a) {
+		u[a] /= ul;
+	}
+	v[0] = dir[1] * u[2] - dir[2] * u[1];
+	v[1] = dir[2] * u[0] - dir[0] * u[2];
+	v[2] = dir[0] * u[1] - dir[1] * u[0];
+}
+// Mirror of the shader's sunRayEscapes: one exact binary shadow ray
+// (ascending column DDA + height-bound voxel walk + coarse far cells).
+bool sunRayEscapesMirror(const ShadowWorld& w, const double o[3],
+												 const double dir[3]) {
+	if (dir[1] <= 0.05) {
+		return true;
 	}
 	const double EPS = 1e-6;
-	const bool soft = coneTan > 0.0;
-	double o[3];
-	for (int a = 0; a < 3; ++a) {
-		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
-	}
-	// Perpendicular axis of the sun's XZ direction (lateral samples).
-	double pAxis[2] = {1.0, 0.0};
-	{
-		const double len = std::sqrt(sun[0] * sun[0] + sun[2] * sun[2]);
-		if (len > 1e-5) {
-			pAxis[0] = -sun[2] / len;
-			pAxis[1] = sun[0] / len;
-		}
-	}
-	auto clamp01 = [](double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); };
-	// Lateral blocker top: near height bound or far cell height.
-	auto lateralTop = [&](int cx, int cz, double& top) -> bool {
-		if (cx >= 0 && cx < w.near.wx && cz >= 0 && cz < w.near.wz) {
-			const unsigned bound = w.near.boundAt(cx, cz);
-			if (bound == 0xFFFFu) {
-				return false;
-			}
-			top = double(bound);
-			return true;
-		}
-		const int fcX = int(std::floor((double(cx) + 0.5 - w.farOrigin) /
-																	 w.farCell));
-		const int fcZ = int(std::floor((double(cz) + 0.5 - w.farOrigin) /
-																	 w.farCell));
-		const unsigned packed = w.farAt(fcX, fcZ);
-		const double h = double(packed & 0xFFFFu);
-		if (h > 0.0) {
-			top = h;
-			return true;
-		}
-		return false;
-	};
-	int stepX = (sun[0] > 0.0) ? 1 : -1;
-	int stepZ = (sun[2] > 0.0) ? 1 : -1;
+	int stepX = (dir[0] > 0.0) ? 1 : -1;
+	int stepZ = (dir[2] > 0.0) ? 1 : -1;
 	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
 	int colX = int(std::floor(o[0]));
 	int colZ = int(std::floor(o[2]));
-	if (std::abs(sun[0]) > EPS) {
-		tMaxX = (double(colX + ((stepX > 0) ? 1 : 0)) - o[0]) / sun[0];
-		dX = std::abs(1.0 / sun[0]);
+	if (std::abs(dir[0]) > EPS) {
+		tMaxX = (double(colX + ((stepX > 0) ? 1 : 0)) - o[0]) / dir[0];
+		dX = std::abs(1.0 / dir[0]);
 	} else {
 		stepX = 0;
 	}
-	if (std::abs(sun[2]) > EPS) {
-		tMaxZ = (double(colZ + ((stepZ > 0) ? 1 : 0)) - o[2]) / sun[2];
-		dZ = std::abs(1.0 / sun[2]);
+	if (std::abs(dir[2]) > EPS) {
+		tMaxZ = (double(colZ + ((stepZ > 0) ? 1 : 0)) - o[2]) / dir[2];
+		dZ = std::abs(1.0 / dir[2]);
 	} else {
 		stepZ = 0;
 	}
 
 	double s = 0.0;
-	double pen = 0.0;
-	double sBest = 0.0;
 	for (int i = 0; i < 256; ++i) {
 		const double sExit = std::min(tMaxX, tMaxZ);
-		const double y0 = o[1] + sun[1] * s;
-		const double dip = soft ? coneTan * s : 0.0;
-		if (y0 - dip >= w.maxTerr) {
-			break;
+		const double y0 = o[1] + dir[1] * s;
+		if (y0 >= w.maxTerr) {
+			return true;
 		}
 		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
 												colZ < w.near.wz;
 		if (inNear) {
 			const unsigned bound = w.near.boundAt(colX, colZ);
-			if (bound != 0xFFFFu && double(bound) > y0 - dip) {
-				const double y1 = o[1] + sun[1] * sExit;
+			if (bound != 0xFFFFu && double(bound) > y0) {
+				const double y1 = o[1] + dir[1] * sExit;
 				const int yTop = std::min(
 						int(std::floor(std::min(y1, double(bound) - 1.0))),
 						w.near.wh - 1);
-				for (int y = std::max(int(std::floor(y0 - dip)), 0); y <= yTop;
-						 ++y) {
+				for (int y = std::max(int(std::floor(y0)), 0); y <= yTop; ++y) {
 					if (w.near.at(colX, y, colZ) != 0) {
-						const double cov =
-								soft ? clamp01(0.5 + (double(y) + 1.0 - y0) /
-																				 (2.0 * coneTan *
-																					std::max(s, 1e-4)))
-											: 1.0;
-						if (cov > pen) {
-							pen = cov;
-							sBest = s;
-						}
-						if (pen >= 1.0) {
-							return 0.0;
-						}
-					}
-				}
-			}
-			// Gap closing: dense lateral columns 1-4 cells beside the ray
-			// line; any hit records sBest for the final integral.
-			if (soft && coneTan * s >= 0.75) {
-				const double ccx = o[0] + sun[0] * s;
-				const double ccz = o[2] + sun[2] * s;
-				const double r = coneTan * s;
-				for (int k = 1; k <= 4; ++k) {
-					for (int sg = -1; sg <= 1; sg += 2) {
-						const double sx = ccx + pAxis[0] * double(k * sg);
-						const double sz = ccz + pAxis[1] * double(k * sg);
-						const double cellx = std::floor(sx) + 0.5;
-						const double cellz = std::floor(sz) + 0.5;
-						const double d =
-								std::sqrt((cellx - ccx) * (cellx - ccx) +
-													(cellz - ccz) * (cellz - ccz));
-						// Rim cells (center just outside the disk, area still
-						// overlapping) count with a clipped chord.
-						const double dEff = std::min(d, r - 0.01);
-						if (d >= r + 0.7 || dEff <= 0.0) {
-							continue;
-						}
-						double top;
-						if (lateralTop(int(std::floor(sx)), int(std::floor(sz)),
-													 top)) {
-							// One cell = one chord strip of the disk:
-							// fraction = chord(d) * 1 / disk area.
-							const double strip =
-									2.0 * std::sqrt(std::max(
-												r * r - dEff * dEff, 0.0)) /
-									(3.14159265358979323846 * r * r);
-							const double vCov =
-									clamp01(0.5 + (top - y0) /
-															 (2.0 * coneTan *
-																std::max(s, 1e-4)));
-							const double cov = vCov * strip;
-							if (cov > pen) {
-								pen = cov;
-								sBest = s;
-							}
-						}
+						return false;
 					}
 				}
 			}
@@ -1604,19 +1526,8 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 																		 w.farCell));
 			const unsigned packed = w.farAt(fcX, fcZ);
 			const double h = double(packed & 0xFFFFu);
-			if (h > 0.0 && h > y0 - dip) {
-				const double cov =
-						soft ? clamp01(0.5 + (h - y0) /
-																 (2.0 * coneTan *
-																	std::max(s, 1e-4)))
-								 : 1.0;
-				if (cov > pen) {
-					pen = cov;
-					sBest = s;
-				}
-				if (pen >= 1.0) {
-					return 0.0;
-				}
+			if (h > 0.0 && y0 < h) {
+				return false;
 			}
 		}
 		s = std::min(tMaxX, tMaxZ);
@@ -1626,57 +1537,53 @@ double sunVisMarch(const ShadowWorld& w, const double origin[3],
 		colX += takeX ? stepX : 0;
 		colZ += takeX ? 0 : stepZ;
 	}
+	return true;
+}
 
-	// Lateral integral at the worst blocker's distance: chord-weighted
-	// quadrature of the disk's horizontal diameter (see the shader).
-	if (soft && pen > 0.0) {
-		const double r = sBest * coneTan;
-		if (r >= 0.75) {
-			const double ccx = o[0] + sun[0] * sBest;
-			const double ccz = o[2] + sun[2] * sBest;
-			const double yB = o[1] + sun[1] * sBest;
-			const int maxD = std::min(int(std::floor(r + 0.7)), 16);
-			double covSum = 0.0;
-			double wSum = 0.0;
-			for (int k = 0; k <= maxD; ++k) {
-				for (int sg = (k == 0) ? 1 : -1; sg <= 1; sg += 2) {
-					const double sx = ccx + pAxis[0] * double(k * sg);
-					const double sz = ccz + pAxis[1] * double(k * sg);
-					const double cellx = std::floor(sx) + 0.5;
-					const double cellz = std::floor(sz) + 0.5;
-					const double d =
-							std::sqrt((cellx - ccx) * (cellx - ccx) +
-													(cellz - ccz) * (cellz - ccz));
-					// Rim cells: clip the offset into the disk.
-					const double dEff = std::min(d, r - 0.01);
-					if (d >= r + 0.7 || dEff <= 0.0) {
-						continue;
-					}
-					const double chordHalf = std::sqrt(
-							std::max(r * r - dEff * dEff, 1e-6));
-					double top;
-					if (lateralTop(int(std::floor(sx)), int(std::floor(sz)),
-													 top)) {
-						const double vCov =
-								clamp01(0.5 + (top - yB) / (2.0 * chordHalf));
-						covSum += chordHalf * vCov;
-					}
-					wSum += chordHalf;
-				}
+// Mirror of the shader's sunShadow (pass 23): cone tracing as a 3x3
+// direction grid on the sun disk - 9 exact binary rays, visibility =
+// the fraction that escape. coneTan = 0 = the single exact march.
+double sunVisConeMirror(const ShadowWorld& w, const double origin[3],
+												const double n[3], const double sun[3],
+												double coneTan) {
+	if (sun[1] <= 0.05) {
+		return 1.0;
+	}
+	double o[3];
+	for (int a = 0; a < 3; ++a) {
+		o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+	}
+	if (coneTan <= 0.0) {
+		return sunRayEscapesMirror(w, o, sun) ? 1.0 : 0.0;
+	}
+	double u[3], v[3];
+	coneBasis(sun, u, v);
+	const double gridStep = coneTan * 0.7071067811865476;
+	int blocked = 0;
+	for (int i = -1; i <= 1; ++i) {
+		for (int j = -1; j <= 1; ++j) {
+			double d[3];
+			for (int a = 0; a < 3; ++a) {
+				d[a] = sun[a] + (u[a] * double(i) + v[a] * double(j)) * gridStep;
 			}
-			if (wSum > 0.0) {
-				pen = std::max(pen, covSum / wSum);
+			const double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+			for (int a = 0; a < 3; ++a) {
+				d[a] /= dl;
+			}
+			if (!sunRayEscapesMirror(w, o, d)) {
+				++blocked;
 			}
 		}
 	}
-	return 1.0 - pen;
+	return 1.0 - double(blocked) / 9.0;
 }
 
 // Binary sharp march = the cone march at coneTan = 0.
 bool sunLitMirror(const ShadowWorld& w, const double origin[3],
 									const double n[3], const double sun[3]) {
-	return sunVisMarch(w, origin, n, sun, 0.0) >= 0.5;
+	return sunVisConeMirror(w, origin, n, sun, 0.0) >= 0.5;
 }
+
 
 // Brute force: dense sampling along the sun ray with identical semantics
 // (near voxels; far column tops; shared ascend bound).
@@ -1846,7 +1753,7 @@ void testSunShadowMarch() {
 // ---------------------------------------------------------------------------
 // Soft sun shadows (pass 21): the shader's sunShadow with a cone
 // (per-blocker coverage of the sun disk's vertical slice, worst blocker
-// wins) is mirrored in sunVisMarch above and checked here against an
+// wins) is mirrored in sunVisConeMirror above and checked here against an
 // independent reference: 13 directions spread over the sun disk, each
 // marched densely. Both estimate the fraction of the sun disk NOT
 // blocked; they must agree within a tolerance (the march approximates
@@ -1880,28 +1787,6 @@ double conePointBlockedMirror(const ShadowWorld& w, double x, double y,
 	return (h > 0.0 && y < h) ? 1.0 : 0.0;
 }
 
-void coneBasis(const double dir[3], double u[3], double v[3]) {
-	double ref[3];
-	if (std::abs(dir[1]) < 0.99) {
-		ref[0] = 0.0;
-		ref[1] = 1.0;
-		ref[2] = 0.0;
-	} else {
-		ref[0] = 1.0;
-		ref[1] = 0.0;
-		ref[2] = 0.0;
-	}
-	u[0] = dir[1] * ref[2] - dir[2] * ref[1];
-	u[1] = dir[2] * ref[0] - dir[0] * ref[2];
-	u[2] = dir[0] * ref[1] - dir[1] * ref[0];
-	const double ul = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
-	for (int a = 0; a < 3; ++a) {
-		u[a] /= ul;
-	}
-	v[0] = dir[1] * u[2] - dir[2] * u[1];
-	v[1] = dir[2] * u[0] - dir[0] * u[2];
-	v[2] = dir[0] * u[1] - dir[1] * u[0];
-}
 
 // Reference: 13 directions over the sun disk (center + 4 azimuths at 3
 // radii), each marched densely; visibility = fraction that escape.
@@ -2003,7 +1888,7 @@ void testShadowLateralJoin() {
 	for (int k = 0; k <= 10; ++k) {
 		const double invSqrt2 = 0.7071067811865476;
 		double origin[3] = {24.0 - invSqrt2 * k, 10.0, 24.0 + invSqrt2 * k};
-		const double vis = sunVisMarch(w, origin, n, sun, coneTan);
+		const double vis = sunVisConeMirror(w, origin, n, sun, coneTan);
 		const double ref = sunVisReference(w, origin, n, sun, coneTan);
 		if (vis < -1e-9 || vis > 1.0 + 1e-9) {
 			check(false, "shadow lateral: visibility within [0, 1]");
@@ -2090,7 +1975,7 @@ void testSunShadowCone() {
 				continue;
 			}
 		}
-		const double visCone = sunVisMarch(w, origin, n, sun, coneTan);
+		const double visCone = sunVisConeMirror(w, origin, n, sun, coneTan);
 		const double visRef = sunVisReference(w, origin, n, sun, coneTan);
 		++tested;
 		if (visCone < 0.0 || visCone > 1.0 || visRef < 0.0 || visRef > 1.0) {

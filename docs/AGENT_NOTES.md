@@ -87,39 +87,35 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 22)
+## Current status (pass 23)
 
-Owner-verified pass 21 (textures work seamlessly; screenshot showed
-shadow seams). Pass 22 asks: (1) reuse texture names across types
-(e.g. dirt for grass bottom), (2) rename px/nx/pz/nz to
-front/back/right/left, (3) fix shadows not joining (sharp transitions,
-seams, gaps between penumbrae).
+Owner report on pass 22: perf dipped; overlapping shadows still have
+gaps (checkerboard); new distortions - "revert that". Root cause: every
+single-ray coverage formula (angular slice, chord strips, lateral
+integrals at one blocker distance) is blind beside the ray line and
+jumps discontinuously between pixels.
 
-Delivered:
-- Custom-mode files renamed: _top/_bottom/_front/_back/_right/_left
-  (front=-X, back=+X, right=+Z, left=-Z; face ids unchanged).
-- aliases.txt in resources/textures/voxels: "<type> <face> = <source>
-  [<source face>]", faces top/bottom/front/back/right/left/sides/all;
-  source face defaults to the target's name resolved through the
-  source's mode. Overrides file-based faces; logged at startup.
-- Shadow lateral fix (the pass-21 single ray was blind BESIDE the sun
-  line -> penumbrae didn't join):
-  (a) per near-region march step, dense lateral samples 1-4 cells
-      either side of the ray line (near height bounds / far cells);
-      each hit seeds pen with a chord-strip fraction
-      (2*sqrt(r^2-d^2)/(pi*r^2)) and records sBest;
-  (b) after the march, a chord-weighted integral of the sun disk's
-      horizontal diameter at sBest (each lateral cell blocks the
-      fraction of its chord below the cell top; rim cells clipped);
-      pen = max(center coverage, integral).
-  Wide casters converge to their full vertical-slice coverage;
-  penumbrae reach true width and merge. Sharp mode (coneTan 0) is
-  untouched and still byte-identical to the old march.
-- New test testShadowLateralJoin: 4x4 pillar, points sweeping
-  perpendicular across its shadow, wide cone (0.15): no lit gaps inside
-  the penumbra, profile within 0.154 of the 13-direction dense
-  reference, and step-to-step gradients track the reference (a seam
-  would be a transition the reference doesn't have).
+Delivered (pass 23) - full soft-path replacement:
+- Cone tracing done properly: a 3x3 direction grid on the sun disk
+  (corners on the rim, gridStep = coneTan/sqrt(2)); each of the 9
+  directions is an EXACT binary march (sunRayEscapes = the original
+  shadow ray, parameterized by direction); visibility = fraction that
+  escape. Penumbrae are unions over directions -> they join across
+  casters and overlap into full shadow; each ray flips only when its
+  own line crosses a blocker -> 1/9 bands, no voxel-quantized seams, no
+  checkerboard, no formulas. The pass-21/22 lateral code and coverage
+  formulas are GONE (shader + mirror).
+- Sharp mode (coneTan 0 / VV_SHADOW_SHARP=1) = the single exact march,
+  still byte-identical (parity test unchanged, 809/2191 agree).
+- Perf: no per-step lateral sampling anymore (the pass-22 dip source);
+  soft mode costs 9 binary marches per sun-facing pixel - more than
+  pass 21's single march, similar or less than pass 22. If still slow:
+  smaller cone / fewer grid points / the planned heightmap shadow
+  optimization (tip 3) makes all of this ~free.
+- Tests: mirror vs 13-direction dense reference - mean |diff| 0.009,
+  max 0.735, 11/1200 beyond 0.25 (better than the formula version);
+  lateral-join test passes (no gaps, gradients track reference);
+  full-blockage/sharp consistency invariant holds by construction.
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

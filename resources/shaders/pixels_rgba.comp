@@ -376,88 +376,15 @@ float calculateAO(ivec3 voxel, vec3 n, vec3 hitPos)
 // beyond. Cheap because the sun is high: the ray ascends past all terrain
 // within a few dozen columns and the march ends there. Returns 1.0 lit /
 // 0.0 shadowed.
-// Lateral blocker top at column (cx, cz): near height bound or far
-// cell height; false when neither tier has data.
-bool lateralColumnTop(int cx, int cz, out float top)
+// One exact binary shadow ray (the original march, parameterized by
+// direction): ascending column DDA + height-bound voxel walk, coarse
+// far cells beyond the near region. Pinned by the CPU parity mirror in
+// tests/terrain_world_tests.cpp - do not refactor blindly.
+bool sunRayEscapes(vec3 origin, vec3 sunV)
 {
-    uint slot = 0u;
-    ivec2 local = ivec2(0);
-    if (resolveColumn(cx, cz, slot, local)) {
-        const uint bound = columnHeightBound(cx, cz);
-        if (bound == kNoHeightData) {
-            return false;
-        }
-        top = float(bound);
-        return true;
+    if (sunV.y <= 0.05) {
+        return true;  // low/sunset sun: no cheap ascend bound, skip
     }
-    if (pc.far.z > 0) {
-        const ivec2 farDim = pc.far.zw;
-        const ivec2 fc = ivec2(floor((vec2(cx, cz) + vec2(0.5) -
-                                      vec2(pc.far.xy)) / pc.farParams.x));
-        if (all(greaterThanEqual(fc, ivec2(0))) &&
-            all(lessThan(fc, farDim))) {
-            const uint packed =
-                farLod.cells[farBase() + uint(fc.x) + uint(fc.y) * uint(farDim.x)];
-            const float h = float(packed & 0xFFFFu);
-            if (h > 0.0) {
-                top = h;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Sun shadows (pass 21, lateral fix in pass 22): one ascending column
-// march toward the sun - the same 2D DDA + height-bound voxel walk that
-// is pinned by the CPU parity mirror in tests/terrain_world_tests.cpp -
-// where every blocker contributes a soft ANGULAR coverage instead of a
-// binary hit:
-//
-//   cov = clamp(0.5 + (blockerTop - y) / (2 * coneTan * s), 0, 1)
-//
-// i.e. the blocker's top, at march distance s, covers that fraction of
-// the sun disk's angular diameter (coneTan = tan of the disk's half
-// angle, scene.misc.w; default tan 2.5 deg). The answer is 1 minus the
-// WORST blocker's coverage. With coneTan = 0 (or VV_SHADOW_SHARP=1)
-// every coverage clamps to 0 or 1 and the march is EXACTLY the old
-// binary shadow ray - same columns, same voxel walks.
-//
-// A single ray is blind to blockers BESIDE the sun line, which read as
-// penumbrae that do not join: hard edges where the ray crosses a caster
-// and lit gaps beside it. Two lateral additions close that:
-//  (a) per NEAR-region step, sample the columns 1-2 cells either side
-//      of the ray line (perpendicular axis) - rays passing BESIDE a
-//      caster still see it (gap closing);
-//  (b) after the march, sweep the terrain tops laterally at the
-//      distance of the blocker that produced the worst coverage, out to
-//      the disk radius, coverage fading with distance from the disk
-//      center - penumbrae reach their true width and merge with the
-//      center coverage and with each other.
-float sunShadow(vec3 hitPosVox, vec3 n)
-{
-    const vec3 sunWorld = normalize(scene.lightDir.xyz);
-    if (sunWorld.y <= 0.05) {
-        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
-    }
-    const float coneTan = scene.misc.w;
-    const bool soft = coneTan > 0.0;
-    const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
-    const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
-    // Lift off the surface (along the normal, then along the sun) to avoid
-    // self-shadow acne; the hit face's outward cell is air by construction.
-    vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
-
-    // Perpendicular axis of the sun's XZ direction (lateral samples).
-    vec2 pAxis = vec2(1.0, 0.0);
-    {
-        const vec2 xz = vec2(sunV.x, sunV.z);
-        const float len = length(xz);
-        if (len > 1e-5) {
-            pAxis = vec2(-xz.y, xz.x) / len;
-        }
-    }
-
     const float EPS = 1e-6;
     const float maxTerr = float(pc.grid.w) + 1.0;
     int sStepX = (sunV.x > 0.0) ? 1 : -1;
@@ -486,20 +413,15 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     const ivec2 farDim = pc.far.zw;
     const vec2 farOrigin = vec2(pc.far.xy);
     float s = 0.0;  // world-unit parameter along sunV
-    float pen = 0.0;  // worst blocker coverage so far
-    float sBest = 0.0;  // distance of the blocker that set `pen`
 
     // A high sun lifts the ray above maxTerrain quickly; 256 columns covers
     // every realistic caster (and bounds the worst case for low suns).
     for (int i = 0; i < 256; ++i) {
         const float sExit = min(sMaxX, sMaxZ);
         const float y0 = origin.y + sunV.y * s;       // ascending (sun up)
-        // In soft mode the disk dips below the ray by coneTan * s; blockers
-        // down to that line can still cover part of the disk.
-        const float dip = soft ? coneTan * s : 0.0;
 
-        if (y0 - dip >= maxTerr) {
-            break;  // whole disk above all possible terrain (refine below)
+        if (y0 >= maxTerr) {
+            return true;  // above all possible terrain: lit from here on
         }
 
         uint slot = 0u;
@@ -508,76 +430,19 @@ float sunShadow(vec3 hitPosVox, vec3 n)
             // Near region: the height bound says whether a blocker can
             // exist in this column at all.
             const uint bound = columnHeightBound(col.x, col.y);
-            if (bound != kNoHeightData && float(bound) > y0 - dip) {
-                // Walk only the cells the segment (widened by the dip in
-                // soft mode) occupies below the bound, ascending.
+            if (bound != kNoHeightData && float(bound) > y0) {
+                // Walk only the cells the segment occupies below the bound
+                // (ascending: from the entry cell up).
                 const float y1 = origin.y + sunV.y * sExit;
                 const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
                                      int(pc.chunkSize.y) - 1);
                 const uint colBase = uint(local.x) +
                                      uint(local.y) *
                                          (pc.chunkSize.x * pc.chunkSize.y);
-                for (int y = max(int(floor(y0 - dip)), 0); y <= yTop; ++y) {
+                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
                     if (fetchVoxel(slot,
                                    colBase + uint(y) * pc.chunkSize.x) != 0u) {
-                        // Solid cell [y, y+1): its top at distance s covers
-                        // this fraction of the sun disk (soft), or blocks
-                        // outright (sharp - identical to the old march).
-                        float cov;
-                        if (soft) {
-                            cov = clamp(
-                                0.5 + (float(y) + 1.0 - y0) /
-                                          (2.0 * coneTan * max(s, 1e-4)),
-                                0.0, 1.0);
-                        } else {
-                            cov = 1.0;
-                        }
-                        if (cov > pen) {
-                            pen = cov;
-                            sBest = s;
-                        }
-                        if (pen >= 1.0) {
-                            return 0.0;
-                        }
-                    }
-                }
-            }
-            // Gap closing: dense lateral columns 1-4 cells either side
-            // of the ray line (see the function comment); any hit
-            // records sBest and the final sweep builds the full-width
-            // profile. Near region only - fog hides the far coarseness.
-            if (soft && coneTan * s >= 0.75) {
-                const vec2 cc = origin.xz + sunV.xz * s;
-                for (int k = 1; k <= 4; ++k) {
-                    for (int sg = -1; sg <= 1; sg += 2) {
-                        const vec2 sampleXZ = cc + pAxis * float(k * sg);
-                        const vec2 cellCenter = floor(sampleXZ) + vec2(0.5);
-                        const float d = length(cellCenter - cc);
-                        const float r = coneTan * s;
-                        // Rim cells (center just outside the disk, area
-                        // still overlapping) count with a clipped chord.
-                        const float dEff = min(d, r - 0.01);
-                        if (d >= r + 0.7 || dEff <= 0.0) {
-                            continue;
-                        }
-                        float top;
-                        if (lateralColumnTop(int(cellCenter.x),
-                                             int(cellCenter.y), top)) {
-                            // One cell = one chord strip of the disk:
-                            // fraction = chord(d) * 1 / disk area.
-                            const float strip =
-                                2.0 * sqrt(max(r * r - dEff * dEff, 0.0)) /
-                                (3.14159265 * r * r);
-                            const float vCov = clamp(
-                                0.5 + (top - y0) /
-                                          (2.0 * coneTan * max(s, 1e-4)),
-                                0.0, 1.0);
-                            const float cov = vCov * strip;
-                            if (cov > pen) {
-                                pen = cov;
-                                sBest = s;
-                            }
-                        }
+                        return false;
                     }
                 }
             }
@@ -592,19 +457,8 @@ float sunShadow(vec3 hitPosVox, vec3 n)
                     farLod.cells[farBase() + uint(fc.x) +
                                  uint(fc.y) * uint(farDim.x)];
                 const float h = float(packed & 0xFFFFu);
-                if (h > 0.0 && h > y0 - dip) {
-                    const float cov = soft
-                        ? clamp(0.5 + (h - y0) /
-                                          (2.0 * coneTan * max(s, 1e-4)),
-                                0.0, 1.0)
-                        : 1.0;
-                    if (cov > pen) {
-                        pen = cov;
-                        sBest = s;
-                    }
-                    if (pen >= 1.0) {
-                        return 0.0;
-                    }
+                if (h > 0.0 && y0 < h) {
+                    return false;
                 }
             }
         }
@@ -617,50 +471,59 @@ float sunShadow(vec3 hitPosVox, vec3 n)
         col.x += takeX ? sStepX : 0;
         col.y += takeX ? 0 : sStepZ;
     }
+    return true;
+}
 
-    // Lateral integral at the worst blocker's distance: chord-weighted
-    // quadrature of the sun disk's horizontal diameter - each lateral
-    // cell blocks the fraction of its disk chord that lies below the
-    // cell's top, so wide casters converge to their full vertical-slice
-    // coverage and penumbrae reach their true width, joining smoothly
-    // with the center coverage and with each other.
-    if (soft && pen > 0.0) {
-        const float r = sBest * coneTan;
-        if (r >= 0.75) {
-            const vec2 cc = origin.xz + sunV.xz * sBest;
-            const float yB = origin.y + sunV.y * sBest;
-            const int maxD = min(int(floor(r + 0.7)), 16);
-            float covSum = 0.0;
-            float wSum = 0.0;
-            for (int k = 0; k <= maxD; ++k) {
-                for (int sg = (k == 0) ? 1 : -1; sg <= 1; sg += 2) {
-                    const vec2 sampleXZ = cc + pAxis * float(k * sg);
-                    const vec2 cellCenter = floor(sampleXZ) + vec2(0.5);
-                    const float d = length(cellCenter - cc);
-                    // Rim cells: clip the offset into the disk.
-                    const float dEff = min(d, r - 0.01);
-                    if (d >= r + 0.7 || dEff <= 0.0) {
-                        continue;
-                    }
-                    // Disk chord half-length at this lateral offset.
-                    const float chordHalf =
-                        sqrt(max(r * r - dEff * dEff, 1e-6));
-                    float top;
-                    if (lateralColumnTop(int(cellCenter.x),
-                                         int(cellCenter.y), top)) {
-                        const float vCov =
-                            clamp(0.5 + (top - yB) / (2.0 * chordHalf), 0.0, 1.0);
-                        covSum += chordHalf * vCov;
-                    }
-                    wSum += chordHalf;
-                }
-            }
-            if (wSum > 0.0) {
-                pen = max(pen, covSum / wSum);
+// Sun shadows (pass 23): cone tracing as a 3x3 direction grid on the
+// sun disk - 9 exact binary rays (sunRayEscapes), visibility = the
+// fraction that escape. Penumbrae are unions over directions, so they
+// join across casters and overlap into full shadow; each ray flips
+// only when its own line crosses a blocker, so neighboring pixels
+// differ by at most a grid step or two (1/9 bands) - no voxel-
+// quantized seams, no checkerboard. This replaces the pass-21/22
+// single-ray coverage formulas (angular slice, chord strips, lateral
+// integrals), which were blind beside the ray line and jumped
+// discontinuously between pixels. coneTan = tan of the sun disk's
+// half angle (scene.misc.w, default tan 2.5 deg); 0 (or
+// VV_SHADOW_SHARP=1) = the single exact march, byte-identical to the
+// pre-soft shadow ray.
+float sunShadow(vec3 hitPosVox, vec3 n)
+{
+    const vec3 sunWorld = normalize(scene.lightDir.xyz);
+    if (sunWorld.y <= 0.05) {
+        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
+    }
+    const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
+    const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
+    // Lift off the surface (along the normal, then along the sun) to avoid
+    // self-shadow acne; the hit face's outward cell is air by construction.
+    const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+
+    const float coneTan = scene.misc.w;
+    if (coneTan <= 0.0) {
+        return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
+    }
+
+    // Basis perpendicular to the sun direction.
+    const vec3 u = normalize(abs(sunV.y) < 0.99
+                                 ? cross(sunV, vec3(0.0, 1.0, 0.0))
+                                 : cross(sunV, vec3(1.0, 0.0, 0.0)));
+    const vec3 v = cross(sunV, u);
+
+    // 3x3 grid on the disk; the corners land exactly on the rim
+    // (gridStep * sqrt(2) = coneTan).
+    const float gridStep = coneTan * 0.70710678;
+    int blocked = 0;
+    for (int i = -1; i <= 1; ++i) {
+        for (int j = -1; j <= 1; ++j) {
+            const vec3 dir =
+                normalize(sunV + (u * float(i) + v * float(j)) * gridStep);
+            if (!sunRayEscapes(origin, dir)) {
+                ++blocked;
             }
         }
     }
-    return 1.0 - pen;
+    return 1.0 - float(blocked) / 9.0;
 }
 
 float fogAmount(float dist)
