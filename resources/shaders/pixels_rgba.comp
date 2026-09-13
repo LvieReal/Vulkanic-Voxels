@@ -76,6 +76,14 @@ layout(set = 0, binding = 6) readonly buffer FarLod {
     uint cells[];
 } farLod;
 
+// Per-slot fade-in alphas (1.0 = opaque). Written by the CPU every
+// frame; a hit inside a chunk whose alpha < 1 is composited against
+// whatever the ray finds BEHIND that chunk (far LOD, another chunk or
+// sky) - see the near march.
+layout(set = 0, binding = 7) readonly buffer ChunkFade {
+    float alpha[];
+} chunkFade;
+
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
 uint farBase()
@@ -456,6 +464,54 @@ float fogAmount(float dist)
 // coordinates, already aspect-scaled and y-flipped) and returns the shaded
 // color. When debugTerm is set, miss pixels are false-colored by their
 // termination cause instead of showing sky.
+// Shades one surface hit (shared by the primary result and the fading
+// chunk's front layer; extracted from traceRay's tail in pass 19).
+vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
+                     ivec2 sCellXZ, int sHitY, vec3 sStart, vec3 sRd,
+                     vec3 sRdWorld, float sTEntryOffset)
+{
+    const vec3 hitPos = sStart + sRd * sTHit;
+    vec3 n = normalize(sNormal);
+    vec3 sunDir = normalize(scene.lightDir.xyz);
+    float ndl = max(dot(n, sunDir), 0.0);
+    vec3 base = voxelColor(sType, sNormal);
+
+    // Per-vertex simulated AO on the hit face (from the owner's WGSL
+    // reference): darkens creases and corners. Far-LOD hits skip AO
+    // (invisible at multi-hundred-unit distances).
+    float ao = 1.0;
+    if (!sFarHit) {
+        ao = calculateAO(ivec3(sCellXZ.x, sHitY, sCellXZ.y), sNormal, hitPos);
+    }
+
+    // Sun shadows: one cheap ascending ray toward the sun. Skipped only
+    // when the direct term is zero anyway (ndl <= 0). Far-LOD hits MUST
+    // be shadowed too: from beyond the region the march self-selects the
+    // cheap far-cell path, and skipping it here lit the whole far band
+    // at full sun while the near terrain right next to it sat in shade.
+    float shadow = 1.0;
+    if (ndl > 0.0) {
+        shadow = sunShadow(hitPos, n);
+    }
+
+    // Lighting model ported from the owner's WGSL reference renderer:
+    // hemispheric sky ambient + direct sun + fresnel rim, from the sky
+    // THIS ray sees - WITHOUT the sun disc/glow (skyBaseColor).
+    vec3 skyAmb = skyBaseColor(sRdWorld);
+    float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
+    vec3 direct =
+        scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0)) * shadow;
+    float view = max(dot(n, -sRdWorld), 0.0);
+    vec3 rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
+
+    vec3 color = base * (ambient + direct + rim) * ao;
+
+    // Distance fog towards the sunless sky in this direction.
+    float fog = clamp(fogAmount(sTEntryOffset + sTHit), 0.0, 1.0);
+    return mix(color, skyBaseColor(sRdWorld), fog);
+}
+
 vec3 traceRay(vec2 uv, bool debugTerm)
 {
     vec3 camPos = scene.camPos.xyz;
@@ -534,6 +590,14 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     uint hitType = 0u;
     // Y of the hit cell (kept for the AO sample at shading time).
     int hitY = 0;
+    // Fading-chunk front layer (see the near march hit block).
+    bool frontValid = false;
+    float frontFade = 1.0;
+    uint frontType = 0u;
+    vec3 frontNormal = vec3(0.0);
+    float frontTHit = 0.0;
+    ivec2 frontCellXZ = ivec2(0);
+    int frontHitY = 0;
     // Ray parameter (same units as the old tracer: t multiplies rd, and the
     // distance from the camera is tEntryOffset + t) at the hit, relative to
     // the region entry point.
@@ -694,6 +758,63 @@ vec3 traceRay(vec2 uv, bool debugTerm)
                 }
             }
             if (hit) {
+                // Fade-in compositing (pass 19): a hit inside a chunk
+                // still fading in is recorded as the FRONT layer and the
+                // march skips past that whole chunk, so the final color
+                // can blend the chunk against whatever is really behind
+                // it (far-LOD preview, another chunk, sky) instead of a
+                // fake backdrop. Only the FIRST fading hit per ray gets
+                // this treatment; later ones shade normally.
+                if (!frontValid && haveSlot &&
+                    chunkFade.alpha[slot] < 0.999) {
+                    frontValid = true;
+                    frontFade = chunkFade.alpha[slot];
+                    frontType = hitType;
+                    frontNormal = normal;
+                    frontTHit = tHit;
+                    frontCellXZ = cell.xz;
+                    frontHitY = hitY;
+                    hit = false;
+                    // Skip past this chunk's XZ box. Floor division via
+                    // floats (integer / truncates toward zero - wrong
+                    // for negative world coordinates).
+                    const vec2 cs2 = vec2(pc.chunkSize.x, pc.chunkSize.z);
+                    const ivec2 cbase = ivec2(
+                        floor(vec2(cell.xz) / cs2) * cs2);
+                    float tOut = t;
+                    if (abs(rd.x) > EPS) {
+                        tOut = max(tOut, (rd.x > 0.0)
+                            ? (float(cbase.x + int(pc.chunkSize.x)) -
+                               start.x) / rd.x
+                            : (float(cbase.x) - start.x) / rd.x);
+                    }
+                    if (abs(rd.z) > EPS) {
+                        tOut = max(tOut, (rd.z > 0.0)
+                            ? (float(cbase.y + int(pc.chunkSize.z)) -
+                               start.z) / rd.z
+                            : (float(cbase.y) - start.z) / rd.z);
+                    }
+                    if (tOut <= t + 1e-6) {
+                        tOut = tEnd;  // vertical ray: nothing else nearby
+                    }
+                    t = min(tOut + 1e-4, tEnd);
+                    cell.x = int(floor(start.x + rd.x * t));
+                    cell.z = int(floor(start.z + rd.z * t));
+                    // Re-init the DDA crossing times for the new column
+                    // (steps and per-cell deltas are unchanged).
+                    if (abs(rd.x) > EPS) {
+                        const float nx =
+                            float(cell.x + ((stepX > 0) ? 1 : 0));
+                        tMaxX = (nx - start.x) / rd.x;
+                    }
+                    if (abs(rd.z) > EPS) {
+                        const float nz =
+                            float(cell.z + ((stepZ > 0) ? 1 : 0));
+                        tMaxZ = (nz - start.z) / rd.z;
+                    }
+                    lastAxis = -1;
+                    continue;
+                }
                 termCause = TERM_HIT;
                 break;
             }
@@ -842,58 +963,20 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         }
     }
 
+    // Base layer: the hit behind everything (or the miss/sky result).
+    vec3 result;
     if (hit || farHit) {
-        const vec3 hitPos = start + rd * tHit;
-        vec3 n = normalize(normal);
-        vec3 sunDir = normalize(scene.lightDir.xyz);
-        float ndl = max(dot(n, sunDir), 0.0);
-        vec3 base = voxelColor(hitType, normal);
-
-        // Per-vertex simulated AO on the hit face (from the owner's WGSL
-        // reference): darkens creases and corners. Far-LOD hits skip AO
-        // (invisible at multi-hundred-unit distances).
-        float ao = 1.0;
-        if (!farHit) {
-            ao = calculateAO(ivec3(cell.x, hitY, cell.z), normal, hitPos);
+        result = shadeSurfaceHit(hitType, normal, tHit, farHit, cell.xz,
+                                 hitY, start, rd, rdWorld, tEntryOffset);
+        // First far-field activation fades in (scene.misc.z, 0 -> 1):
+        // the whole distant world pops in at once otherwise, which read
+        // as "LOD appears before near chunks". Recenters do NOT fade -
+        // their cells are bit-identical by construction (world-aligned
+        // window shift), so this only ever ramps once per session.
+        if (farHit && scene.misc.z < 0.999) {
+            result = mix(skyColor(rdWorld), result, scene.misc.z);
         }
-
-        // Sun shadows: one cheap ascending ray toward the sun. Skipped
-        // only when the direct term is zero anyway (ndl <= 0). Far-LOD
-        // hits MUST be shadowed too: from beyond the region the march
-        // self-selects the cheap far-cell path, and skipping it here lit
-        // the whole far band at full sun while the near terrain right
-        // next to it sat in shade - a bright "fully lit face" band along
-        // the near/far seam (pass-6 perf cut, reverted).
-        float shadow = 1.0;
-        if (ndl > 0.0) {
-            shadow = sunShadow(hitPos, n);
-        }
-
-        // Lighting model ported from the owner's WGSL reference renderer:
-        // hemispheric sky ambient + direct sun (lambert floor + broad
-        // pow-8 lobe) + fresnel rim, from the sky THIS ray sees (so lit
-        // terrain and its fog background always agree) - WITHOUT the sun
-        // disc/glow (skyBaseColor; the reference passes only envColors.sky
-        // into shading). Shadow scales the direct term and dims the
-        // ambient like sky occlusion, so shadows read clearly without
-        // crushing anything to black. AO scales everything.
-        vec3 skyAmb = skyBaseColor(rdWorld);
-        float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-        vec3 ambient =
-            mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
-        vec3 direct =
-            scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0)) * shadow;
-        float view = max(dot(n, -rdWorld), 0.0);
-        vec3 rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
-
-        vec3 color = base * (ambient + direct + rim) * ao;
-
-        // Distance fog towards the sunless sky in this direction; hides
-        // the region edge and gives the world aerial perspective.
-        float fog = clamp(fogAmount(tEntryOffset + tHit), 0.0, 1.0);
-        return mix(color, skyBaseColor(rdWorld), fog);
-    }
-    if (holeDbgFar) {
+    } else if (holeDbgFar) {
         // VV_DEBUG_HOLE (see the far march): magenta = crossed an EMPTY
         // far cell of the target chunk (data hole); cyan = crossed it but
         // passed over the stored surface (height too low); yellow = the
@@ -905,8 +988,21 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             return vec3(0.0, 1.0, 1.0);
         }
         return vec3(1.0, 1.0, 0.0);
+    } else {
+        result = debugTerm ? termColor(termCause) : skyColor(rdWorld);
     }
-    return debugTerm ? termColor(termCause) : skyColor(rdWorld);
+
+    // Front layer: a hit inside a FADING chunk, composited over whatever
+    // the march found behind it (far-LOD preview of the same terrain,
+    // another chunk, or sky). One layer is plenty - overlapping fading
+    // chunks at the same pixel for 0.6 s is rare enough to ignore.
+    if (frontValid && !debugTerm) {
+        const vec3 front = shadeSurfaceHit(
+            frontType, frontNormal, frontTHit, false, frontCellXZ,
+            frontHitY, start, rd, rdWorld, tEntryOffset);
+        result = mix(result, front, frontFade);
+    }
+    return result;
 }
 
 uint packColor(vec3 rgb01)

@@ -296,6 +296,13 @@ class VulkanRenderer final {
   // Slots released by a region swap, waiting until no in-flight frame can
   // reference them (two frames) before rejoining the free list.
   std::vector<std::pair<std::uint32_t, std::uint32_t>> m_slotCooldown;
+  // Chunk fade-in (pass 19): per-slot fade start times (epoch = opaque);
+  // m_slotFadeScratch is the per-frame alpha array pushed to binding 7.
+  // The far fade ramps once, after the FIRST far-field activation.
+  std::vector<std::chrono::steady_clock::time_point> m_slotFadeStart;
+  std::vector<float> m_slotFadeScratch;
+  bool m_farEverActivated = false;
+  std::chrono::steady_clock::time_point m_farFadeStart{};
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
   std::int32_t m_farCenterChunkZ = 0;

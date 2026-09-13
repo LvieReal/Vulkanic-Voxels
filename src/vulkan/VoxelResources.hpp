@@ -113,11 +113,18 @@ class VoxelResources final {
 	bool writeChunkTable(const std::vector<std::uint32_t>& slotPerCell,
 											std::uint32_t half);
 
+	// Per-slot fade-in alphas (binding 7; one float per atlas slot, 1.0 =
+	// fully opaque). The renderer writes the whole array each frame from
+	// mapped memory; the shader composites hits in fading chunks against
+	// whatever is behind them (far LOD / sky / another chunk).
+	void writeChunkFade(const std::vector<float>& alphas);
+
 	void cleanup(VkDevice device);
 
 	VkBuffer voxelBuffer() const { return m_voxelBuffer; }
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
+	VkBuffer fadeBuffer() const { return m_fadeBuffer; }
 	VkBuffer farBuffer() const { return m_farBuffer; }
 	VkBuffer paletteBuffer() const { return m_paletteBuffer; }
 
@@ -138,6 +145,11 @@ class VoxelResources final {
 
 	VkBuffer m_heightBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_heightMemory = VK_NULL_HANDLE;
+
+	// Per-slot fade-in alphas (see writeChunkFade).
+	VkBuffer m_fadeBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_fadeMemory = VK_NULL_HANDLE;
+	void* m_mappedFade = nullptr;
 
 	VkBuffer m_farBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;

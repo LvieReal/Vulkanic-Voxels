@@ -264,5 +264,5 @@ Headless smoke test (no GPU/display in restricted sandboxes - the game must
 fail gracefully with the Vulkan error dialog, not crash):
 
   QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH="$QT_PREFIX/lib:$DEP_PREFIX/lib" \\
-      timeout 5 ./build/bin/game
+      timeout 5 ./build/release/bin/game
 EOF

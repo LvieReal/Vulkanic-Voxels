@@ -25,7 +25,8 @@ class SceneUniform final {
   void cleanup(VkDevice device);
 
   // debugFlags: x = termination-cause visualization (VV_DEBUG_TERM),
-  // landing in SceneUBO.misc.y (y kept for layout stability, unused).
+  // y = far-field fade-in alpha (first activation only; recenters do
+  // not fade - their cells are identical). Lands in SceneUBO.misc.y/z.
   void update(const vv::core::Camera& camera, float timeSeconds,
               const LightingConfig& lighting,
               const glm::vec2& debugFlags = glm::vec2(0.0f));

@@ -40,7 +40,7 @@ pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
           mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-glslang
 cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/bin/game.exe
+./build/release/bin/game.exe
 ```
 
 ### Linux
@@ -63,14 +63,14 @@ sudo dnf install gcc-c++ cmake qt6-qtbase-devel vulkan-headers \
 > **Optional:** Qt's private headers (`qt6-base-private-dev` on Debian/Ubuntu)
 > enable the native **Wayland** backend. The game builds and runs without them
 > on Windows, macOS and X11; on Wayland without them, run via XWayland:
-> `QT_QPA_PLATFORM=xcb ./build/bin/game`.
+> `QT_QPA_PLATFORM=xcb ./build/release/bin/game`.
 
 Build and run:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/bin/game
+./build/release/bin/game
 ```
 
 A small pure-logic test suite (noise, terrain layering, chunked world) builds
@@ -89,7 +89,7 @@ Requires a Vulkan implementation with [MoltenVK]
 brew install cmake qt vulkan-sdk glslang
 cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/bin/game.app/Contents/MacOS/game   # or use the build/package_folder target
+./build/release/bin/game.app/Contents/MacOS/game   # or use the build/package_folder target
 ```
 
 ### Packaging
@@ -100,7 +100,7 @@ in `build/dist/<config>` with the Qt runtime deployed next to the executable.
 ## Troubleshooting
 
 - **Wayland glitches / black window**: run under XWayland with
-  `QT_QPA_PLATFORM=xcb ./build/bin/game`. Rendering into a Qt widget on
+  `QT_QPA_PLATFORM=xcb ./build/release/bin/game`. Rendering into a Qt widget on
   Wayland is best-effort; X11 is the battle-tested path.
 - **"Required Vulkan instance extension 'VK_KHR_*_surface' is not supported"**:
   your Vulkan loader is too old or misconfigured. Update your GPU drivers /

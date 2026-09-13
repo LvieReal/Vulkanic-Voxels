@@ -45,6 +45,10 @@ constexpr std::size_t kStreamSprintChunks = 16;
 // How many chunks the generation worker may run ahead of the upload pump
 // (bounds worker memory: N x 128 KB of staged voxel data).
 constexpr std::size_t kGenBacklog = 6;
+// Chunk fade-in duration (seconds) and the first far-field activation
+// fade (recenters never fade - their cells are identical).
+constexpr double kChunkFadeSeconds = 0.6;
+constexpr double kFarFadeSeconds = 1.5;
 // Sentinel for "VV_DEBUG_HOLE not set" (int32 max).
 constexpr int32_t kHoleDebugOff = 0x7FFFFFFF;
 
@@ -167,8 +171,18 @@ void VulkanRenderer::drawFrame() {
   m_fogDensity = 1.0f / fogCutDistance();
 
   // Delegated to SceneUniform utility: updates camera + lighting UBO.
-  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
-                         glm::vec2(m_debugTerminators ? 1.0f : 0.0f, 0.0f));
+  float farFade = 1.0f;
+  if (m_farEverActivated) {
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() -
+                               m_farFadeStart)
+                               .count();
+    farFade = static_cast<float>(
+        std::min(elapsed / kFarFadeSeconds, 1.0));
+  }
+  m_sceneUniform.update(
+      m_camera, m_timeSeconds, m_lighting,
+      glm::vec2(m_debugTerminators ? 1.0f : 0.0f, farFade));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -420,6 +434,30 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
                        .count();
   }
 
+  // Chunk fade-in alphas (binding 7): age every tracked slot, finalize
+  // finished fades, publish the whole (tiny) array via mapped memory.
+  if (!m_slotFadeStart.empty()) {
+    const auto now = std::chrono::steady_clock::now();
+    std::fill(m_slotFadeScratch.begin(), m_slotFadeScratch.end(), 1.0f);
+    for (const auto& [coord, slot] : m_slotOf) {
+      (void)coord;
+      const auto& start = m_slotFadeStart[slot];
+      if (start.time_since_epoch().count() == 0) {
+        continue;  // opaque (not fading)
+      }
+      const double elapsed =
+          std::chrono::duration<double>(now - start).count();
+      const float alpha =
+          static_cast<float>(std::min(elapsed / kChunkFadeSeconds, 1.0));
+      if (alpha >= 1.0f) {
+        m_slotFadeStart[slot] = {};
+      } else {
+        m_slotFadeScratch[slot] = alpha;
+      }
+    }
+    m_voxelResources.writeChunkFade(m_slotFadeScratch);
+  }
+
   const auto& cfg = m_voxelConfig;
   const float chunkWorldX = static_cast<float>(cfg.chunkSizeX) * cfg.voxelSize.x;
   const float chunkWorldZ = static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
@@ -449,6 +487,7 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
           if (std::abs(it->first.x - m_streamTarget.x) > rr ||
               std::abs(it->first.z - m_streamTarget.z) > rr) {
             m_slotCooldown.emplace_back(it->second, m_frameCounter);
+            m_slotFadeStart[it->second] = {};
             it = m_slotOf.erase(it);
           } else {
             ++it;
@@ -747,6 +786,7 @@ void VulkanRenderer::pumpRegionStreaming() {
     const vv::voxel::Chunk* chunk =
         m_world->installChunk(gen.coord, std::move(gen.types));
     m_slotOf[gen.coord] = slot;
+    m_slotFadeStart[slot] = std::chrono::steady_clock::now();
     std::string error;
     if (!m_voxelResources.uploadChunksStreaming(
             m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
@@ -909,6 +949,7 @@ void VulkanRenderer::finishRegionMove() {
     if (std::abs(it->first.x - m_streamTarget.x) > r ||
         std::abs(it->first.z - m_streamTarget.z) > r) {
       m_slotCooldown.emplace_back(it->second, m_frameCounter);
+      m_slotFadeStart[it->second] = {};  // back to opaque for lingering refs
       it = m_slotOf.erase(it);
     } else {
       ++it;
@@ -999,6 +1040,10 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       m_farDim = m_farPending.dim;
       m_farCell = m_farPending.cellVoxels;
       m_farFieldActive = true;
+      if (!m_farEverActivated) {
+        m_farEverActivated = true;
+        m_farFadeStart = std::chrono::steady_clock::now();
+      }
       // Recenter hysteresis is measured against the SNAPPED field center
       // (the build snaps to a world-aligned grid; see FarField::build).
       const std::int32_t chunkX32 =
@@ -1633,13 +1678,20 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   farBinding.descriptorCount = 1;
   farBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // Per-slot fade-in alphas (pass 19).
+  VkDescriptorSetLayoutBinding fadeBinding{};
+  fadeBinding.binding = 7;
+  fadeBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  fadeBinding.descriptorCount = 1;
+  fadeBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
-      paletteBinding, heightBinding, farBinding};
+      paletteBinding, heightBinding, farBinding, fadeBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 7;
+  info.bindingCount = 8;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1707,6 +1759,9 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   for (uint32_t slot = m_voxelResources.slotCount(); slot-- > 0;) {
     m_freeSlots.push_back(slot);
   }
+  m_slotFadeStart.assign(m_voxelResources.slotCount(), {});
+  m_slotFadeScratch.assign(m_voxelResources.slotCount(), 1.0f);
+  m_farEverActivated = false;
 
   // Startup is ASYNC now: the old synchronous initial region blocked the
   // first frame for ~10 s on slow machines (729 chunks x ~15 ms). The far
@@ -1784,6 +1839,7 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     const auto it = m_slotOf.find(coord);
     if (it != m_slotOf.end()) {
       m_slotCooldown.emplace_back(it->second, m_frameCounter);
+      m_slotFadeStart[it->second] = {};
       m_slotOf.erase(it);
     }
   }
@@ -1834,10 +1890,12 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
 
   std::vector<vv::vulkan::VoxelResources::ChunkUpload> uploads;
   uploads.reserve(needUpload.size());
+  const auto fadeStart = std::chrono::steady_clock::now();
   for (const auto& [coord, chunk] : needUpload) {
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
     m_slotOf[coord] = slot;
+    m_slotFadeStart[slot] = fadeStart;  // teleport regions fade in too
     uploads.push_back({slot, chunk});
   }
 
@@ -1978,8 +2036,9 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[2] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 6;  // voxel atlas, output, chunk table,
-                                     // palette, column heights, far LOD
+  poolSizes[0].descriptorCount = 7;  // voxel atlas, output, chunk table,
+                                     // palette, column heights, far LOD,
+                                     // chunk fade
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
 
@@ -2045,7 +2104,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[7] = {};
+  VkWriteDescriptorSet writes[8] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2095,7 +2154,19 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[6].pBufferInfo = &farInfo;
 
-  vkUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
+  VkDescriptorBufferInfo fadeInfo{};
+  fadeInfo.buffer = m_voxelResources.fadeBuffer();
+  fadeInfo.offset = 0;
+  fadeInfo.range = VK_WHOLE_SIZE;
+
+  writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[7].dstSet = m_descriptorSet;
+  writes[7].dstBinding = 7;
+  writes[7].descriptorCount = 1;
+  writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[7].pBufferInfo = &fadeInfo;
+
+  vkUpdateDescriptorSets(m_device, 8, writes, 0, nullptr);
   return true;
 }
 
@@ -2228,7 +2299,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     return false;
   }
 
-  VkBufferMemoryBarrier preComputeBarriers[3] = {};
+  VkBufferMemoryBarrier preComputeBarriers[4] = {};
   preComputeBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
   preComputeBarriers[0].srcAccessMask = 0;
   preComputeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2253,6 +2324,15 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].buffer = m_outputBuffer;
+
+  // Chunk fade alphas: mapped-memory writes from updateWorld must be
+  // visible to the compute stage before the dispatch.
+  preComputeBarriers[3].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[3].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  preComputeBarriers[3].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  preComputeBarriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[3].buffer = m_voxelResources.fadeBuffer();
   preComputeBarriers[2].offset = 0;
   preComputeBarriers[2].size = VK_WHOLE_SIZE;
 
@@ -2260,7 +2340,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                            VK_PIPELINE_STAGE_TRANSFER_BIT |
                            VK_PIPELINE_STAGE_HOST_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 3,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 4,
                        preComputeBarriers, 0, nullptr);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);

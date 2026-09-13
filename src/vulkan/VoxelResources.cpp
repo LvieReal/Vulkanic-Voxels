@@ -55,6 +55,34 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 		return false;
 	}
 
+	// Per-slot fade-in alphas (binding 7; one float per atlas slot).
+	// HOST_VISIBLE + COHERENT: the renderer rewrites the whole (tiny)
+	// array every frame; the draw-frame barrier makes the writes visible
+	// to the compute stage. Starts fully opaque (no fade anywhere).
+	{
+		const VkDeviceSize fadeBytes =
+				static_cast<VkDeviceSize>(m_slotCount) * sizeof(float);
+		if (!utils::createBuffer(device, physicalDevice, fadeBytes,
+														 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+														 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+																 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+														 m_fadeBuffer, m_fadeMemory,
+														 outError)) {
+			cleanup(device);
+			return false;
+		}
+		VkResult fr = vkMapMemory(device, m_fadeMemory, 0, VK_WHOLE_SIZE, 0,
+															&m_mappedFade);
+		if (fr != VK_SUCCESS || m_mappedFade == nullptr) {
+			outError = "Failed to map the chunk fade buffer.";
+			cleanup(device);
+			return false;
+		}
+		std::vector<float> ones(m_slotCount, 1.0f);
+		std::memcpy(m_mappedFade, ones.data(),
+								static_cast<std::size_t>(fadeBytes));
+	}
+
 	// Far-LOD height field (binding 6): one u32 per coarse cell, dim =
 	// 2 * farLodRadiusChunks * chunkSizeX / farLodCellVoxels (square). The
 	// buffer always exists (tiny dummy when far LOD is disabled) so the
@@ -664,6 +692,14 @@ bool VoxelResources::writeChunkTable(
 	return true;
 }
 
+void VoxelResources::writeChunkFade(const std::vector<float>& alphas) {
+	if (m_mappedFade == nullptr ||
+			alphas.size() != static_cast<std::size_t>(m_slotCount)) {
+		return;
+	}
+	std::memcpy(m_mappedFade, alphas.data(), alphas.size() * sizeof(float));
+}
+
 void VoxelResources::cleanup(VkDevice device) {
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_streamFence[k] != VK_NULL_HANDLE) {
@@ -702,6 +738,18 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_heightMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_heightMemory, nullptr);
 		m_heightMemory = VK_NULL_HANDLE;
+	}
+	if (m_mappedFade != nullptr) {
+		vkUnmapMemory(device, m_fadeMemory);
+		m_mappedFade = nullptr;
+	}
+	if (m_fadeBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_fadeBuffer, nullptr);
+		m_fadeBuffer = VK_NULL_HANDLE;
+	}
+	if (m_fadeMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_fadeMemory, nullptr);
+		m_fadeMemory = VK_NULL_HANDLE;
 	}
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_farFence[k] != VK_NULL_HANDLE) {
