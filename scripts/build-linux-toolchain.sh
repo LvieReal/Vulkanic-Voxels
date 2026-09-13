@@ -22,7 +22,10 @@
 #                                  VALIDATION only - see note at the bottom)
 #
 # Usage:   scripts/build-linux-toolchain.sh [prefix-dir]
-# Default prefix: /tmp/deps. Takes roughly 20-30 minutes on 2 cores.
+# Default prefix: ~/.cache/vv-deps (PERSISTS across sandbox /tmp resets,
+# which wiped the toolchain 8+ times; /tmp/deps is created as a SYMLINK to
+# it so the documented /tmp/deps paths keep working). Takes roughly 20-30
+# minutes on 2 cores.
 #
 # Afterwards, configure the game:
 #   export PATH="$PREFIX/venv/bin:$PREFIX/prefix/bin:$PATH"
@@ -32,7 +35,7 @@
 # =============================================================================
 set -eu
 
-PREFIX="${1:-/tmp/deps}"
+PREFIX="${1:-$HOME/.cache/vv-deps}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 SRC="$PREFIX/src"
 BUILD="$PREFIX/build"
@@ -43,6 +46,11 @@ say() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$SRC" "$BUILD" "$DEP_PREFIX"
+# Compatibility symlink so /tmp/deps paths keep working after a /tmp wipe.
+if [ "$PREFIX" != "/tmp/deps" ]; then
+	rm -f /tmp/deps
+	ln -s "$PREFIX" /tmp/deps
+fi
 
 # --- preflight ---------------------------------------------------------------
 command -v curl >/dev/null || die "curl is required"

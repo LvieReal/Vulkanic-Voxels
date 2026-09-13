@@ -2,6 +2,11 @@
 
 #include <vulkan/vulkan.h>
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -56,10 +61,22 @@ class VulkanRenderer final {
   void ensureFarField(int32_t centerChunkX, int32_t centerChunkZ);
   void launchFarFieldBuild(int32_t centerChunkX, int32_t centerChunkZ);
 
-  // Incremental region streaming (all main-thread, time-sliced).
+  // Incremental region streaming. Generation runs on a WORKER thread
+  // (pass 13): the render thread only installs finished chunks and uploads
+  // them (sub-millisecond) - generation (~2.8 ms/chunk, up to 4/frame at
+  // sprint) on the render thread was the last main-thread hitch source.
   void beginRegionMove(int32_t targetChunkX, int32_t targetChunkZ);
+  // Worker plumbing (see the .cpp for the memory-ordering rationale).
+  struct GeneratedChunk {
+    vv::voxel::ChunkCoord coord;
+    std::vector<std::uint8_t> types;
+  };
+  void generationWorker(const vv::terrain::TerrainGenerator* gen);
+  void stopGenerationWorker();
+  // Installs finished chunks, tops up requests from the pending set.
+  void pumpRegionStreaming();
   void rebuildStreamPending();
-  void pumpRegionStreaming(double budgetMs);
+
   void finishRegionMove();
 
   // Incremental far-LOD seam patch: rewrites the cells covered by
@@ -215,12 +232,27 @@ class VulkanRenderer final {
   // Pending coords, sorted WORST-first (pop_back() = highest priority:
   // frustum-facing, near). Coords already in m_slotOf are excluded.
   std::vector<vv::voxel::ChunkCoord> m_streamPending;
+  // Async generation worker (see pumpRegionStreaming).
+  std::thread m_genThread;
+  std::mutex m_genMutex;
+  std::condition_variable m_genCV;
+  std::vector<vv::voxel::ChunkCoord> m_genRequests;
+  std::vector<GeneratedChunk> m_genResults;
+  bool m_genStop = false;
   float m_fogDensity = 0.01f;
 
   // Debug visualization (see AGENT_NOTES): VV_DEBUG_TERM colors each pixel
   // by ray-termination cause. Default off. (VV_DEBUG_SSAA / VV_SSAA were
   // removed in pass 10 - supersampling was too heavy.)
   bool m_debugTerminators = false;
+  // VV_PERF: frame-time logging for hitch diagnosis (frames > 25 ms,
+  // rate-limited). VV_DEBUG_HOLE: color far-march misses over a chunk.
+  bool m_perfEnabled = false;
+  std::chrono::steady_clock::time_point m_perfLastFrame{};
+  std::chrono::steady_clock::time_point m_perfLastLog{};
+  double m_perfStreamMs = 0.0;
+  std::int32_t m_holeDebugX = 0x7FFFFFFF;
+  std::int32_t m_holeDebugZ = 0x7FFFFFFF;
 
 
   // --- Far-LOD field (background build + upload state) ---

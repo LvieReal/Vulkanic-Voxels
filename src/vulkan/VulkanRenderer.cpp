@@ -33,7 +33,6 @@ using namespace vv::vulkan::utils;
 // even one per frame was measurable as a micro-stutter at high fps - with
 // the cap at 1 a border crossing takes ~49 frames (~0.8 s at 60 fps) to
 // fully swap, invisible because the old region keeps rendering meanwhile.
-constexpr double kStreamBudgetMs = 3.0;
 constexpr std::size_t kStreamChunksPerFrame = 1;
 // Sprint mode: when the camera outruns the base rate (more than 2 chunks
 // ahead of the ACTIVE region center), the pump raises its per-frame cap and
@@ -43,7 +42,11 @@ constexpr std::size_t kStreamChunksPerFrame = 1;
 // generated everything at once (25 chunks per crossed row x 2.8 ms = 70 ms+
 // hitches every couple of frames - the sprint stutter).
 constexpr std::size_t kStreamSprintChunks = 4;
-constexpr double kStreamSprintBudgetMs = 10.0;
+// How many chunks the generation worker may run ahead of the upload pump
+// (bounds worker memory: N x 128 KB of staged voxel data).
+constexpr std::size_t kGenBacklog = 3;
+// Sentinel for "VV_DEBUG_HOLE not set" (int32 max).
+constexpr int32_t kHoleDebugOff = 0x7FFFFFFF;
 
 // Fog tail attenuation used ONLY inside the shader's fog curve
 // (fog = 1 - exp(-kFogTail * (d/cut)^4)); the C++ side never needs the value,
@@ -90,6 +93,22 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
   // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
   // colors each pixel by ray-termination cause.
   m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
+  if (const char* perfEnv = std::getenv("VV_PERF")) {
+    m_perfEnabled = std::strcmp(perfEnv, "0") != 0;
+  }
+  if (const char* holeEnv = std::getenv("VV_DEBUG_HOLE")) {
+    int hx = 0, hz = 0;
+    if (std::sscanf(holeEnv, "%d,%d", &hx, &hz) == 2) {
+      m_holeDebugX = hx;
+      m_holeDebugZ = hz;
+      std::fprintf(stderr,
+                   "[vulkan] VV_DEBUG_HOLE: far-miss pixels over chunk "
+                   "(%d,%d) colored (magenta = empty far cell, cyan = data "
+                   "present but ray passed over, yellow = ray never "
+                   "crossed the chunk)\n",
+                   hx, hz);
+    }
+  }
   if (m_debugTerminators) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
@@ -210,6 +229,23 @@ void VulkanRenderer::drawFrame() {
     return;
   }
 
+  if (m_perfEnabled) {
+    const auto now = std::chrono::steady_clock::now();
+    const double frameMs =
+        std::chrono::duration<double, std::milli>(now - m_perfLastFrame)
+            .count();
+    if (frameMs > 25.0 &&
+        std::chrono::duration<double, std::milli>(now - m_perfLastLog)
+                .count() > 250.0) {
+      std::fprintf(stderr,
+                   "[perf] frame %u: %.1f ms total, stream/world %.1f ms "
+                   "(generation is on the worker thread)\n",
+                   m_frameCounter, frameMs, m_perfStreamMs);
+      m_perfLastLog = now;
+    }
+    m_perfLastFrame = now;
+    m_perfStreamMs = 0.0;
+  }
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
   ++m_frameCounter;
 }
@@ -224,7 +260,10 @@ void VulkanRenderer::setDeviceLost(const std::string& message) {
 }
 
 void VulkanRenderer::cleanup() {
-  // Join the far-LOD builder thread FIRST: it reads the terrain generator
+  // Stop the generation worker first (same reason as the far thread
+  // below: it reads the terrain generator owned by m_world).
+  stopGenerationWorker();
+  // Join the far-LOD builder thread: it reads the terrain generator
   // owned by m_world (destroyed below) and fills m_farPending.
   if (m_farThread.joinable()) {
     m_farThread.join();
@@ -321,6 +360,14 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
 }
 
 void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
+  // Not streaming: discard any straggling worker results (the sync paths
+  // generated their own data; keeping these would block a later stream's
+  // completion check).
+  if (!m_streamActive) {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    m_genResults.clear();
+  }
+
   // Recycle released atlas slots once no in-flight frame can still
   // reference them (two frames after release; see finishRegionMove).
   for (auto it = m_slotCooldown.begin(); it != m_slotCooldown.end();) {
@@ -369,7 +416,15 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
     // into sprint mode (see kStreamSprintChunks), which drains the deficit
     // within a few frames instead of hitching. Teleports still take the
     // fallback above.
-    pumpRegionStreaming(kStreamBudgetMs);
+    if (m_perfEnabled) {
+      const auto t0 = std::chrono::steady_clock::now();
+      pumpRegionStreaming();
+      m_perfStreamMs = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+    } else {
+      pumpRegionStreaming();
+    }
     ensureFarField(chunkX, chunkZ);
     return;
   }
@@ -385,6 +440,17 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
 
 void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
                                      int32_t targetChunkZ) {
+  // Drop queued generation requests for the old target; finished results
+  // are filtered by the pump against the new target.
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    m_genRequests.clear();
+  }
+  if (!m_genThread.joinable() && m_world) {
+    m_genStop = false;
+    m_genThread = std::thread(&VulkanRenderer::generationWorker, this,
+                              &m_world->terrain());
+  }
   m_streamTarget = vv::voxel::ChunkCoord{targetChunkX, targetChunkZ};
   rebuildStreamPending();
 
@@ -452,59 +518,143 @@ void VulkanRenderer::rebuildStreamPending() {
             });
 }
 
-void VulkanRenderer::pumpRegionStreaming(double budgetMs) {
-  if (!m_streamActive) {
+void VulkanRenderer::generationWorker(
+    const vv::terrain::TerrainGenerator* gen) {
+  const auto& cfg = m_voxelConfig;
+  for (;;) {
+    vv::voxel::ChunkCoord coord{};
+    {
+      std::unique_lock<std::mutex> lock(m_genMutex);
+      m_genCV.wait(lock, [this] { return m_genStop || !m_genRequests.empty(); });
+      if (m_genRequests.empty()) {
+        return;  // stop requested and nothing left
+      }
+      coord = m_genRequests.back();
+      m_genRequests.pop_back();
+    }
+    // generateChunkVoxels is const and thread-safe (same contract as the
+    // far-LOD build thread); ~2.8 ms per chunk.
+    std::vector<std::uint8_t> types;
+    gen->generateChunkVoxels(
+        coord.x * static_cast<std::int32_t>(cfg.chunkSizeX),
+        coord.z * static_cast<std::int32_t>(cfg.chunkSizeZ), cfg.chunkSizeX,
+        cfg.chunkSizeZ, cfg.worldHeight, types);
+    {
+      std::lock_guard<std::mutex> lock(m_genMutex);
+      m_genResults.push_back(GeneratedChunk{coord, std::move(types)});
+    }
+  }
+}
+
+void VulkanRenderer::stopGenerationWorker() {
+  if (!m_genThread.joinable()) {
     return;
   }
-  const auto start = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    m_genStop = true;
+    m_genRequests.clear();
+  }
+  m_genCV.notify_all();
+  m_genThread.join();
+  m_genResults.clear();
+}
 
-  // Through the FENCE-SCOPED upload path: no vkDeviceWaitIdle /
-  // vkQueueWaitIdle / per-frame staging allocation (those were the
-  // streaming stutter). The upload only touches spare-ring slots no
-  // uploaded table references; finishRegionMove drains everything with its
-  // own device wait before the table swap.
-  //
-  // Deficit-adaptive rate: normally one chunk within budgetMs; when the
-  // camera runs more than 2 chunks ahead of the ACTIVE region (sprint),
-  // raise both (see kStreamSprintChunks) so the deficit drains within a
-  // few frames instead of growing into the teleport fallback.
+void VulkanRenderer::pumpRegionStreaming() {
+  // 1) Collect finished generations (stale ones are discarded below).
+  std::vector<GeneratedChunk> done;
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    done.swap(m_genResults);
+  }
+
+  // 2) Install + upload finished chunks that are still wanted. The upload
+  //    path is fence-scoped (waits only the previous pump's submit), so
+  //    this step is sub-millisecond per chunk.
+  const int32_t r = static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
   const std::size_t deficit = static_cast<std::size_t>(std::max(
       std::abs(m_streamTarget.x - m_regionCenter.x),
       std::abs(m_streamTarget.z - m_regionCenter.z)));
-  const std::size_t cap =
+  const std::size_t uploadCap =
       deficit > 2 ? kStreamSprintChunks : kStreamChunksPerFrame;
-  const double effectiveBudget = deficit > 2 ? kStreamSprintBudgetMs : budgetMs;
-  std::size_t streamed = 0;
-  while (!m_streamPending.empty() && streamed < cap) {
-    const std::chrono::duration<double> elapsed =
-        std::chrono::steady_clock::now() - start;
-    if (elapsed.count() * 1000.0 >= effectiveBudget) {
-      break;
+  std::size_t uploaded = 0;
+  for (GeneratedChunk& gen : done) {
+    if (!m_streamActive) {
+      gen.types.clear();  // streaming aborted: discard (never re-queue)
+      continue;
     }
-    const vv::voxel::ChunkCoord coord = m_streamPending.back();
-    m_streamPending.pop_back();
-    const vv::voxel::Chunk* chunk = m_world->ensureChunk(coord);
+    const bool stale =
+        std::abs(gen.coord.x - m_streamTarget.x) > r ||
+        std::abs(gen.coord.z - m_streamTarget.z) > r ||
+        m_slotOf.find(gen.coord) != m_slotOf.end() ||
+        std::find(m_streamPending.begin(), m_streamPending.end(),
+                  gen.coord) == m_streamPending.end();
+    if (stale) {
+      gen.types.clear();  // not wanted: discard (never re-queue)
+      continue;
+    }
+    if (uploaded >= uploadCap) {
+      break;  // enough this frame; the rest is re-queued below
+    }
     if (m_freeSlots.empty()) {
-      m_streamPending.push_back(coord);
-      break;
+      continue;  // cannot happen mid-stream (pending fits the spare ring)
     }
     const uint32_t slot = m_freeSlots.back();
     m_freeSlots.pop_back();
-    m_slotOf[coord] = slot;
+    const vv::voxel::Chunk* chunk =
+        m_world->installChunk(gen.coord, std::move(gen.types));
+    m_slotOf[gen.coord] = slot;
     std::string error;
     if (!m_voxelResources.uploadChunksStreaming(
             m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
             {slot, chunk}, error)) {
       std::fprintf(stderr, "[vulkan] streaming upload failed: %s\n",
                    error.c_str());
-      m_slotOf.erase(coord);
+      m_slotOf.erase(gen.coord);
       m_freeSlots.push_back(slot);
-      m_streamPending.push_back(coord);
-      break;
+      continue;
     }
-    ++streamed;
+    m_streamPending.erase(std::remove(m_streamPending.begin(),
+                                      m_streamPending.end(), gen.coord),
+                           m_streamPending.end());
+    ++uploaded;
   }
-  if (m_streamPending.empty()) {
+  // Leftovers (not uploaded this frame) go back for the next pump.
+  if (!done.empty()) {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    for (GeneratedChunk& gen : done) {
+      if (!gen.types.empty()) {
+        m_genResults.push_back(std::move(gen));
+      }
+    }
+  }
+
+  // 3) Top up the worker's queue from the pending set.
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    for (const vv::voxel::ChunkCoord& coord : m_streamPending) {
+      const bool queued =
+          std::find(m_genRequests.begin(), m_genRequests.end(), coord) !=
+              m_genRequests.end() ||
+          std::any_of(m_genResults.begin(), m_genResults.end(),
+                      [&](const GeneratedChunk& g) {
+                        return g.coord == coord;
+                      });
+      if (!queued && m_genRequests.size() + m_genResults.size() < kGenBacklog) {
+        m_genRequests.push_back(coord);
+      }
+    }
+    m_genCV.notify_one();
+  }
+
+  // 4) Done when everything pending has been generated AND uploaded.
+  bool finished = false;
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    finished = m_streamPending.empty() && m_genRequests.empty() &&
+               m_genResults.empty();
+  }
+  if (finished && m_streamActive) {
     finishRegionMove();
   }
 }
@@ -536,8 +686,10 @@ void VulkanRenderer::finishRegionMove() {
 
   // Evict the CPU cache beyond the usual +1 hysteresis ring.
   std::vector<vv::voxel::ChunkCoord> evicted;
+  // Amortized (max 8 per swap): freeing a whole crossing row of 128 KB
+  // chunk buffers in one call was visible allocator churn.
   m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
-                        cfg.renderRadiusChunks + 1, evicted);
+                        cfg.renderRadiusChunks + 1, evicted, 8);
 
   // Build the new table and write it into the INACTIVE half, then flip.
   // No device/queue wait: no in-flight frame reads that half (three
@@ -1381,6 +1533,11 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   // acceptable here - it also retires every frame that could reference
   // cooldown slots, so they can be recycled immediately.
   vkDeviceWaitIdle(m_device);
+  {
+    std::lock_guard<std::mutex> lock(m_genMutex);
+    m_genRequests.clear();
+    m_genResults.clear();
+  }
   for (auto it = m_slotCooldown.begin(); it != m_slotCooldown.end();) {
     m_freeSlots.push_back(it->first);
     it = m_slotCooldown.erase(it);
@@ -1914,8 +2071,15 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
                           static_cast<int32_t>(m_farDim),
                           static_cast<int32_t>(m_farDim));
     // farParams.y = far-field half (ping-pong; see uploadFarFieldHalf).
+    // z/w = VV_DEBUG_HOLE target chunk (z encodes x+4096 as the on-flag).
+    float holeZ = 0.0f;
+    float holeW = 0.0f;
+    if (m_holeDebugX != kHoleDebugOff) {
+      holeZ = static_cast<float>(m_holeDebugX + 4096);
+      holeW = static_cast<float>(m_holeDebugZ);
+    }
     push.farParams = glm::vec4(static_cast<float>(m_farCell),
-                               static_cast<float>(m_farHalf), 0.0f, 0.0f);
+                               static_cast<float>(m_farHalf), holeZ, holeW);
   } else {
     push.far = glm::ivec4(0, 0, 0, 0);  // z = 0: far LOD off in the shader
     push.farParams = glm::vec4(0.0f);

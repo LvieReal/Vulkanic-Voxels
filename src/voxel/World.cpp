@@ -99,18 +99,43 @@ const Chunk* World::ensureChunk(const ChunkCoord& coord) {
 }
 
 void World::evictOutside(std::int32_t centerX, std::int32_t centerZ,
-												 std::uint32_t evictRadius,
-												 std::vector<ChunkCoord>& outEvicted) {
+													std::uint32_t evictRadius,
+													std::vector<ChunkCoord>& outEvicted,
+													std::size_t maxEvict) {
+	// maxEvict > 0 amortizes eviction: freeing ~50 x 128 KB blocks in one
+	// call (a full crossing row) causes visible allocator churn (mmap/munmap
+	// per block); a per-call cap spreads it over a few frames. Leftovers
+	// are picked up by the next call - the cache just lingers slightly
+	// longer, bounded by movement.
 	const std::int32_t r = static_cast<std::int32_t>(evictRadius);
+	std::size_t evicted = 0;
 	for (auto it = m_chunks.begin(); it != m_chunks.end();) {
+		if (maxEvict != 0 && evicted >= maxEvict) {
+			return;
+		}
 		if (std::abs(it->first.x - centerX) > r ||
 				std::abs(it->first.z - centerZ) > r) {
 			outEvicted.push_back(it->first);
 			it = m_chunks.erase(it);
+			++evicted;
 		} else {
 			++it;
 		}
 	}
+}
+
+const Chunk* World::installChunk(const ChunkCoord& coord,
+																 std::vector<std::uint8_t>&& types) {
+	auto existing = m_chunks.find(coord);
+	if (existing != m_chunks.end()) {
+		return existing->second.get();
+	}
+	auto chunk = std::make_unique<Chunk>(coord.x, coord.z, m_chunkSizeX,
+																			 m_worldHeight, m_chunkSizeZ);
+	chunk->setVoxelTypes(std::move(types));
+	const Chunk* raw = chunk.get();
+	m_chunks.emplace(coord, std::move(chunk));
+	return raw;
 }
 
 const Chunk* World::findChunk(const ChunkCoord& coord) const {

@@ -72,6 +72,11 @@ void Chunk::recomputeHeightMap() const {
 	m_heightMapDirty = false;
 }
 
+void Chunk::setVoxelTypes(std::vector<std::uint8_t>&& types) {
+	m_voxelTypes = std::move(types);
+	m_heightMapDirty = true;
+}
+
 const std::vector<std::uint16_t>& Chunk::heightMap() const {
 	if (m_heightMapDirty) {
 		recomputeHeightMap();

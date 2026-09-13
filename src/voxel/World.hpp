@@ -51,9 +51,17 @@ class World final {
 	const Chunk* ensureChunk(const ChunkCoord& coord);
 	void evictOutside(std::int32_t centerX, std::int32_t centerZ,
 										std::uint32_t evictRadius,
-										std::vector<ChunkCoord>& outEvicted);
+										std::vector<ChunkCoord>& outEvicted,
+										std::size_t maxEvict = 0);
 
 	const Chunk* findChunk(const ChunkCoord& coord) const;
+
+	// Installs a chunk generated on another thread (same layout contract
+	// as the terrain generator's output). If the chunk is already cached
+	// the data is discarded and the existing chunk is returned (the
+	// synchronous paths may have generated it in the meantime).
+	const Chunk* installChunk(const ChunkCoord& coord,
+														std::vector<std::uint8_t>&& types);
 
 	const vv::terrain::TerrainGenerator& terrain() const { return m_terrain; }
 

@@ -721,6 +721,9 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     // cell; the near-region traversal above is untouched, so its parity
     // guarantee still holds.
     bool farHit = false;
+    bool holeDbgFar = false;
+    bool holeVisitedFar = false;
+    bool holeEmptyFar = false;
     if (!hit && pc.far.z > 0) {
         const float cell = pc.farParams.x;
         const ivec2 farDim = pc.far.zw;
@@ -754,6 +757,22 @@ vec3 traceRay(vec2 uv, bool debugTerm)
 
         float ft = tEndRegion;  // entry param of the current far cell
         int fLastAxis = -1;
+        // VV_DEBUG_HOLE instrumentation: farParams.z = targetChunkX + 4096
+        // (the on-flag), farParams.w = targetChunkZ. Tracks whether the
+        // march crossed the target chunk's cells and whether any was
+        // EMPTY (stored height 0).
+        holeDbgFar = pc.farParams.z >= 4096.0;
+        ivec2 holeCellMin = ivec2(0);
+        ivec2 holeCellMax = ivec2(-1);
+        if (holeDbgFar) {
+            const ivec2 chunkOrg = ivec2(int(pc.farParams.z) - 4096,
+                                         int(pc.farParams.w));
+            const vec2 chunkVox = vec2(chunkOrg) *
+                vec2(pc.chunkSize.x, pc.chunkSize.z);
+            holeCellMin = ivec2(floor((chunkVox - farOrigin) / cell));
+            const int perChunk = int(pc.chunkSize.x / uint(cell));
+            holeCellMax = holeCellMin + ivec2(perChunk - 1);
+        }
         // A ray can cross at most dim.x + dim.y cells of the grid.
         const int farBudget = farDim.x + farDim.y;
         for (int i = 0; i < farBudget; ++i) {
@@ -778,6 +797,14 @@ vec3 traceRay(vec2 uv, bool debugTerm)
                                uint(c2.y) * uint(farDim.x)]
                 : 0u;
             const float fh = float(packed & 0xFFFFu);
+            if (holeDbgFar &&
+                all(greaterThanEqual(c2, holeCellMin)) &&
+                all(lessThanEqual(c2, holeCellMax))) {
+                holeVisitedFar = true;
+                if (fh == 0.0) {
+                    holeEmptyFar = true;
+                }
+            }
 
             if (fh > 0.0 && fy0 < fh) {
                 // Entered this cell below the surface top: side-face hit.
@@ -865,6 +892,19 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         // the region edge and gives the world aerial perspective.
         float fog = clamp(fogAmount(tEntryOffset + tHit), 0.0, 1.0);
         return mix(color, skyBaseColor(rdWorld), fog);
+    }
+    if (holeDbgFar) {
+        // VV_DEBUG_HOLE (see the far march): magenta = crossed an EMPTY
+        // far cell of the target chunk (data hole); cyan = crossed it but
+        // passed over the stored surface (height too low); yellow = the
+        // march never crossed the target chunk (geometry/aim).
+        if (holeEmptyFar) {
+            return vec3(1.0, 0.0, 1.0);
+        }
+        if (holeVisitedFar) {
+            return vec3(0.0, 1.0, 1.0);
+        }
+        return vec3(1.0, 1.0, 0.0);
     }
     return debugTerm ? termColor(termCause) : skyColor(rdWorld);
 }

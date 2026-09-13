@@ -48,6 +48,10 @@ class Chunk final {
 													 std::uint32_t z) const;
 	void set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
 					 vv::voxel::VoxelType type);
+	// Installs a full voxel-type vector generated elsewhere (async worker;
+	// same X + Y*sizeX + Z*sizeX*sizeY layout as generateChunkVoxels).
+	// Moves instead of 131k set() calls; marks the heightmap dirty.
+	void setVoxelTypes(std::vector<std::uint8_t>&& types);
 
 	const std::vector<std::uint8_t>& voxelTypes() const { return m_voxelTypes; }
 
