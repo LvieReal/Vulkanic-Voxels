@@ -298,3 +298,53 @@ the penumbra is now a SMOOTH MONOTONIC ramp (1.0 -> 0.93 -> 0.77 -> 0.59 ->
 0.41 -> 0.21 -> 0.00 over ~1.4 columns), the lit region is clean (no comb),
 and the shadow is fully dark under the wall top. Wall penumbra shape pinned:
 1.0, 1.0, 0.409, 0.0, 0.0 (lit, lit, partial, hard, hard).
+
+Pass 35 IN PROGRESS (owner green-lit, absent until tomorrow — work
+unattended, prototype in the CPU mirror first; SDF experimental path only,
+exact binary sunRayEscapes stays bit-identical). Owner: "sides of the SDF
+shadow right now are completely sharp... limitation or can be fixed?" ->
+it IS fixable. GOAL: the penumbra SOFT ON ALL EDGES (top/leading AND
+side/vertical edges) of the SDF shadow, no hard 0->1 jumps.
+
+ROOT CAUSE (confirmed, L2027-2120 + diag11-16): the penumbra term
+h = y0 - bound is only evaluated in the CLEAR branch (ray above the
+column's top plane). In the BELOW-top/solid branch (y0 < bound, the ray
+crosses the caster's SIDE face — the shadow's side/leading edge) the
+estimate does `return 0.0` with NO penumbra term at all. So the side edge
+is a hard 0->1. k*h/t can NEVER see the side edge: h is height over the
+top plane, constant along the caster's side.
+
+GROUND TRUTH (diag12 brute force: 168-ray sun disk, radius 1/k = 0.125,
+fraction of rays escaping; world = box x/z 28..37, y 10..39, ground y=10,
+sun = normalize(0.5,1,0.5), dy/dx = 2). The correct shape is a SMOOTH
+VALLEY with a ramp on EVERY edge:
+  x:      9    12   16   20 21 22 23   24   28   30   33+   (z=20)
+  truth: 0.837 0.633 0.245 0.0  0  0  0  0.020 0.408 0.633 1.000
+  k*h/t: 1.000 0.211 0.000 0.0  0  0  0  0.000 0.000 0.000 1.000  (hard step)
+  z=30 truth: x17:0.959 19:0.755 21:0.571 23:0.143 25:0.000 27:0.000
+Left penumbra x~9-19, right penumbra x~24-32, narrow umbra x=20-23.
+
+CANDIDATE (marchSdfEdge, diag15/16) — CONFIRMED CORRECT MECHANISM, needs
+tuning: in the below-top branch, instead of `return 0.0`, return
+k*edgeDist/t where edgeDist = perpendicular distance from the march ray to
+the caster's TRAILING edge (the top-edge boundary of the next voxel it is
+heading toward, min of |px-(colX+1)| and |pz-(colZ+1)|). This is exactly
+the missing quantity — it IS zero on the side face (edgeDist=0 -> 0) and
+grows as the ray crosses the top plane, so it produces the side penumbra
+that k*h/t lacks. diag15: the side edge becomes a RAMP (x13:0.113 -> x20:
+0.218, k=4) instead of the hard 0->1 the current code gives.
+
+TUNING TODO (next step): the edgeDist measure and the k constant are not
+calibrated yet (the ramp is too shallow, and a z=30 variant regressed to
+too-bright — the edge distance needs to be measured from the ACTUAL march
+point to the specific trailing-edge segment, not a crude min). Match the
+ground-truth valley at z=20 AND z=30 (both ramps soft, umbra stays dark),
+then the diag10 gentle-bump lit pocket must fill. Then port to the shader
+(same structure: shadowPenumbra gains a 3rd edge-distance arg in the
+below-top branch), rebuild both, ctest, offscreen smoke, one commit.
+
+DIAGNOSTICS in /tmp (NOT wiped this turn): diag12.cpp = brute-force
+ground-truth generator (ShadowWorld + 168 sun-disk rays); diag13/14/15/16 =
+estimate candidates. Rebuild: g++ -std=c++20 -O2 -ffp-contract=off diagNN.cpp
+(they embed the CPU mirrors from diag5.cpp: ShadowWorld, sunRayEscapesSdfMirror,
+sunRayEscapesMirror, shadowSun).
