@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "terrain/FarField.hpp"
+#include "vulkan/StreamPriority.hpp"
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
@@ -1772,6 +1773,105 @@ static void testVoxelTextures() {
 	check(plainOk, "textures: default set is plain colors");
 }
 
+// ---------------------------------------------------------------------------
+// Streaming priority (pass 27): the generation backlog must be consumed
+// BEST-FIRST. Pins the "frustum prioritization is backwards" bug: the
+// pump stocks m_genRequests in reverse (best first, so the front is the
+// best), but the worker used to pop the BACK - the best coords were
+// stuck at the front forever while progressively worse top-ups were
+// generated first; the nearest in-frustum chunks came dead last.
+// ---------------------------------------------------------------------------
+void testStreamPriority() {
+	const float chunk = 32.0f;  // chunk world size (32 voxels x 1.0)
+	const float cx = 400.0f, cz = 400.0f;  // camera (world units)
+	const float fx = 1.0f, fz = 0.0f;      // facing +x
+
+	const auto prio = [&](std::int32_t chx, std::int32_t chz) {
+		return vv::vulkan::streamPriority(chx, chz, cx, cz, fx, fz,
+		                                  chunk);
+	};
+
+	// --- semantics: near-first with a ~96-unit forward bias ---
+	{
+		// Same distance: in front of the camera beats behind it.
+		const int frontChunk = 13;   // ~+416 vs cam x=400 -> ahead
+		const int behindChunk = 11;  // ~-352... both ~1 chunk away
+		check(prio(frontChunk, 12) > prio(behindChunk, 12),
+		      "stream priority: in-front beats behind at equal "
+		      "distance");
+		// Near beats far.
+		check(prio(12, 12) > prio(20, 20),
+		      "stream priority: near beats far");
+		// The bias is bounded: a chunk 200 units ahead still loses to
+		// a sideways chunk 50 units away (near-first dominates).
+		check(prio(12, 12) /* ~sideways, 1 chunk */ >
+		          prio(19, 12) /* ~7 chunks ahead */,
+		      "stream priority: near-first dominates the forward bias");
+	}
+
+	// --- the queue simulation: pump top-up + worker consumption ---
+	{
+		// A 9x9 pending set around chunk (12,12).
+		std::vector<std::pair<std::int32_t, std::int32_t>> pending;
+		for (std::int32_t z = 8; z <= 16; ++z) {
+			for (std::int32_t x = 8; x <= 16; ++x) {
+				pending.emplace_back(x, z);
+			}
+		}
+		// rebuildStreamPending(): sort ascending = worst first.
+		std::sort(pending.begin(), pending.end(),
+		          [&](const auto& a, const auto& b) {
+			          return prio(a.first, a.second) <
+			             prio(b.first, b.second);
+		          });
+
+		// Simulate the pump (top-up: reverse iteration, cap 6) and the
+		// workers (2 chunks per frame). done[i] = generated.
+		const std::size_t kBacklog = 6, kWorkers = 2;
+		std::vector<std::size_t> requests;  // indices into pending
+		std::vector<char> done(pending.size(), 0);
+		std::vector<float> genOrder;        // priority per generation
+		for (int frame = 0; frame < 500; ++frame) {
+			// Top-up (pump step 3).
+			for (std::size_t i = pending.size(); i-- > 0;) {
+				const bool queued =
+				    std::find(requests.begin(), requests.end(), i) !=
+				    requests.end();
+				if (!queued && !done[i] &&
+				    requests.size() < kBacklog) {
+					requests.push_back(i);
+				}
+			}
+			// Workers consume (FRONT = best, the pass-27 fix).
+			for (std::size_t w = 0; w < kWorkers && !requests.empty();
+			     ++w) {
+				const std::size_t i = requests.front();
+				requests.erase(requests.begin());
+				done[i] = 1;
+				genOrder.push_back(
+				    prio(pending[i].first, pending[i].second));
+			}
+		}
+		const bool allDone =
+		    std::all_of(done.begin(), done.end(), [](char c) { return c; });
+		check(allDone, "stream priority: simulation drains the backlog");
+		bool monotonic = true;
+		long long inversions = 0;
+		for (std::size_t i = 1; i < genOrder.size(); ++i) {
+			if (genOrder[i] > genOrder[i - 1]) {
+				++inversions;
+				monotonic = false;
+			}
+		}
+		check(monotonic,
+		      "stream priority: generation runs best-first (no "
+		      "inversions)");
+		std::printf("stream priority: %zu chunks generated, %lld "
+		            "priority inversions\n",
+		            genOrder.size(), inversions);
+	}
+}
+
 int main() {
 	testVertexAO();
 	testNoiseDeterministic();
@@ -1791,6 +1891,7 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testStreamPriority();
 	testVoxelTextures();
 
 	if (g_failures == 0) {

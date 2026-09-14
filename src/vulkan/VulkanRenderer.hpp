@@ -223,8 +223,10 @@ class VulkanRenderer final {
   // when the target region is complete.
   bool m_streamActive = false;
   vv::voxel::ChunkCoord m_streamTarget{};
-  // Pending coords, sorted WORST-first (pop_back() = highest priority:
-  // frustum-facing, near). Coords already in m_slotOf are excluded.
+  // Pending coords, sorted WORST-first (the pump stocks the generation
+  // backlog from the REVERSE end; the workers front-consume, so the
+  // best coords - frustum-facing, near - generate first). Coords
+  // already in m_slotOf are excluded.
   std::vector<vv::voxel::ChunkCoord> m_streamPending;
   // Generate-only coords for the far seam patch (r+1 ring; no slots).
   std::vector<vv::voxel::ChunkCoord> m_streamRingPending;

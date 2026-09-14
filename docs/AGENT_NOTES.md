@@ -87,33 +87,28 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status: REVERTED TO PASS 21 (owner decision)
+## Current status (pass 27)
 
-After pass 26 (CPU flood-fill light grid) failed on the owner's machine
-(everything shadowed / 'sideways' shadows; Release-only immediate
-crash; Debug and VV_SUN_GRID=0 fine) and could not be root-caused
-remotely, the owner asked to return to the last state they consider
-stable: pass 21 below (file-based voxel textures, cone-traced soft sun
-shadows, chunk fade). The revert commit (ad0aa6b) on top of 5daf98f
-restores the tree byte-identical to dda0c0c; the pass-21 CPU test
-suite passes.
+Tree state: pass-25 shadows RESTORED on top of the pass-21 revert (the
+owner confirmed the revert worked, then asked for the cone tracing to
+go too): file-based voxel textures + pass-22 aliases intact, sun
+shadows back to the single exact binary march, no light grid, no cone
+machinery. Owner-verified base: 3ff725f.
 
-If the light grid is ever revisited:
-- 5daf98f holds the complete pass-26.3 state: SunLightGrid module
-  (exhaustively validated on CPU - exact parity vs the march on
-  fixtures and real terrain, renderer-scale windows, nonzero origins,
-  moved regions, far rings), renderer integration, CrashLog telemetry
-  (vv-crash.log next to the exe - the Release exe is -mwindows, its
-  stderr is detached!), VV_SUN_DEBUG raw-field view, and a bit-exact
-  GPU sampling-path emulation test. All of it passed every CPU test and
-  still failed on the owner's GPU - uneliminated suspects: driver-
-  specific GENERAL-layout 3D-texture sampling, mingw -O3 codegen, and
-  the staging/copy/flip path.
-- Salvage-worthy standalone fix inside the reverted range: the pass-13
-  stuck m_streamActive bug (finishRegionMove ran every frame at rest;
-  fixed in 20ca086). The bug is PRESENT AGAIN in this tree (harmless
-  at rest, minor per-frame cost); cherry-pick just that hunk if a later
-  pass touches streaming.
+Pass 27 (first of the fix-one-by-one round): STREAMING PRIORITY WAS
+BACKWARDS. The pump stocks m_genRequests by iterating the sorted
+pending list in reverse (best first), but the workers popped the BACK -
+so the best coords sat at the FRONT forever while every top-up
+(appended at the back, always a little worse) was generated first: the
+nearest, in-frustum chunks appeared dead last after every region move.
+Fix: the workers consume the FRONT (strict FIFO in descending
+priority). streamPriority() extracted to src/vulkan/StreamPriority.hpp
+(glm-free) and pinned by testStreamPriority, including a full
+pump/worker queue simulation (old behavior: 26 priority inversions;
+fixed: 0). Validated: both builds warning-free, ctest green, smoke ok.
+
+Note for the fix round: each fix = one pass = one commit, owner
+verifies before the next.
 
 Owner's stated next step after the shadow saga: their benchmark /
 optimization work (tips delivered in pass 20).

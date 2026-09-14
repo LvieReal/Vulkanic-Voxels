@@ -15,6 +15,7 @@
 #include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
 #include "render/VoxelTextureFiles.hpp"
+#include "vulkan/StreamPriority.hpp"
 #include "vulkan/VulkanUtils.hpp"
 #include "voxel/VoxelTypes.hpp"
 
@@ -601,32 +602,8 @@ void VulkanRenderer::beginRegionMove(int32_t targetChunkX,
   m_streamActive = true;
 }
 
-// Priority: chunks in front of the camera (frustum) first, then near ones.
-// Sorted ascending (worst first) so pop_back() serves the best chunk.
-static float streamPriority(const vv::voxel::ChunkCoord& coord,
-                            const glm::vec3& cameraPos,
-                            const glm::vec3& cameraForward, uint32_t chunkSize,
-                            float voxelSize) {
-  const glm::vec3 center(
-      (static_cast<float>(coord.x) + 0.5f) * static_cast<float>(chunkSize) *
-          voxelSize,
-      0.0f,
-      (static_cast<float>(coord.z) + 0.5f) * static_cast<float>(chunkSize) *
-          voxelSize);
-  glm::vec3 dir = center - cameraPos;
-  dir.y = 0.0f;
-  const float dist = std::max(glm::length(dir), 1.0f);
-  const glm::vec3 f(cameraForward.x, 0.0f, cameraForward.z);
-  const float facing =
-      glm::length(f) > 1e-6f ? glm::dot(dir / dist, glm::normalize(f)) : 0.0f;
-  // NEAR-FIRST with a forward bias: priority = -(dist - facing * 96).
-  // The old facing-dominant order generated the far edge ahead of the
-  // camera before the chunks right next to it (at startup the NEAREST
-  // chunks face away/sideways and came last - "takes a while for nearby
-  // chunks"). Now near chunks always come first, ties/equal distance go
-  // to what is in front (96 world units of bias ~ 3 chunks).
-  return -(dist - facing * 96.0f);
-}
+// Priority: chunks in front of the camera (frustum) first, then near ones
+// (see vulkan/StreamPriority.hpp - shared with the CPU tests).
 
 void VulkanRenderer::rebuildStreamPending() {
   const auto& cfg = m_voxelConfig;
@@ -664,22 +641,18 @@ void VulkanRenderer::rebuildStreamPending() {
   }
   const glm::vec3 pos = m_camera.position();
   const glm::vec3 fwd = m_camera.forward();
-  std::sort(m_streamRingPending.begin(), m_streamRingPending.end(),
-            [this, &pos, &fwd](const vv::voxel::ChunkCoord& a,
-                               const vv::voxel::ChunkCoord& b) {
-              return streamPriority(a, pos, fwd, m_voxelConfig.chunkSizeX,
-                                    m_voxelConfig.voxelSize.x) <
-                     streamPriority(b, pos, fwd, m_voxelConfig.chunkSizeX,
-                                    m_voxelConfig.voxelSize.x);
-            });
-  std::sort(m_streamPending.begin(), m_streamPending.end(),
-            [this, &pos, &fwd](const vv::voxel::ChunkCoord& a,
-                               const vv::voxel::ChunkCoord& b) {
-              return streamPriority(a, pos, fwd, m_voxelConfig.chunkSizeX,
-                                    m_voxelConfig.voxelSize.x) <
-                     streamPriority(b, pos, fwd, m_voxelConfig.chunkSizeX,
-                                    m_voxelConfig.voxelSize.x);
-            });
+  const auto prio = [&](const vv::voxel::ChunkCoord& c) {
+    return vv::vulkan::streamPriority(
+        c.x, c.z, pos.x, pos.z, fwd.x, fwd.z,
+        static_cast<float>(m_voxelConfig.chunkSizeX) *
+            m_voxelConfig.voxelSize.x);
+  };
+  const auto byPrio = [&prio](const vv::voxel::ChunkCoord& a,
+                              const vv::voxel::ChunkCoord& b) {
+    return prio(a) < prio(b);  // ascending: worst first, best at the back
+  };
+  std::sort(m_streamRingPending.begin(), m_streamRingPending.end(), byPrio);
+  std::sort(m_streamPending.begin(), m_streamPending.end(), byPrio);
 }
 
 void VulkanRenderer::generationWorker(
@@ -693,8 +666,14 @@ void VulkanRenderer::generationWorker(
       if (m_genRequests.empty()) {
         return;  // stop requested and nothing left
       }
-      coord = m_genRequests.back();
-      m_genRequests.pop_back();
+      // FRONT = the best pending coord (the pump stocks best-first; see
+      // the fill comment in pumpRegionStreaming). The old pop-BACK here
+      // (pass-27 fix) inverted the order: with reverse stocking the best
+      // coords sat at the front forever while the workers consumed the
+      // progressively WORSE top-ups from the back - the nearest,
+      // in-frustum chunks generated dead last after every region move.
+      coord = m_genRequests.front();
+      m_genRequests.erase(m_genRequests.begin());
     }
     // generateChunkVoxels is const and thread-safe (same contract as the
     // far-LOD build thread); ~2.8 ms per chunk.
@@ -838,14 +817,16 @@ void VulkanRenderer::pumpRegionStreaming() {
       }
     };
     // Backlog filling order: both lists are sorted ascending (worst
-    // first), and the worker pops from the BACK - so the backlog must be
-    // filled in REVERSE (best first). Filling from the front (pass 17
-    // bug) kept the backlog stocked with the WORST pending chunks: the
-    // workers ground through the list farthest-first ("sorted
-    // backwards"). With reverse filling the backlog always holds the
-    // top-k best coords and generation runs nearest-ahead-first; the
-    // ring (queued after the region in reverse order) still only starts
-    // once the region's best are taken.
+    // first), and the backlog is stocked by iterating in REVERSE (best
+    // first) so the FRONT of m_genRequests is always the best pending
+    // coord - which is exactly what the workers consume (front-pop;
+    // pass 27). History: pass 17 fixed the STOCKING (the old front-fill
+    // capped the backlog with the worst coords), but the worker kept
+    // popping the BACK - so with reverse stocking the best coords were
+    // stuck at the front while top-ups (appended at the back, always a
+    // little worse) were consumed first: nearest-ahead chunks generated
+    // last. Front-consumption makes the queue a strict FIFO in
+    // descending priority order (pinned by testStreamPriority).
     for (auto it = m_streamPending.rbegin(); it != m_streamPending.rend();
          ++it) {
       tryQueue(*it);
