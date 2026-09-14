@@ -65,9 +65,11 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 - VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - VV_FAR_LOD=1: opt into the coarse terrain LOD field (OFF by default).
 - VV_SDF_SHADOWS=1: SDF soft-shadow experiment (pass 33: the exact
-  march's traversal + Quilez/Aaltonen penumbra estimates -
-  iquilezles.org/articles/rmshadows/; kShadowSharpness in the shader
-  tunes softness). Exact binary shadows remain the default reference.
+  march's traversal + the Quilez k*h/t penumbra estimate -
+  iquilezles.org/articles/rmshadows/; the Aaltonen two-sphere refinement
+  was removed in pass 34 - it projected a hard "clamped edge" stripe;
+  kShadowSharpness in the shader tunes softness). Exact binary shadows
+  remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
   future foliage can attenuate and be marched through instead of
   requiring precise decal projection.
@@ -267,3 +269,32 @@ umbra (fully-blocked sun), which is binary in ANY SDF soft shadow (see
 the article's reference images); only the penumbra (partial block) is
 soft. Validated: glslangValidator clean, both builds warning-free,
 ctest green, offscreen smoke identical to baseline (dialog, 0% CPU).
+
+Pass 34 (owner: "that wasn't it. the stripes/lines are too strong, jitter
+cannot fix it. these honestly look like clamped edges"): THE AALTONEN
+TRIANGULATION WAS THE STRIPE - NOT THE SAMPLING POSITION. The pass-33
+follow-up's jitter dithered the sample position by a sub-pixel amount, but the
+stripe's period is a FULL DDA COLUMN (~10-30 px), so a +-0.5 px jitter cannot
+touch it (the owner was right that jitter can't fix it). Measured on the CPU
+mirror (flat ground + wall, fine sub-column scan): the Aaltonen estimate has a
+near-vertical cliff at h/prev ~= 2 (the distance DOUBLING in one step, where
+y = h^2/(2 prev) = h and d = sqrt(h^2 - y^2) -> 0), swinging a single
+per-column estimate from ~0 to 1 over an infinitesimal range of h/prev. As the
+pixel moves, the column where h/prev = 2 slides; folded into the min over the
+march's columns it projects a hard STRAIGHT edge across the lit terrain - a
+1-column-period comb of ~7% dips in the lit region plus a chaotic,
+non-monotonic penumbra at the shadow edge (the "clamped edge"). Fix:
+shadowPenumbra is now the PLAIN Quilez estimate k*h/t (the article's original
+technique) - a smooth, well-conditioned function of (h, t) with no cliff; the
+dense per-column sampling (every column the ray clears) already resolves the
+closest approach well within a pixel, so the refinement's light-leak
+correction is not needed. The march's `previous` tracking is gone. The pass-33
+follow-up jitter is removed too (its stated purpose was this artifact; the
+estimate fix makes it moot, and it no longer had a role). The exact-binary
+reference (sunRayEscapes) is untouched. The CPU mirrors
+shadowPenumbraMirror/sunRayEscapesSdfMirror are updated in lockstep (same
+2-arg estimate, no `previous`). Measured (CPU mirror, flat ground + wall):
+the penumbra is now a SMOOTH MONOTONIC ramp (1.0 -> 0.93 -> 0.77 -> 0.59 ->
+0.41 -> 0.21 -> 0.00 over ~1.4 columns), the lit region is clean (no comb),
+and the shadow is fully dark under the wall top. Wall penumbra shape pinned:
+1.0, 1.0, 0.409, 0.0, 0.0 (lit, lit, partial, hard, hard).

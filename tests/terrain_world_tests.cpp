@@ -2013,26 +2013,20 @@ void testSunShadowMarch() {
 // ---------------------------------------------------------------------------
 // SDF soft shadow: CPU mirror of the shader's shadowPenumbra +
 // sunRayEscapesSdf (the VV_SDF_SHADOWS=1 path). Same traversal as the exact
-// march mirror, with the Quilez/Aaltonen penumbra estimate sampled at every
-// cleared column (iquilezles.org/articles/rmshadows/).
+// march mirror, with the Quilez penumbra estimate sampled at every cleared
+// column (iquilezles.org/articles/rmshadows/).
 // ---------------------------------------------------------------------------
 
-// Mirror of the shader's shadowPenumbra: plain Quilez k*h/t when there is no
-// previous sample, otherwise Aaltonen's two-sphere triangulation. The
-// triangle degenerates when the distance is growing (y >= t or h*h <= y*y);
-// the canonical formulation yields NaN there and min() no-ops, the mirror
-// skips the update explicitly (returns 1.0 = no darkening) instead.
-double shadowPenumbraMirror(double h, double prev, double t) {
+// Mirror of the shader's shadowPenumbra: the plain Quilez estimate k*h/t.
+// h is the distance from the sample to the closest relevant surface (a
+// column's top plane), t the distance marched so far. Returns the
+// visibility factor to fold into the min (1.0 = no darkening). The
+// Aaltonen two-sphere refinement was removed from the shader (ill-
+// conditioned where the distance grows; it projected a hard "clamped edge"
+// stripe sampled per DDA column) - see the shader comment.
+double shadowPenumbraMirror(double h, double t) {
 	const double k = 8.0;  // = the shader's kShadowSharpness
-	if (prev >= 1e19) {
-		return std::clamp(k * h / std::max(t, 1e-4), 0.0, 1.0);
-	}
-	const double y = h * h / (2.0 * prev);
-	if (y >= t || h * h <= y * y) {
-		return 1.0;
-	}
-	const double d = std::sqrt(h * h - y * y);
-	return std::clamp(k * d / std::max(t - y, 1e-4), 0.0, 1.0);
+	return std::clamp(k * h / std::max(t, 1e-4), 0.0, 1.0);
 }
 
 // Mirror of the shader's sunRayEscapesSdf: the exact march's ascending
@@ -2063,7 +2057,6 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 	}
 
 	double visibility = 1.0;
-	double previous = 1e20;  // distance at the last estimate sample (none)
 	double t = 0.0;
 	for (int i = 0; i < 256; ++i) {
 		const double sExit = std::min(tMaxX, tMaxZ);
@@ -2072,15 +2065,13 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 			return visibility;
 		}
 		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
-				colZ < w.near.wz;
+			colZ < w.near.wz;
 		if (inNear) {
 			const unsigned bound = w.near.boundAt(colX, colZ);
 			if (bound != 0xFFFFu) {
 				if (y0 >= double(bound)) {
 					const double h = y0 - double(bound);
-					visibility = std::min(
-							visibility, shadowPenumbraMirror(h, previous, t));
-					previous = h;
+					visibility = std::min(visibility, shadowPenumbraMirror(h, t));
 				} else {
 					const double y1 = o[1] + dir[1] * sExit;
 					const int yTop = std::min(
@@ -2097,25 +2088,22 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 					if (solid) {
 						return 0.0;  // opaque world (all test types opaque)
 					}
-					// Air all the way (overhang shaft): the previous
-					// distance is stale across the gap - break the triangle.
-					previous = 1e20;
+					// Air all the way (overhang shaft): no relevant surface
+					// here, no estimate for this column.
 				}
 			}
 		} else {
 			const int fcX = int(std::floor((double(colX) + 0.5 - w.farOrigin) /
-					w.farCell));
+				w.farCell));
 			const int fcZ = int(std::floor((double(colZ) + 0.5 - w.farOrigin) /
-					w.farCell));
+				w.farCell));
 			const unsigned packed = w.farAt(fcX, fcZ);
 			const double h = double(packed & 0xFFFFu);
 			if (h > 0.0) {
 				if (y0 < h) {
 					return 0.0;
 				}
-				visibility = std::min(
-						visibility, shadowPenumbraMirror(y0 - h, previous, t));
-				previous = y0 - h;
+				visibility = std::min(visibility, shadowPenumbraMirror(y0 - h, t));
 			}
 		}
 		t = sExit;
