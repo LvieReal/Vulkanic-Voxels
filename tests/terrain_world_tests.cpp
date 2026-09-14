@@ -805,6 +805,25 @@ static inline int bFloorDiv(int a, int b) {
 	return (a >= 0) ? (a / b) : -((-a + b - 1) / b);
 }
 
+// Pass 32: the shader's floorDiv takes a power-of-two fast path
+// (a >> log2(b) instead of '/' plus '%'), relying on arithmetic right
+// shift being floor division for two's-complement integers (SPIR-V
+// OpShiftRightArithmetic is sign-extending by spec). Pin that identity
+// on the CPU mirror for every divisor the shader uses.
+static void testFloorDivShiftIdentity() {
+	bool ok = true;
+	for (int shift = 1; shift <= 5; ++shift) {  // divisors 2, 4, 8, 16, 32
+		const int b = 1 << shift;
+		for (int a = -70000; a <= 70000; ++a) {
+			if ((a >> shift) != bFloorDiv(a, b)) {
+				ok = false;
+				break;
+			}
+		}
+	}
+	check(ok, "floordiv: pow2 arithmetic shift == floor division");
+}
+
 struct TraceStats {
 	int columns = 0;         // per-column iterations actually run
 	int blockSkips = 0;      // whole-block skips taken
@@ -2329,6 +2348,7 @@ int main() {
 	testWorldEnsureChunk();
 	testChunkMatchesGenerator();
 	testChunkHeightMap();
+	testFloorDivShiftIdentity();
 	testTraversalParity();
 	testFarField();
 	testFarPatchRegion();

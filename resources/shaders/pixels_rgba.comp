@@ -113,6 +113,7 @@ layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
 // half), blockX + blockZ * blocksPerChunkX layout. Built by
 // Chunk::blockHeightMapWords and uploaded with each chunk.
 const int kBlockVoxels = 8;  // sync with vv::voxel::kHeightBlockVoxels
+const int kBlockShift = 3;  // log2(kBlockVoxels), same sync contract
 layout(set = 0, binding = 11) readonly buffer BlockHeights {
     uint data[];
 } blockHeights;
@@ -174,8 +175,19 @@ vec3 termColor(int cause)
 }
 
 // Division rounding towards negative infinity (GLSL '/' truncates).
+// Power-of-two fast path: every divisor here is a power of two (chunk
+// sizes 32, block size 8), and an arithmetic right shift by log2(b) IS
+// floor division for two's-complement integers (SPIR-V
+// OpShiftRightArithmetic is sign-extending by spec) - one instruction
+// instead of the two emulated integer divisions ('/' plus '%') that
+// made floorDiv's first two lines the #1 and #2 shader hotspots in
+// Nsight (14% + 12% of the frame). Pinned on the CPU side by the
+// floorDiv-shift identity test.
 int floorDiv(int a, int b)
 {
+    if ((b & (b - 1)) == 0) {
+        return a >> findLSB(b);
+    }
     int q = a / b;
     if ((a % b != 0) && ((a < 0) != (b < 0))) {
         --q;
@@ -217,38 +229,35 @@ uint fetchVoxel(uint slot, uint idx)
     return (word >> ((idx & 3u) * 8u)) & 0xFFu;
 }
 
-// Height bound of the column containing (voxX, voxZ): highest solid voxel
-// Y + 1 (0 = all air), or kNoHeightData when the column is not loaded.
-uint columnHeightBound(int voxX, int voxZ)
+// Height bound for an ALREADY-RESOLVED column (see resolveColumn):
+// highest solid voxel Y + 1 (0 = all air). The marches resolve a column
+// once and feed the slot/local pair to this, the block bound and the
+// Y-walk fetches (pass 32: resolveColumn used to run 2-3x per column -
+// each with two integer divisions inside floorDiv).
+uint columnHeightAt(uint slot, ivec2 local)
 {
-    uint slot = 0u;
-    ivec2 local = ivec2(0);
-    if (!resolveColumn(voxX, voxZ, slot, local)) {
-        return kNoHeightData;
-    }
     const uint heightStride =
-        (pc.chunkSize.x * pc.chunkSize.z + 1u) / 2u;
+        (pc.chunkSize.x * pc.chunkSize.z + 1u) >> 1u;
     const uint col = uint(local.x) + uint(local.y) * pc.chunkSize.x;
     const uint word = heights.data[slot * heightStride + (col >> 1u)];
     return ((col & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
 }
 
 // Max height bound over the kBlockVoxels^2 block of columns containing
-// (voxX, voxZ) (pass 30): the max column bound in the block (so a ray
-// staying at/above it provably clears EVERY column of the block), or
-// kNoHeightData when the block's chunk is not loaded.
-uint blockHeightBound(int voxX, int voxZ)
+// the ALREADY-RESOLVED column (local.x, local.y) (pass 30 + 32): the
+// max column bound in the block, so a ray staying at/above it provably
+// clears EVERY column of the block. The block grid rounds UP per axis
+// like the CPU builder (Chunk::blockHeightWordStride); shifts replace
+// the divisions (local is always in [0, size)).
+uint blockHeightAt(uint slot, ivec2 local)
 {
-    uint slot = 0u;
-    ivec2 local = ivec2(0);
-    if (!resolveColumn(voxX, voxZ, slot, local)) {
-        return kNoHeightData;
-    }
-    const int blocksX = int(pc.chunkSize.x) / kBlockVoxels;
-    const int blocksZ = int(pc.chunkSize.z) / kBlockVoxels;
-    const uint blockStride = (uint(blocksX * blocksZ) + 1u) / 2u;
-    const uint blk = uint(local.x / kBlockVoxels) +
-                     uint(local.y / kBlockVoxels) * uint(blocksX);
+    const int blocksX =
+        (int(pc.chunkSize.x) + kBlockVoxels - 1) >> kBlockShift;
+    const int blocksZ =
+        (int(pc.chunkSize.z) + kBlockVoxels - 1) >> kBlockShift;
+    const uint blockStride = (uint(blocksX * blocksZ) + 1u) >> 1u;
+    const uint blk = (uint(local.x) >> kBlockShift) +
+                     (uint(local.y) >> kBlockShift) * uint(blocksX);
     const uint word = blockHeights.data[slot * blockStride + (blk >> 1u)];
     return ((blk & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
 }
@@ -459,7 +468,7 @@ bool sunRayEscapes(vec3 origin, vec3 sunV)
         if (resolveColumn(col.x, col.y, slot, local)) {
             // Near region: the height bound says whether a blocker can
             // exist in this column at all.
-            const uint bound = columnHeightBound(col.x, col.y);
+            const uint bound = columnHeightAt(slot, local);
             if (bound != kNoHeightData && float(bound) > y0) {
                 // Walk only the cells the segment occupies below the bound
                 // (ascending: from the entry cell up).
@@ -800,6 +809,15 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             break;
         }
 
+        // Resolve the column ONCE (pass 32): the block bound, the height
+        // bound and the Y-walk fetches below all reuse this slot/local
+        // pair. Before, columnHeightBound and the walk each resolved it
+        // again (2-3 resolveColumn calls = 4-6 integer divisions per
+        // column, the Nsight #1/#2 hotspots).
+        uint slot = 0u;
+        ivec2 local = ivec2(0);
+        const bool haveSlot = resolveColumn(cell.x, cell.z, slot, local);
+
         // --- Hierarchical block skip (pass 30) ---------------------
         // On entering a new kBlockVoxels^2 block, ONE fetch of the
         // block's max height decides whether the ray provably stays
@@ -826,7 +844,8 @@ vec3 traceRay(vec2 uv, bool debugTerm)
                     float((bz + ((stepZ > 0) ? 1 : 0)) * kBlockVoxels);
                 tBlockExit = min(tBlockExit, (edgeZ - start.z) / rd.z);
             }
-            const uint blockMax = blockHeightBound(cell.x, cell.z);
+            const uint blockMax =
+                haveSlot ? blockHeightAt(slot, local) : kNoHeightData;
             const float yBExit = start.y + rd.y * tBlockExit;
             curBlockSkippable =
                 (blockMax != kNoHeightData) &&
@@ -864,17 +883,16 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             continue;
         }
 
-        const uint bound = columnHeightBound(cell.x, cell.z);
+        const uint bound =
+            haveSlot ? columnHeightAt(slot, local) : kNoHeightData;
         const bool skip = (bound != kNoHeightData) && (yMin >= float(bound));
 
-        if (!skip) {
-            uint slot = 0u;
-            ivec2 local = ivec2(0);
-            const bool haveSlot = resolveColumn(cell.x, cell.z, slot, local);
-            const uint colBase = haveSlot
-                ? uint(local.x) + uint(local.y) *
-                      (pc.chunkSize.x * pc.chunkSize.y)
-                : 0u;
+        // An unresolved column (outside the region / empty slot) is all
+        // air: voxelTypeAt returned 0 for every cell of the old walk, so
+        // skipping the walk outright is identical - and free.
+        if (!skip && haveSlot) {
+            const uint colBase = uint(local.x) + uint(local.y) *
+                                (pc.chunkSize.x * pc.chunkSize.y);
 
             // First cell to check: the segment's entry cell, clamped down to
             // the height bound / world top (cells above are provably air).
@@ -888,9 +906,8 @@ vec3 traceRay(vec2 uv, bool debugTerm)
                 // Descending: cells in t order from yFirst down to the
                 // lowest cell the segment reaches (clamped into the world).
                 for (int y = yFirst; y >= max(yLast, 0); --y) {
-                    const uint type = haveSlot
-                        ? fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x)
-                        : voxelTypeAt(ivec3(cell.x, y, cell.z));
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
                     if (type != 0u) {
                         hit = true;
                         hitType = type;
@@ -921,9 +938,8 @@ vec3 traceRay(vec2 uv, bool debugTerm)
                     if (bound != kNoHeightData && y >= int(bound)) {
                         break;
                     }
-                    const uint type = haveSlot
-                        ? fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x)
-                        : voxelTypeAt(ivec3(cell.x, y, cell.z));
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
                     if (type != 0u) {
                         hit = true;
                         hitType = type;
