@@ -1309,6 +1309,14 @@ float VulkanRenderer::fogCutDistance() const {
   const float chunkWorldZ =
       static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
 
+  // During an asynchronous region move, m_regionCenter intentionally stays
+  // on the old complete region. The active table, however, may already have
+  // been published for the target region. Use the table's actual origin for
+  // the fog box so its cut follows the visible terrain immediately instead
+  // of waiting for the whole stream to finish.
+  const std::int32_t visibleCenterX = m_tableOriginX;
+  const std::int32_t visibleCenterZ = m_tableOriginZ;
+
   float x0, x1, z0, z1;
   if (m_farFieldActive) {
     x0 = static_cast<float>(m_farOriginVoxX) * cfg.voxelSize.x;
@@ -1319,9 +1327,9 @@ float VulkanRenderer::fogCutDistance() const {
                   cfg.voxelSize.z;
   } else {
     const int32_t originX =
-        m_regionCenter.x - static_cast<int32_t>(cfg.renderRadiusChunks);
+        visibleCenterX - static_cast<int32_t>(cfg.renderRadiusChunks);
     const int32_t originZ =
-        m_regionCenter.z - static_cast<int32_t>(cfg.renderRadiusChunks);
+        visibleCenterZ - static_cast<int32_t>(cfg.renderRadiusChunks);
     x0 = static_cast<float>(originX) * chunkWorldX;
     x1 = x0 + static_cast<float>(cfg.gridWidth()) * chunkWorldX;
     z0 = static_cast<float>(originZ) * chunkWorldZ;
@@ -2078,6 +2086,8 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     return false;
   }
   m_tableHalf = nextTableHalf;
+  m_tableOriginX = centerChunkX;
+  m_tableOriginZ = centerChunkZ;
 
   // Diagnostic (rare missing-chunk hunt): log empty cells in the table
   // that was just published.

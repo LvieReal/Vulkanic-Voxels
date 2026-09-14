@@ -577,16 +577,19 @@ float shadowOpacity(uint type)
 // Approximate signed distance used by the optional shadow experiment. Near
 // terrain uses the exact voxel occupancy when a sample is inside a column;
 // above a column it uses the uploaded top bound to jump over clear air. The
-// step is always clipped to the next cell boundary, so overhangs and future
-// foliage are still visited through voxelTypeAt instead of being projected
-// from a surface normal. Far cells use the coarse height field conservatively.
+// returned distance is kept separate from `stepLimit`: the former drives the
+// smooth penumbra estimate, while the latter prevents a height-bound jump from
+// skipping a neighboring overhang. Far cells use the coarse height field
+// conservatively.
 // `occupiedType` is non-zero when the sample is in known solid material;
 // `known` is false outside all resident data, which has the same meaning as
 // the exact marcher: no loaded blocker remains to test.
-float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known)
+float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known,
+                        out float stepLimit)
 {
     occupiedType = 0u;
     known = true;
+    stepLimit = 1e30;
 
     if (p.y < 0.0 || p.y >= float(pc.chunkSize.y)) {
         return 1e30;
@@ -608,7 +611,8 @@ float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known)
                                 p.y >= float(bound))
             ? p.y - float(bound)
             : 0.25;  // air inside a folded/overhung column: inspect occupancy
-        return min(max(vertical, 0.05), nextShadowCellDistance(p, d));
+        stepLimit = nextShadowCellDistance(p, d);
+        return max(vertical, 0.05);
     }
 
     if (pc.far.z > 0) {
@@ -633,17 +637,20 @@ float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known)
                 tz = max((edge.y - p.z) / d.z, 1e-4);
             }
             const float farExit = min(tx, tz);
+            stepLimit = farExit;
             if (height > 0.0 && p.y < height) {
                 occupiedType = (packed >> 16u) & 0xFFu;
                 return 0.0;
             }
             if (height > 0.0) {
-                return min(max(p.y - height, 0.05), farExit);
+                return max(p.y - height, 0.05);
             }
             // Empty coarse cells are skipped as cells, not as individual
             // voxels; otherwise the experiment would spend its budget on
-            // air before reaching the next populated far cell.
-            return farExit;
+            // air before reaching the next populated far cell. There is no
+            // surface-distance penalty for an empty cell, so keep this large
+            // enough that it remains fully lit in the penumbra estimate.
+            return 1e30;
         }
     }
 
@@ -675,8 +682,9 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 
         uint occupiedType = 0u;
         bool known = false;
+        float stepLimit = 1e30;
         const float sdfDistance =
-            shadowSdfDistance(p, sunV, occupiedType, known);
+            shadowSdfDistance(p, sunV, occupiedType, known, stepLimit);
         if (!known) {
             return visibility;
         }
@@ -689,10 +697,14 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
             // its next boundary and keep reading occupancy beyond it.
             s += max(nextShadowCellDistance(p, sunV) + 1e-3, 0.02);
         } else {
-            // Stay conservative near the implicit surface. Clipping to cell
-            // boundaries in shadowSdfDistance prevents a height-bound jump
-            // from tunnelling into a neighboring column's overhang.
-            s += max(min(sdfDistance * 0.85, 32.0), 0.02);
+            // Ratio-based SDF soft shadows: clear space close to a blocker
+            // gets a fractional visibility instead of a binary boundary.
+            // `stepLimit` still clips traversal to the current cell/coarse
+            // cell, but does not flatten the distance used for the penumbra.
+            const float penumbra = clamp(
+                8.0 * sdfDistance / max(s, 0.01), 0.0, 1.0);
+            visibility = min(visibility, penumbra);
+            s += max(min(sdfDistance * 0.85, stepLimit), 0.02);
         }
     }
     // A bounded experiment should fail open, matching the exact marcher when
