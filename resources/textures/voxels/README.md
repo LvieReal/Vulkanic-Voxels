@@ -54,9 +54,10 @@ Notes:
   texture's average color (which keeps the far LOD consistent - pick
   textures whose average roughly matches the palette colors in
   `src/voxel/VoxelTypes.hpp` for a seamless near/far look).
-- UVs are world-space on each face: +U follows +X (or +Z on X faces),
-  +V follows +Z (or +Y on X/Z faces). If a side texture appears flipped
-  for your art, mirror the file.
+- UVs are world-space on each face: +U follows +X (or +Z on X faces);
+  +V follows +Z on top/bottom faces and −Y on side faces (image top row
+  at the voxel top - textures display UPRIGHT on sides). If a texture
+  runs the wrong way horizontally for your art, mirror the file.
 - Textures are the face ALBEDO (they replace the palette color for
   textured faces).
 - Where the game looks for them: `resources/textures/voxels` next to

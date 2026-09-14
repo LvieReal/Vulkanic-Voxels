@@ -95,6 +95,17 @@ go too): file-based voxel textures + pass-22 aliases intact, sun
 shadows back to the single exact binary march, no light grid, no cone
 machinery. Owner-verified base: 3ff725f.
 
+Pass 29 (textures): SIDE-FACE V AXIS FLIPPED - textures displayed
+upside down on every side face. Root cause: the shader built side-face
+UVs as (z,y)/(x,y), i.e. V = world +Y, but in this pipeline Vulkan's
+V=0 is the image's TOP row (QImage rows upload in order), so the image
+top landed at the voxel BOTTOM. Fix: V = -Y on side faces (REPEAT
+sampler; fract(-y) = 1 - fract(y) keeps tiling continuous). Top/bottom
+faces keep V = +Z (rotation, not flip - art-dependent). README UV
+paragraph updated ("textures display UPRIGHT on sides; mirror the file
+only for horizontal direction"). Validated: both builds warning-free
+(shader recompiled), ctest green, smoke ok.
+
 Pass 28 (textures): PARTIAL TEXTURE SETS NOW WORK PER FACE. Owner
 report: grass_top.png + grass_side.png + "grass bottom = dirt" in
 aliases.txt still rendered grass as plain colors. Root cause: a mode

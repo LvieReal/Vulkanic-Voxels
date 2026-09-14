@@ -536,9 +536,17 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
     } else {
         // World-space UV on the hit face: the two axes tangent to it.
         // REPEAT addressing tiles the texture per voxel (1 uv unit).
+        // SIDE faces negate V: Vulkan's V=0 is the image's TOP row
+        // (rows upload in order), so V = +y put the image top at the
+        // voxel BOTTOM - every side texture displayed upside down
+        // (pass 29). V = -y flips it: fract(-y) = 1 - fract(y) keeps
+        // the tiling continuous across voxels. Top/bottom faces keep
+        // V = +z (a rotation, not a flip - art-dependent).
         const vec2 uv = abs(sNormal.y) > 0.5
             ? hitPos.xz
-            : (abs(sNormal.x) > 0.5 ? hitPos.zy : hitPos.xy);
+            : (abs(sNormal.x) > 0.5
+                   ? vec2(hitPos.z, -hitPos.y)
+                   : vec2(hitPos.x, -hitPos.y));
         // Explicit LOD from the texel footprint: texels per pixel =
         // texRes * worldUnitsPerPixel, worldUnitsPerPixel at distance d
         // = d * 2 * tanHalfFov / screenHeight. Clamped to the mip chain.
