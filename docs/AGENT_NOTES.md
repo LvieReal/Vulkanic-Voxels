@@ -159,3 +159,20 @@ image is bit-identical. CPU mirror traceHier + 3-way parity
 world 0 84,033 -> 36,259 (-57%), world 1 69,924 -> 33,668 (-52%).
 Block-map packing unit tests added (single-block chunk, 9x9 round-up,
 generated 32x32 chunks vs ground truth).
+
+Pass 31 (owner-requested, for Nsight profiling): SPIR-V DEBUG INFO IN
+DEBUG BUILDS ONLY. cmake/Shaders.cmake now passes glslangValidator -g in
+Debug (embeds the GLSL source + line tables: 753 OpLine, full source
+text, 143 KB vs 79 KB) and -g0 (glslang's default = strip) in every
+other config - the flag list is never empty because an empty
+generator-expression argument leaks as a literal "" file argument under
+Ninja/VERBATIM and fails the compile. -g0 is a true no-op: release
+SPIR-V is byte-identical to a flag-less compile (verified by hash).
+Debug spv loads fine on a real driver (offscreen smoke). To profile:
+configure a Debug build dir and run it under Nsight Graphics (Shader
+Profiler activity) - the exe picks up the debug spv from its own
+resources/shaders. scripts/spirv_dbg.py inspects a spv for debug
+opcodes. Note for the optimization hunt: finishRegionMove() still never
+clears m_streamActive (the pass-13 bug, lost in the reverts), so the
+pump re-runs the full region-table publish every frame AT REST - a
+likely CPU-side constant cost; fix parked in 20ca086 as the next pass.
