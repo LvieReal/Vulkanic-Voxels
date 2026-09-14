@@ -539,212 +539,205 @@ bool sunRayEscapes(vec3 origin, vec3 sunV)
     return true;
 }
 
-// Distance to the next voxel boundary along a ray. The small floor keeps
-// sphere tracing moving when a sample lands exactly on a boundary after
-// floating-point rounding.
-float nextShadowCellDistance(vec3 p, vec3 d)
-{
-    float tx = 1e30;
-    float ty = 1e30;
-    float tz = 1e30;
-    if (abs(d.x) > 1e-6) {
-        const float edgeX = (d.x > 0.0) ? ceil(p.x) : floor(p.x);
-        tx = max((edgeX - p.x) / d.x, 1e-4);
-    }
-    if (abs(d.y) > 1e-6) {
-        const float edgeY = (d.y > 0.0) ? ceil(p.y) : floor(p.y);
-        ty = max((edgeY - p.y) / d.y, 1e-4);
-    }
-    if (abs(d.z) > 1e-6) {
-        const float edgeZ = (d.z > 0.0) ? ceil(p.z) : floor(p.z);
-        tz = max((edgeZ - p.z) / d.z, 1e-4);
-    }
-    return min(min(tx, ty), tz);
-}
-
 // Material hook for the SDF shadow experiment. Current voxel materials are
 // opaque. A future leaf/grass-foliage material should return a fractional
-// opacity here: the marcher will read its occupancy, attenuate the ray, and
-// continue through the cell instead of treating foliage as a hard decal.
-// Keeping that policy here avoids coupling shadow projection to the primary
-// surface hit and makes foliage a data/material change rather than a new
-// traversal.
+// opacity here: the marcher reads its occupancy, attenuates the ray, and
+// keeps reading occupancy beyond the column instead of treating foliage as
+// a hard decal. Keeping that policy here avoids coupling shadow projection
+// to the primary surface hit and makes foliage a data/material change
+// rather than a new traversal.
 float shadowOpacity(uint type)
 {
     return type == 0u ? 0.0 : 1.0;
 }
 
-// Approximate signed distance used by the optional shadow experiment. Near
-// terrain uses the exact voxel occupancy when a sample is inside a column;
-// above a column it uses the uploaded top bound to jump over clear air. The
-// returned distance is kept separate from `stepLimit`: the former drives the
-// smooth penumbra estimate, while the latter prevents a height-bound jump from
-// skipping a neighboring overhang. Far cells use the coarse height field
-// conservatively.
-// `occupiedType` is non-zero when the sample is in known solid material;
-// `known` is false outside all resident data, which has the same meaning as
-// the exact marcher: no loaded blocker remains to test.
-float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known,
-                        out float stepLimit)
+// SDF soft-shadow sharpness: the inverse of the sun's angular size. 8 ~= a
+// 7-degree light, whose penumbra spans a few voxels (a soft "game sun");
+// raise it for harder shadows (32 ~= 2 degrees), lower it for softer.
+const float kShadowSharpness = 8.0;
+
+// One penumbra sample of the SDF soft shadow (technique:
+// iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t,
+// improved with Aaltonen's two-sphere triangulation - the closest surface
+// point is estimated from the current distance h and the PREVIOUS sample's
+// distance `prev` (1e20 = no previous sample), which removes the
+// marching-step light leak of the plain estimate. h is the distance from
+// the sample to the closest relevant surface (a column's top plane - the
+// shadow ray is always ascending), t the distance marched so far. Returns
+// the visibility factor to fold into the min (1.0 = no darkening).
+// The triangle degenerates when the distance is GROWING: the estimated
+// closest point then lands behind the previous sample (y >= t) or the two
+// spheres do not meet in front of the ray (h*h <= y*y). The canonical
+// formulation yields NaN there and min() no-ops on it; we skip the update
+// explicitly instead of relying on that quirk. (The old clamp-to-zero made
+// the same degenerate case pin visibility to black - the shadow edge is
+// exactly where the distance grows, so that killed the penumbra.)
+float shadowPenumbra(float h, float prev, float t)
 {
-    occupiedType = 0u;
-    known = true;
-    stepLimit = 1e30;
-
-    if (p.y < 0.0 || p.y >= float(pc.chunkSize.y)) {
-        return 1e30;
+    if (prev >= 1e19) {
+        return clamp(kShadowSharpness * h / max(t, 1e-4), 0.0, 1.0);
     }
-
-    const ivec3 cell = ivec3(floor(p));
-    uint slot = 0u;
-    ivec2 local = ivec2(0);
-    if (resolveColumn(cell.x, cell.z, slot, local)) {
-        const uint idx = uint(local.x) + uint(cell.y) * pc.chunkSize.x +
-                         uint(local.y) * (pc.chunkSize.x * pc.chunkSize.y);
-        occupiedType = fetchVoxel(slot, idx);
-        if (occupiedType != 0u) {
-            return 0.0;
-        }
-
-        const uint bound = columnHeightAt(slot, local);
-        const float vertical = (bound != kNoHeightData &&
-                                p.y >= float(bound))
-            ? p.y - float(bound)
-            : 0.25;  // air inside a folded/overhung column: inspect occupancy
-        stepLimit = nextShadowCellDistance(p, d);
-        return max(vertical, 0.05);
+    const float y = h * h / (2.0 * prev);
+    if (y >= t || h * h <= y * y) {
+        return 1.0;
     }
-
-    if (pc.far.z > 0) {
-        const float cellSize = pc.farParams.x;
-        const ivec2 farDim = pc.far.zw;
-        const vec2 farOrigin = vec2(pc.far.xy);
-        const ivec2 fc = ivec2(floor((p.xz - farOrigin) / cellSize));
-        if (all(greaterThanEqual(fc, ivec2(0))) &&
-            all(lessThan(fc, farDim))) {
-            const uint packed = farLod.cells[farBase() + uint(fc.x) +
-                                               uint(fc.y) * uint(farDim.x)];
-            const float height = float(packed & 0xFFFFu);
-            const vec2 edge = vec2(
-                farOrigin.x + float(fc.x + ((d.x > 0.0) ? 1 : 0)) * cellSize,
-                farOrigin.y + float(fc.y + ((d.z > 0.0) ? 1 : 0)) * cellSize);
-            float tx = 1e30;
-            float tz = 1e30;
-            if (abs(d.x) > 1e-6) {
-                tx = max((edge.x - p.x) / d.x, 1e-4);
-            }
-            if (abs(d.z) > 1e-6) {
-                tz = max((edge.y - p.z) / d.z, 1e-4);
-            }
-            const float farExit = min(tx, tz);
-            stepLimit = farExit;
-            if (height > 0.0 && p.y < height) {
-                occupiedType = (packed >> 16u) & 0xFFu;
-                return 0.0;
-            }
-            if (height > 0.0) {
-                return max(p.y - height, 0.05);
-            }
-            // Empty coarse cells are skipped as cells, not as individual
-            // voxels; otherwise the experiment would spend its budget on
-            // air before reaching the next populated far cell. There is no
-            // surface-distance penalty for an empty cell, so keep this large
-            // enough that it remains fully lit in the penumbra estimate.
-            return 1e30;
-        }
-    }
-
-    known = false;
-    return 1e30;
+    const float d = sqrt(h * h - y * y);
+    return clamp(kShadowSharpness * d / max(t - y, 1e-4), 0.0, 1.0);
 }
 
-// Sphere-traced/occupancy-aware shadow ray. This is intentionally an
-// experiment selected by VV_SDF_SHADOWS=1; the exact binary column march
-// remains the default reference. It returns fractional visibility so foliage
-// can be marched through later without changing the primary hit/decal path.
+// SDF soft shadow ray (VV_SDF_SHADOWS=1). The TRAVERSAL is the exact
+// march's ascending column DDA + height-bound cell walk + coarse far cells -
+// the same occlusion events as sunRayEscapes, so nothing the binary march
+// shadows can leak, and the 256-column budget matches it (the old
+// sphere-traced variant stepped by the "SDF" value, crawled at ~0.04
+// voxels/step near surfaces, and burned its 128-step budget within ~50
+// voxels). Softness comes from shadowPenumbra, sampled at every column the
+// ray clears, from the distance to that column's top plane. Returns
+// fractional visibility (1.0 = fully lit, 0.0 = fully shadowed).
 float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 {
     if (sunV.y <= 0.05) {
-        return 1.0;
+        return 1.0;  // low/sunset sun: no cheap ascend bound, skip
     }
-
+    const float EPS = 1e-6;
     const float maxTerr = float(pc.grid.w) + 1.0;
-    float visibility = 1.0;
-    float s = 0.0;
-    // Quilez/Aaltonen's triangulation uses the previous distance as well as
-    // the current one. Keeping this invalid across an empty coarse-cell jump
-    // avoids connecting unrelated samples when the marcher skips a region.
-    float previousDistance = 1e20;
-    for (int i = 0; i < 128; ++i) {
-        const vec3 p = origin + sunV * s;
-        if (p.y >= maxTerr || p.y >= float(pc.chunkSize.y)) {
-            return visibility;
-        }
-        if (p.y < 0.0) {
+    int sStepX = (sunV.x > 0.0) ? 1 : -1;
+    int sStepZ = (sunV.z > 0.0) ? 1 : -1;
+    float sMaxX = 1e30;
+    float sMaxZ = 1e30;
+    float sDeltaX = 1e30;
+    float sDeltaZ = 1e30;
+    ivec2 col = ivec2(floor(origin.xz));
+    if (abs(sunV.x) > EPS) {
+        const float nextX = float(col.x + ((sStepX > 0) ? 1 : 0));
+        sMaxX = (nextX - origin.x) / sunV.x;
+        sDeltaX = abs(1.0 / sunV.x);
+    } else {
+        sStepX = 0;
+    }
+    if (abs(sunV.z) > EPS) {
+        const float nextZ = float(col.y + ((sStepZ > 0) ? 1 : 0));
+        sMaxZ = (nextZ - origin.z) / sunV.z;
+        sDeltaZ = abs(1.0 / sunV.z);
+    } else {
+        sStepZ = 0;
+    }
+
+    float visibility = 1.0;  // min over the march's penumbra samples
+    float previous = 1e20;   // distance at the last estimate sample (none)
+    float t = 0.0;           // distance marched (voxel units)
+
+    for (int i = 0; i < 256; ++i) {
+        const float sExit = min(sMaxX, sMaxZ);
+        const float y0 = origin.y + sunV.y * t;
+
+        // Above all possible terrain: lit from here on. Keep the
+        // accumulated penumbra - a distant graze already darkened it.
+        if (y0 >= maxTerr) {
             return visibility;
         }
 
-        uint occupiedType = 0u;
-        bool known = false;
-        float stepLimit = 1e30;
-        const float sdfDistance =
-            shadowSdfDistance(p, sunV, occupiedType, known, stepLimit);
-        if (!known) {
-            return visibility;
-        }
-        if (occupiedType != 0u) {
-            visibility *= 1.0 - shadowOpacity(occupiedType);
-            if (visibility <= 0.01) {
-                return 0.0;
-            }
-            // A fractional-opacity foliage cell is not a blocker: move to
-            // its next boundary and keep reading occupancy beyond it.
-            previousDistance = 1e20;
-            s += max(nextShadowCellDistance(p, sunV) + 1e-3, 0.02);
-        } else {
-            // Quilez's improved soft-shadow estimate triangulates between the
-            // previous and current SDF spheres. Sampling only the current
-            // sphere lets missed near-grazes show up as marching-step-shaped
-            // light leaks, which is the wireframe artifact this experiment is
-            // intended to avoid. The old k=8 behavior is retained by writing
-            // the improved estimate as k * d / (t - y).
-            float penumbra = 1.0;
-            const bool hasDistance = sdfDistance < 1e20;
-            if (hasDistance) {
-                if (previousDistance < 1e20) {
-                    const float y = sdfDistance * sdfDistance /
-                                    (2.0 * max(previousDistance, 0.05));
-                    const float d2 = max(
-                        sdfDistance * sdfDistance - y * y, 0.0);
-                    penumbra = 8.0 * sqrt(d2) /
-                               max(s - y, 0.01);
-                } else {
-                    // First valid sample after a skipped region: use the
-                    // original estimate until a pair of adjacent samples is
-                    // available for triangulation.
-                    penumbra = 8.0 * sdfDistance / max(s, 0.01);
-                }
-                previousDistance = sdfDistance;
+        uint slot = 0u;
+        ivec2 local = ivec2(0);
+        if (resolveColumn(col.x, col.y, slot, local)) {
+            const uint bound = columnHeightAt(slot, local);
+            if (bound == kNoHeightData) {
+                // No height data: air, exactly like the exact march.
+            } else if (y0 >= float(bound)) {
+                // Clear of the column: its top plane at `bound` is the
+                // closest relevant surface (the ray is ascending).
+                const float h = y0 - float(bound);
+                visibility = min(visibility,
+                                  shadowPenumbra(h, previous, t));
+                previous = h;
             } else {
-                // Do not triangulate across a coarse-cell skip: its distance
-                // is a traversal sentinel, not a sampled surface distance.
-                previousDistance = 1e20;
+                // The segment dips below the column's top: the exact cell
+                // walk decides (identical walk to sunRayEscapes).
+                const float y1 = origin.y + sunV.y * sExit;
+                const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
+                                     int(pc.chunkSize.y) - 1);
+                const uint colBase = uint(local.x) +
+                                     uint(local.y) *
+                                         (pc.chunkSize.x * pc.chunkSize.y);
+                uint solidType = 0u;
+                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
+                    if (type != 0u) {
+                        solidType = type;
+                        break;
+                    }
+                }
+                if (solidType != 0u) {
+                    const float opacity = shadowOpacity(solidType);
+                    if (opacity >= 0.999) {
+                        // Opaque: the penumbra up to the surface is already
+                        // accumulated in `visibility`; the surface itself
+                        // blocks the rest of the sun.
+                        return 0.0;
+                    }
+                    // Fractional-opacity foliage: attenuate and keep
+                    // reading occupancy beyond it.
+                    visibility *= 1.0 - opacity;
+                    if (visibility <= 0.01) {
+                        return 0.0;
+                    }
+                    previous = 1e20;  // the triangulation is interrupted
+                }
+                // Air all the way (an overhanging shaft): the topmost solid
+                // sits above the segment and the ray ascends away from it -
+                // no relevant surface here. The previous distance is stale
+                // across this gap, so break the triangulation.
+                previous = 1e20;
             }
-            visibility = min(visibility, clamp(penumbra, 0.0, 1.0));
-            s += max(min(sdfDistance * 0.85, stepLimit), 0.02);
+        } else if (pc.far.z > 0) {
+            // Beyond the near region: coarse far cells, conservative in the
+            // blocker's favor exactly like the exact march (fog hides the
+            // coarseness).
+            const float farCell = pc.farParams.x;
+            const ivec2 farDim = pc.far.zw;
+            const vec2 farOrigin = vec2(pc.far.xy);
+            const ivec2 fc = ivec2(floor((vec2(col) + vec2(0.5) -
+                                          farOrigin) / farCell));
+            if (all(greaterThanEqual(fc, ivec2(0))) &&
+                all(lessThan(fc, farDim))) {
+                const uint packed =
+                    farLod.cells[farBase() + uint(fc.x) +
+                                 uint(fc.y) * uint(farDim.x)];
+                const float h = float(packed & 0xFFFFu);
+                if (h > 0.0) {
+                    if (y0 < h) {
+                        return 0.0;  // the exact march's far occlusion
+                    }
+                    visibility = min(
+                        visibility, shadowPenumbra(y0 - h, previous, t));
+                    previous = y0 - h;
+                }
+            }
         }
+        // No data and no far field: air, like the exact march.
+
+        // Advance to the next column: branchless 2D DDA step (identical to
+        // the exact march, same tie rule).
+        t = sExit;
+        const bool takeX = sMaxX < sMaxZ;
+        sMaxX += takeX ? sDeltaX : 0.0;
+        sMaxZ += takeX ? 0.0 : sDeltaZ;
+        col.x += takeX ? sStepX : 0;
+        col.y += takeX ? 0 : sStepZ;
     }
-    // A bounded experiment should fail open, matching the exact marcher when
-    // it leaves the resident region without finding a known blocker.
+    // Budget exhausted without a known blocker: fail open with the
+    // accumulated penumbra (the exact march fails open with full light).
     return visibility;
 }
 
-// Sun visibility at a hit position (voxel space): ONE exact binary
-// shadow ray - ascending column DDA + height-bound voxel walk, coarse
-// far cells beyond the near region (pass 25: the cone/heightmap soft
-// machinery of passes 21-24 is removed; soft shadows will return as a
-// CPU-built light grid). Far-LOD hits shadow through the same march:
-// from beyond the region it self-selects the cheap far-cell path.
+// Sun visibility at a hit position (voxel space): one ascending shadow ray
+// - column DDA + height-bound voxel walk, coarse far cells beyond the near
+// region. By default the exact binary march (1.0 lit / 0.0 shadowed);
+// scene.misc.w (VV_SDF_SHADOWS=1) selects sunRayEscapesSdf instead - the
+// SAME traversal with Quilez/Aaltonen penumbra estimates, returning
+// fractional visibility. Far-LOD hits shadow through the same march: from
+// beyond the region it self-selects the cheap far-cell path.
 float sunShadow(vec3 hitPosVox, vec3 n)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);

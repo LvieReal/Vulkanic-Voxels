@@ -64,10 +64,13 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
 - VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - VV_FAR_LOD=1: opt into the coarse terrain LOD field (OFF by default).
-- VV_SDF_SHADOWS=1: occupancy-aware signed-distance shadow experiment;
-  exact binary shadows remain the default reference. The SDF marcher keeps
-  occupancy/material policy separate so future foliage can attenuate and be
-  marched through instead of requiring precise decal projection.
+- VV_SDF_SHADOWS=1: SDF soft-shadow experiment (pass 33: the exact
+  march's traversal + Quilez/Aaltonen penumbra estimates -
+  iquilezles.org/articles/rmshadows/; kShadowSharpness in the shader
+  tunes softness). Exact binary shadows remain the default reference.
+  The SDF marcher keeps occupancy/material policy in shadowOpacity() so
+  future foliage can attenuate and be marched through instead of
+  requiring precise decal projection.
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation
@@ -206,3 +209,38 @@ stayed pinned to the last synchronous rebuild (stale fog-cut box with
 far-LOD off + far-seam patch scan off-center after streamed moves).
 Validated: CPU parity 3-way unchanged, both builds warning-free, ctest
 green x2, smoke x2.
+
+Pass 33 (owner-reported artifacts, the "sdf shadows" rewrite): SDF SOFT
+SHADOWS REWRITTEN ON THE EXACT TRAVERSAL. The previous sphere-traced
+attempt had two compounding bugs: (1) the Aaltonen triangulation's
+d2 = max(d^2 - y^2, 0) clamp - when the distance to the surface GROWS
+(the shadow edge, exactly where the penumbra lives) y > d, d2 clamps to
+0, penumbra = 0, and min() pins visibility to BLACK for the rest of the
+march (the canonical formulation gets NaN there and min() no-ops - the
+clamp turned the safe no-op into a permanent blackout, so every grazing
+pixel rendered darker than the binary shadow); (2) the march stepped by
+the "SDF" value (floored 0.05), crawling at ~0.04 voxels/step near
+surfaces, so the 128-step budget covered only ~50 voxels vs the exact
+march's 256 columns - shadows appeared/disappeared at an unexplained
+distance. Rewrite: sunRayEscapesSdf now runs the EXACT march's
+traversal (ascending column DDA + height-bound cell walk + coarse far
+cells, identical occlusion events and 256-column budget, so nothing the
+binary march shadows can leak) and takes softness from shadowPenumbra -
+Quilez's k*h/t improved with Aaltonen's two-sphere triangulation
+(iquilezles.org/articles/rmshadows/), sampled at every cleared column
+from the distance to its top plane; degenerate triangles (y >= t or
+h^2 <= y^2, i.e. growing distance) skip the update explicitly instead of
+clamping to zero. The fake per-sample distances (0.25 overhang air,
+0.05 floor, 1e30 sentinels) and nextShadowCellDistance are gone; the
+overhang-shaft case (walk finds no solid) advances without a sample -
+the topmost solid sits above the ascending ray, no relevant surface.
+kShadowSharpness = 8 (~7-degree light, few-voxel penumbra) is named and
+documented for tuning. shadowOpacity() keeps the foliage hook
+(attenuate + continue through the column). CPU mirror
+shadowPenumbraMirror/sunRayEscapesSdfMirror + testSunShadowSdfMarch:
+occlusion parity with the exact mirror (0 leaks over 3000 rays), [0,1]
+range, penumbra present but a minority, and the penumbra shape pinned
+against the known wall (hard shadow under the top, partial grazing, lit
+well clear, monotonic). Validated: CPU tests green (sdf shadow: 2191
+shadowed, 9 penumbral, 800 lit of 3000; wall gradient 1,1,0.40,0,0),
+both builds warning-free, ctest green x2, smoke x2.

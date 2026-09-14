@@ -2005,8 +2005,239 @@ void testSunShadowMarch() {
 	}
 	check(mismatches == 0, "shadow march: column DDA matches dense sampling");
 	check(lit > 400 && shadowed > 400,
-				"shadow march: both outcomes well exercised");
+			"shadow march: both outcomes well exercised");
 	std::printf("shadow march: %d lit / %d shadowed agree\n", lit, shadowed);
+}
+
+
+// ---------------------------------------------------------------------------
+// SDF soft shadow: CPU mirror of the shader's shadowPenumbra +
+// sunRayEscapesSdf (the VV_SDF_SHADOWS=1 path). Same traversal as the exact
+// march mirror, with the Quilez/Aaltonen penumbra estimate sampled at every
+// cleared column (iquilezles.org/articles/rmshadows/).
+// ---------------------------------------------------------------------------
+
+// Mirror of the shader's shadowPenumbra: plain Quilez k*h/t when there is no
+// previous sample, otherwise Aaltonen's two-sphere triangulation. The
+// triangle degenerates when the distance is growing (y >= t or h*h <= y*y);
+// the canonical formulation yields NaN there and min() no-ops, the mirror
+// skips the update explicitly (returns 1.0 = no darkening) instead.
+double shadowPenumbraMirror(double h, double prev, double t) {
+	const double k = 8.0;  // = the shader's kShadowSharpness
+	if (prev >= 1e19) {
+		return std::clamp(k * h / std::max(t, 1e-4), 0.0, 1.0);
+	}
+	const double y = h * h / (2.0 * prev);
+	if (y >= t || h * h <= y * y) {
+		return 1.0;
+	}
+	const double d = std::sqrt(h * h - y * y);
+	return std::clamp(k * d / std::max(t - y, 1e-4), 0.0, 1.0);
+}
+
+// Mirror of the shader's sunRayEscapesSdf: the exact march's ascending
+// column DDA + height-bound walk + coarse far cells (same occlusion
+// events), fractional visibility from per-column penumbra samples.
+double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
+		const double dir[3]) {
+	if (dir[1] <= 0.05) {
+		return 1.0;
+	}
+	const double EPS = 1e-6;
+	int stepX = (dir[0] > 0.0) ? 1 : -1;
+	int stepZ = (dir[2] > 0.0) ? 1 : -1;
+	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
+	int colX = int(std::floor(o[0]));
+	int colZ = int(std::floor(o[2]));
+	if (std::abs(dir[0]) > EPS) {
+		tMaxX = (double(colX + ((stepX > 0) ? 1 : 0)) - o[0]) / dir[0];
+		dX = std::abs(1.0 / dir[0]);
+	} else {
+		stepX = 0;
+	}
+	if (std::abs(dir[2]) > EPS) {
+		tMaxZ = (double(colZ + ((stepZ > 0) ? 1 : 0)) - o[2]) / dir[2];
+		dZ = std::abs(1.0 / dir[2]);
+	} else {
+		stepZ = 0;
+	}
+
+	double visibility = 1.0;
+	double previous = 1e20;  // distance at the last estimate sample (none)
+	double t = 0.0;
+	for (int i = 0; i < 256; ++i) {
+		const double sExit = std::min(tMaxX, tMaxZ);
+		const double y0 = o[1] + dir[1] * t;
+		if (y0 >= w.maxTerr) {
+			return visibility;
+		}
+		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
+				colZ < w.near.wz;
+		if (inNear) {
+			const unsigned bound = w.near.boundAt(colX, colZ);
+			if (bound != 0xFFFFu) {
+				if (y0 >= double(bound)) {
+					const double h = y0 - double(bound);
+					visibility = std::min(
+							visibility, shadowPenumbraMirror(h, previous, t));
+					previous = h;
+				} else {
+					const double y1 = o[1] + dir[1] * sExit;
+					const int yTop = std::min(
+							int(std::floor(std::min(y1, double(bound) - 1.0))),
+							w.near.wh - 1);
+					bool solid = false;
+					for (int y = std::max(int(std::floor(y0)), 0);
+							y <= yTop; ++y) {
+						if (w.near.at(colX, y, colZ) != 0) {
+							solid = true;
+							break;
+						}
+					}
+					if (solid) {
+						return 0.0;  // opaque world (all test types opaque)
+					}
+					// Air all the way (overhang shaft): the previous
+					// distance is stale across the gap - break the triangle.
+					previous = 1e20;
+				}
+			}
+		} else {
+			const int fcX = int(std::floor((double(colX) + 0.5 - w.farOrigin) /
+					w.farCell));
+			const int fcZ = int(std::floor((double(colZ) + 0.5 - w.farOrigin) /
+					w.farCell));
+			const unsigned packed = w.farAt(fcX, fcZ);
+			const double h = double(packed & 0xFFFFu);
+			if (h > 0.0) {
+				if (y0 < h) {
+					return 0.0;
+				}
+				visibility = std::min(
+						visibility, shadowPenumbraMirror(y0 - h, previous, t));
+				previous = y0 - h;
+			}
+		}
+		t = sExit;
+		const bool takeX = tMaxX < tMaxZ;
+		tMaxX += takeX ? dX : 0.0;
+		tMaxZ += takeX ? 0.0 : dZ;
+		colX += takeX ? stepX : 0;
+		colZ += takeX ? 0 : stepZ;
+	}
+	return visibility;
+}
+
+// SDF soft shadow: occlusion parity with the exact march (fully dark
+// wherever the exact march is blocked - same traversal, opaque world),
+// visibility range, the penumbra being a real minority (the old
+// clamp-to-zero pinned every grazing pixel to black), and the penumbra
+// shape against the known wall (hard shadow under the top, partial light
+// grazing it, lit well clear, monotonic toward the wall).
+void testSunShadowSdfMarch() {
+	ShadowWorld w = makeShadowWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int outOfRange = 0, leaked = 0, grazing = 0, shadowed = 0, total = 0;
+	for (int i = 0; i < 3000; ++i) {
+		double origin[3], n[3] = {0.0, 1.0, 0.0};
+		if (i % 3 == 0) {
+			// Surface point on near terrain (top face).
+			origin[0] = next01() * 64.0;
+			origin[2] = next01() * 64.0;
+			const unsigned bound =
+					w.near.boundAt(int(std::floor(origin[0])),
+							int(std::floor(origin[2])));
+			origin[1] = bound == 0xFFFFu ? 10.0 : double(bound);
+		} else if (i % 3 == 1) {
+			// Side face at the wall (normal -x).
+			origin[0] = 20.0;
+			origin[1] = next01() * 40.0;
+			origin[2] = next01() * 64.0;
+			n[0] = -1.0;
+			n[1] = 0.0;
+		} else {
+			// Point on far terrain (far hits shadow too).
+			origin[0] = -60.0 + next01() * 180.0;
+			origin[2] = -60.0 + next01() * 180.0;
+			const int fcX = int(std::floor(origin[0] + 64.0) / 4.0);
+			const int fcZ = int(std::floor(origin[2] + 64.0) / 4.0);
+			const unsigned packed =
+					w.farAt(fcX < 0 ? -1 : fcX, fcZ < 0 ? -1 : fcZ);
+			origin[1] = double(packed & 0xFFFFu);
+			if (origin[1] == 0.0) {
+				continue;
+			}
+		}
+		double o[3];
+		for (int a = 0; a < 3; ++a) {
+			o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+		}
+		++total;
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const double soft = sunRayEscapesSdfMirror(w, o, sun);
+		if (soft < -1e-9 || soft > 1.0 + 1e-9) {
+			++outOfRange;
+		}
+		// Occlusion parity: wherever the exact march is blocked, the SDF
+		// march must be fully dark (same traversal, opaque test world).
+		if (!exactLit && soft > 1e-6) {
+			if (leaked <= 3) {
+				std::printf("FAIL sdf shadow %d at (%.2f,%.2f,%.2f): "
+						"exact shadowed, soft %.3f\n",
+						i, origin[0], origin[1], origin[2], soft);
+			}
+			++leaked;
+		}
+		if (!exactLit) {
+			++shadowed;
+		}
+		// Exact-lit but dark pixels are the penumbra (a grazing near-miss):
+		// they must exist (the feature) yet stay a clear minority (the old
+		// degenerate-triangle clamp turned nearly all of them into black).
+		if (exactLit && soft < 0.1) {
+			++grazing;
+		}
+	}
+	check(outOfRange == 0, "sdf shadow: visibility stays in [0, 1]");
+	check(leaked == 0,
+			"sdf shadow: fully dark wherever the exact march is occluded");
+	check(shadowed > 300, "sdf shadow: shadowed cases well exercised");
+	check(grazing > 5 && grazing < 1500,
+			"sdf shadow: penumbra pixels exist but are a minority");
+	std::printf("sdf shadow: %d shadowed, %d penumbral, %d lit of %d\n",
+			shadowed, grazing, total - shadowed - grazing, total);
+
+	// Penumbra shape against the known wall (column x=20, top at y=40, sun
+	// (0.5,1,0.5) rises 2 voxels per column of x): the ray from (x, 25, 10)
+	// reaches the wall at y ~= 25 + 2*(20-x), so x <= 12 grazes/clears the
+	// top (partial to full light) and x >= 13 hits the wall (hard shadow).
+	const double wallX[5] = {8.0, 10.0, 12.0, 13.0, 14.0};
+	double wallSoft[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+	for (int i = 0; i < 5; ++i) {
+		double o[3] = {wallX[i] + sun[0] * 1e-2,
+				25.0 + 1e-3 + sun[1] * 1e-2, 10.0 + sun[2] * 1e-2};
+		wallSoft[i] = sunRayEscapesSdfMirror(w, o, sun);
+	}
+	check(wallSoft[4] == 0.0 && wallSoft[3] == 0.0,
+			"sdf penumbra: hard shadow under the wall top");
+	check(wallSoft[0] > 0.9 && wallSoft[1] > 0.9,
+			"sdf penumbra: lit well clear of the wall top");
+	check(wallSoft[2] > 0.05 && wallSoft[2] < 0.9,
+			"sdf penumbra: partial light grazing the wall top");
+	for (int i = 1; i < 5; ++i) {
+		check(wallSoft[i] <= wallSoft[i - 1] + 1e-6,
+				"sdf penumbra: no lighter farther into the shadow");
+	}
 }
 
 }  // namespace
@@ -2354,6 +2585,7 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testSunShadowSdfMarch();
 	testStreamPriority();
 	testVoxelTextures();
 

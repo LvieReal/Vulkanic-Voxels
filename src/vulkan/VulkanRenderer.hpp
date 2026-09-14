@@ -246,8 +246,9 @@ class VulkanRenderer final {
   // by ray-termination cause. Default off. (VV_DEBUG_SSAA / VV_SSAA were
   // removed in pass 10 - supersampling was too heavy.)
   bool m_debugTerminators = false;
-  // Optional signed-distance shadow experiment. Exact binary shadows remain
-  // the default; VV_SDF_SHADOWS=1 selects the occupancy-aware marcher.
+  // Optional SDF soft-shadow experiment (pass 33: the exact march's
+  // traversal + Quilez/Aaltonen penumbra estimates). Exact binary shadows
+  // remain the default; VV_SDF_SHADOWS=1 selects the soft marcher.
   bool m_sdfShadows = false;
   // VV_PERF: frame-time logging for hitch diagnosis (frames > 25 ms,
   // rate-limited). VV_DEBUG_HOLE: color far-march misses over a chunk.
