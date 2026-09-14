@@ -14,6 +14,16 @@ function(vv_enable_shader_pipeline target_name)
         message(FATAL_ERROR "No shader sources found in ${shader_source_dir}")
     endif()
 
+    # SPIR-V debug info in Debug builds only: -g embeds the GLSL source
+    # and line tables (OpSource/OpLine/OpName), which Nsight Graphics
+    # needs for shader source correlation while profiling. Every other
+    # config passes -g0 (glslang's default = strip), so the flag list is
+    # never empty (an empty generator-expression argument would leak as
+    # a literal "" file argument under Ninja/VERBATIM) and the Release
+    # SPIR-V stays byte-identical to a flag-less compile.
+    set(shader_debug_flag "$<$<CONFIG:Debug>:-g>$<$<NOT:$<CONFIG:Debug>>:-g0>")
+    set(shader_debug_comment "$<$<CONFIG:Debug>: (with debug info)>")
+
     set(shader_spv_files)
     foreach(shader_file IN LISTS shader_sources)
         get_filename_component(shader_name "${shader_file}" NAME)
@@ -21,9 +31,9 @@ function(vv_enable_shader_pipeline target_name)
         add_custom_command(
             OUTPUT "${shader_spv}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${shader_output_dir}"
-            COMMAND "${GLSLANG_VALIDATOR}" -V "${shader_file}" -o "${shader_spv}"
+            COMMAND "${GLSLANG_VALIDATOR}" -V "${shader_file}" ${shader_debug_flag} -o "${shader_spv}"
             DEPENDS "${shader_file}"
-            COMMENT "Compiling ${shader_name} -> ${shader_name}.spv"
+            COMMENT "Compiling ${shader_name} -> ${shader_name}.spv${shader_debug_comment}"
             VERBATIM
         )
         list(APPEND shader_spv_files "${shader_spv}")

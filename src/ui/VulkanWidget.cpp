@@ -1,7 +1,5 @@
 #include "ui/VulkanWidget.hpp"
 
-#include <windows.h>
-
 #include <QCursor>
 #include <QFocusEvent>
 #include <QKeyEvent>
@@ -9,9 +7,12 @@
 #include <QMouseEvent>
 #include <QResizeEvent>
 #include <QTimer>
+#include <QWindow>
 #include <algorithm>
+#include <cstdio>
 
-#include "ui/PauseMenu.hpp"
+#include "core/Version.h"
+#include "platform/QtNativeWindowResolver.hpp"
 #include "vulkan/VulkanRenderer.hpp"
 
 namespace vv::ui {
@@ -23,8 +24,18 @@ VulkanWidget::VulkanWidget(QWidget* parent) : QWidget(parent) {
 
 	setFocusPolicy(Qt::StrongFocus);
 
-	// Ensure the native HWND exists early, so we can create the VkSurfaceKHR.
+	// Deliver mouse moves while no button is held (first-person look).
+	// Without this, mouseMoveEvent only fires while a button is pressed.
+	setMouseTracking(true);
+
+	// Ensure the native window exists early, so we can create the VkSurfaceKHR.
 	(void)winId();
+
+	// Watch the backing QWindow so we can apply the deferred mouse grab as
+	// soon as the window is actually exposed on screen.
+	if (QWindow* window = windowHandle()) {
+		window->installEventFilter(this);
+	}
 
 	// Reasonable defaults for a first-person style free camera.
 	m_camera.setFovDegrees(70.0f);
@@ -33,18 +44,10 @@ VulkanWidget::VulkanWidget(QWidget* parent) : QWidget(parent) {
 	auto* timer = new QTimer(this);
 	timer->setTimerType(Qt::PreciseTimer);
 	connect(timer, &QTimer::timeout, this, [this]() { tick(); });
-	timer->start(16);
-
-	m_pauseMenu = new PauseMenu(this);
-	m_pauseMenu->hide();
-	m_pauseMenu->setGeometry(rect());
-	connect(m_pauseMenu, &PauseMenu::backToGameRequested, this,
-					[this]() { hidePauseMenu(); });
-	connect(m_pauseMenu, &PauseMenu::exitRequested, this, [this]() {
-		if (auto* w = window()) {
-			w->close();
-		}
-	});
+	// 0 ms = tick on every event-loop pass: the loop runs as fast as the
+	// GPU can present (see also choosePresentMode - IMMEDIATE by default).
+	// The old 16 ms interval capped the game at ~62 fps by itself.
+	timer->start(0);
 }
 
 VulkanWidget::~VulkanWidget() = default;
@@ -53,14 +56,23 @@ QPaintEngine* VulkanWidget::paintEngine() const {
 	return nullptr;
 }
 
+bool VulkanWidget::eventFilter(QObject* watched, QEvent* event) {
+	if (watched == windowHandle() && event->type() == QEvent::Expose) {
+		// The window is (or is about to be) on screen: safe to apply a mouse
+		// grab that was deferred earlier because the window was not visible.
+		applyPendingMouseGrab();
+	}
+	return QWidget::eventFilter(watched, event);
+}
+
 void VulkanWidget::showEvent(QShowEvent* event) {
 	QWidget::showEvent(event);
 
 	const qreal dpr = devicePixelRatioF();
 	m_pendingWidth =
-		static_cast<uint32_t>(std::max(1, static_cast<int>(width() * dpr)));
+			static_cast<uint32_t>(std::max(1, static_cast<int>(width() * dpr)));
 	m_pendingHeight =
-		static_cast<uint32_t>(std::max(1, static_cast<int>(height() * dpr)));
+			static_cast<uint32_t>(std::max(1, static_cast<int>(height() * dpr)));
 	ensureInitialized();
 	lockMouse();
 }
@@ -70,15 +82,11 @@ void VulkanWidget::resizeEvent(QResizeEvent* event) {
 
 	const qreal dpr = devicePixelRatioF();
 	m_pendingWidth = static_cast<uint32_t>(
-		std::max(1, static_cast<int>(event->size().width() * dpr)));
+			std::max(1, static_cast<int>(event->size().width() * dpr)));
 	m_pendingHeight = static_cast<uint32_t>(
-		std::max(1, static_cast<int>(event->size().height() * dpr)));
+			std::max(1, static_cast<int>(event->size().height() * dpr)));
 	if (m_renderer) {
 		m_renderer->resize(m_pendingWidth, m_pendingHeight);
-	}
-
-	if (m_pauseMenu) {
-		m_pauseMenu->setGeometry(rect());
 	}
 }
 
@@ -87,23 +95,25 @@ void VulkanWidget::ensureInitialized() {
 		return;
 	}
 
-	const auto hwnd = reinterpret_cast<HWND>(winId());
-	if (!hwnd) {
-		QMessageBox::critical(this, "Vulkan",
-													"Failed to obtain a native window handle (HWND).");
+	std::string error;
+	const vv::platform::NativeWindow native =
+			vv::platform::resolveNativeWindow(this, error);
+	if (!native.isValid()) {
+		QMessageBox::critical(
+				this, "Vulkan",
+				QString("Failed to obtain a native window handle: %1")
+						.arg(QString::fromStdString(error)));
 		return;
 	}
 
 	m_renderer = std::make_unique<vv::vulkan::VulkanRenderer>();
-	m_renderer->setWorldConfig(m_chunkSizeVoxels, m_voxelSize);
+	m_renderer->setWorldConfig(m_voxelConfig);
 
 	vv::vulkan::VulkanRenderer::InitInfo init{};
-	init.hinstance = GetModuleHandleW(nullptr);
-	init.hwnd = hwnd;
+	init.nativeWindow = native;
 	init.width = m_pendingWidth;
 	init.height = m_pendingHeight;
 
-	std::string error;
 	if (!m_renderer->init(init, error)) {
 		QMessageBox::critical(this, "Vulkan unsupported",
 													QString::fromStdString(error));
@@ -111,19 +121,51 @@ void VulkanWidget::ensureInitialized() {
 		return;
 	}
 
-	// Start at a sensible place relative to the initial chunk (0..64).
-	const glm::vec3 chunkSizeWorld = glm::vec3(m_chunkSizeVoxels) * m_voxelSize;
-	const glm::vec3 center = chunkSizeWorld * 0.5f;
-	m_camera.setPosition(center + glm::vec3(0.0f, chunkSizeWorld.y * 0.35f,
-																					chunkSizeWorld.z * 1.75f));
-	m_camera.setYawPitchDegrees(180.0f, -10.0f);
+	// Spawn above the terrain at the center of chunk (0,0), looking out over
+	// the world.
+	m_camera.setPosition(m_renderer->spawnPosition());
+	m_camera.setYawPitchDegrees(180.0f, -18.0f);
 	m_gameTimer.reset();
 
 	m_initialized = true;
+
+	// Ground truth for remote debugging: name the exact binary and the live
+	// render state (also mirrored into the window title, refreshed 1 Hz).
+	std::fprintf(stderr, "[vv] build=%s | %s\n", vv::core::kBuildId,
+				 m_renderer->debugStats().c_str());
+	m_lastStatsSeconds = m_gameTimer.totalSeconds();
+	refreshDebugTitle();
+}
+
+void VulkanWidget::refreshDebugTitle() {
+	if (!m_renderer) {
+		return;
+	}
+	window()->setWindowTitle(QString::asprintf(
+			"Vulkanic Voxels - build %s | %s | %.0f fps", vv::core::kBuildId,
+			m_renderer->debugStats().c_str(), m_titleFps));
 }
 
 void VulkanWidget::tick() {
 	if (!m_renderer) {
+		return;
+	}
+
+	// Fatal GPU error: surface it once and stop rendering.
+	if (m_renderer->deviceLost()) {
+		if (!m_deviceLostReported) {
+			m_deviceLostReported = true;
+			unlockMouse();
+			setGamePaused(true);
+			QMessageBox::critical(
+					this, "Vulkan device lost",
+					QString("The GPU or driver reported a fatal error and rendering "
+									"was stopped:\n\n%1\n\nIf this mentions a timeout, the "
+									"compute workload was too heavy for the GPU; lowering "
+									"the render radius or trace steps in VoxelConfig "
+									"helps.")
+							.arg(QString::fromStdString(m_renderer->lastError())));
+		}
 		return;
 	}
 
@@ -154,7 +196,29 @@ void VulkanWidget::tick() {
 
 	m_renderer->setCamera(m_camera,
 												static_cast<float>(m_gameTimer.totalSeconds()));
+
+	// Keep the GPU chunk region centered on the camera (no-op unless the
+	// camera crossed a chunk boundary).
+	m_renderer->updateWorld(m_camera.position());
+
+	// Do not present while the window is not on screen (minimized/hidden);
+	// presenting to an unexposed surface just burns swapchain cycles.
+	const QWindow* window = windowHandle();
+	if (window == nullptr || !window->isExposed()) {
+		return;
+	}
 	m_renderer->drawFrame();
+
+	// 1 Hz debug title refresh (build id + live state + fps).
+	++m_statFrames;
+	const double now = m_gameTimer.totalSeconds();
+	if (now - m_lastStatsSeconds >= 1.0) {
+		m_titleFps = static_cast<double>(m_statFrames) /
+					 std::max(1e-9, now - m_lastStatsSeconds);
+		m_lastStatsSeconds = now;
+		m_statFrames = 0;
+		refreshDebugTitle();
+	}
 }
 
 void VulkanWidget::keyPressEvent(QKeyEvent* event) {
@@ -164,10 +228,12 @@ void VulkanWidget::keyPressEvent(QKeyEvent* event) {
 	}
 
 	if (event->key() == Qt::Key_Escape) {
-		if (m_pauseMenu && m_pauseMenu->isVisible()) {
-			hidePauseMenu();
+		if (m_mouseLocked) {
+			unlockMouse();
+			setGamePaused(true);
 		} else {
-			showPauseMenu();
+			lockMouse();
+			setGamePaused(false);
 		}
 		event->accept();
 		return;
@@ -252,9 +318,9 @@ void VulkanWidget::mouseMoveEvent(QMouseEvent* event) {
 	const QPoint center = globalCenterPos();
 	const QPointF gpos = event->globalPosition();
 	const float dx =
-		static_cast<float>(gpos.x() - static_cast<qreal>(center.x()));
+			static_cast<float>(gpos.x() - static_cast<qreal>(center.x()));
 	const float dy =
-		static_cast<float>(gpos.y() - static_cast<qreal>(center.y()));
+			static_cast<float>(gpos.y() - static_cast<qreal>(center.y()));
 	if (dx == 0.0f && dy == 0.0f) {
 		event->accept();
 		return;
@@ -268,13 +334,23 @@ void VulkanWidget::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void VulkanWidget::mousePressEvent(QMouseEvent* event) {
-	(void)event;
+	// Clicking the view resumes mouse lock (e.g. after Escape or a focus
+	// loss) instead of dragging a "view" around.
+	if (!m_mouseLocked) {
+		lockMouse();
+		setGamePaused(false);
+		event->accept();
+		return;
+	}
 
 	QWidget::mousePressEvent(event);
 }
 
 void VulkanWidget::focusOutEvent(QFocusEvent* event) {
-	showPauseMenu();
+	// Losing focus (alt-tab, OS shortcut) must never keep the pointer
+	// confined or the camera running with stale key state.
+	unlockMouse();
+	setGamePaused(true);
 	QWidget::focusOutEvent(event);
 }
 
@@ -289,53 +365,64 @@ void VulkanWidget::lockMouse() {
 	}
 
 	m_mouseLocked = true;
+	setFocus(Qt::OtherFocusReason);
 	setCursor(Qt::BlankCursor);
-	grabMouse();
-	grabKeyboard();
+
+	// Confine the pointer so fast movement cannot leave the window. Grabbing
+	// is only requested once the platform window is actually visible; on some
+	// platforms showEvent happens before that, and grabbing an invisible
+	// window makes Qt emit
+	// "setMouseGrabEnabled: Not setting mouse grab for invisible window".
+	// In that case the grab is deferred to the first expose event.
+	if (QWindow* window = windowHandle()) {
+		if (window->isVisible()) {
+			window->setMouseGrabEnabled(true);
+		} else {
+			m_pendingMouseGrab = true;
+		}
+	}
 
 	m_ignoreNextMouseMove = true;
 	QCursor::setPos(globalCenterPos());
 }
 
 void VulkanWidget::unlockMouse() {
+	m_pendingMouseGrab = false;
 	if (!m_mouseLocked) {
 		return;
 	}
 
 	m_mouseLocked = false;
+	resetKeyStates();
+	if (QWindow* window = windowHandle()) {
+		window->setMouseGrabEnabled(false);
+	}
 	unsetCursor();
-	releaseMouse();
-	releaseKeyboard();
 }
 
-void VulkanWidget::showPauseMenu() {
-	if (!m_pauseMenu) {
-		return;
-	}
-	if (m_pauseMenu->isVisible()) {
+void VulkanWidget::applyPendingMouseGrab() {
+	if (!m_pendingMouseGrab || !m_mouseLocked) {
 		return;
 	}
 
-	m_gameTimer.setPaused(true);
-	unlockMouse();
+	QWindow* window = windowHandle();
+	if (window == nullptr || !window->isVisible()) {
+		return;
+	}
 
-	m_pauseMenu->setGeometry(rect());
-	m_pauseMenu->show();
-	m_pauseMenu->raise();
-	m_pauseMenu->setFocus(Qt::ActiveWindowFocusReason);
+	window->setMouseGrabEnabled(true);
+	m_pendingMouseGrab = false;
+	m_ignoreNextMouseMove = true;
+	QCursor::setPos(globalCenterPos());
 }
 
-void VulkanWidget::hidePauseMenu() {
-	if (!m_pauseMenu) {
-		return;
-	}
-	if (!m_pauseMenu->isVisible()) {
-		return;
-	}
-
-	m_pauseMenu->hide();
-	m_gameTimer.setPaused(false);
-	lockMouse();
+void VulkanWidget::setGamePaused(bool paused) {
+	m_gameTimer.setPaused(paused);
 }
 
-} // namespace vv::ui
+void VulkanWidget::resetKeyStates() {
+	m_keyW = m_keyA = m_keyS = m_keyD = false;
+	m_keySpace = m_keyCtrl = m_keyShift = false;
+}
+
+}  // namespace vv::ui

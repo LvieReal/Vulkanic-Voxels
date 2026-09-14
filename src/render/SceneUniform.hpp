@@ -24,8 +24,12 @@ class SceneUniform final {
               std::string& outError);
   void cleanup(VkDevice device);
 
+  // sceneFlags: x = termination-cause visualization (VV_DEBUG_TERM),
+  // y = far-field fade-in alpha (first activation only; recenters do
+  // not fade - their cells are identical). Lands in SceneUBO.misc.y/z.
   void update(const vv::core::Camera& camera, float timeSeconds,
-              const LightingConfig& lighting);
+              const LightingConfig& lighting,
+              const glm::vec4& sceneFlags = glm::vec4(0.0f));
 
   VkBuffer buffer() const { return m_buffer; }
   void* mapped() const { return m_mapped; }

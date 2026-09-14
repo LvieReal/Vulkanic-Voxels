@@ -1,3 +1,4 @@
+cd /d "%~dp0"
 set PATH=%PATH%;C:\msys64\mingw64\bin
-"build/bin/game.exe"
+"build/release/bin/game.exe"
 pause

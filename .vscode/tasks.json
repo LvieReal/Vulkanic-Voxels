@@ -11,9 +11,48 @@
                 "-B",
                 "${workspaceFolder}/build/debug",
                 "-G",
-                "MinGW Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=Debug"
             ],
+            "windows": {
+                "command": "C:/msys64/mingw64/bin/cmake.exe",
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/debug",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Debug"
+                ],
+                "options": {
+                    "env": {
+                        "PATH": "C:\\msys64\\mingw64\\bin;${env:PATH}"
+                    }
+                }
+            },
+            "linux": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/debug",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Debug"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/debug",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Debug"
+                ]
+            },
             "group": "build",
             "problemMatcher": []
         },
@@ -27,9 +66,48 @@
                 "-B",
                 "${workspaceFolder}/build/release",
                 "-G",
-                "MinGW Makefiles",
+                "Ninja",
                 "-DCMAKE_BUILD_TYPE=Release"
             ],
+            "windows": {
+                "command": "C:/msys64/mingw64/bin/cmake.exe",
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/release",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ],
+                "options": {
+                    "env": {
+                        "PATH": "C:\\msys64\\mingw64\\bin;${env:PATH}"
+                    }
+                }
+            },
+            "linux": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/release",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    "${workspaceFolder}/build/release",
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
             "group": "build",
             "problemMatcher": []
         },
@@ -40,18 +118,50 @@
             "args": [
                 "--build",
                 "${workspaceFolder}/build/debug",
-                "--parallel ${env:NUMBER_OF_PROCESSORS}",
-                "--config",
-                "Debug"
+                "--parallel"
             ],
+            "windows": {
+                "command": "C:/msys64/mingw64/bin/cmake.exe",
+                "options": {
+                    "env": {
+                        "PATH": "C:\\msys64\\mingw64\\bin;${env:PATH}"
+                    }
+                }
+            },
+            "linux": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/debug",
+                    "--parallel"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/debug",
+                    "--parallel"
+                ]
+            },
             "dependsOn": "cmake-configure-debug",
             "group": {
                 "kind": "build",
-                "isDefault": true
+                "isDefault": false
             },
-            "problemMatcher": [
-                "$gcc"
-            ]
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": [
+                    "relative",
+                    "${workspaceFolder}"
+                ],
+                "pattern": {
+                    "regexp": "^(.*?):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(warning|error):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
         },
         {
             "label": "cmake-build-release",
@@ -60,53 +170,50 @@
             "args": [
                 "--build",
                 "${workspaceFolder}/build/release",
-                "--parallel ${env:NUMBER_OF_PROCESSORS}",
-                "--config",
-                "Release"
+                "--parallel"
             ],
+            "windows": {
+                "command": "C:/msys64/mingw64/bin/cmake.exe",
+                "options": {
+                    "env": {
+                        "PATH": "C:\\msys64\\mingw64\\bin;${env:PATH}"
+                    }
+                }
+            },
+            "linux": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/release",
+                    "--parallel"
+                ]
+            },
+            "osx": {
+                "args": [
+                    "--build",
+                    "${workspaceFolder}/build/release",
+                    "--parallel"
+                ]
+            },
             "dependsOn": "cmake-configure-release",
-            "group": "build",
-            "problemMatcher": [
-                "$gcc"
-            ]
-        },
-        {
-            "label": "cmake-package-debug",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build/debug",
-                "--target",
-                "package_folder"
-            ],
-            "dependsOn": "cmake-build-debug",
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": [
-                "$gcc"
-            ]
-        },
-        {
-            "label": "cmake-package-release",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build/release",
-                "--target",
-                "package_folder"
-            ],
-            "dependsOn": "cmake-build-release",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "problemMatcher": [
-                "$gcc"
-            ]
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": [
+                    "relative",
+                    "${workspaceFolder}"
+                ],
+                "pattern": {
+                    "regexp": "^(.*?):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(warning|error):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
         }
     ]
 }
