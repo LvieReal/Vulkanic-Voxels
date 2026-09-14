@@ -10,7 +10,7 @@ constexpr std::array<const char*, 1> kUniformSuffixes = {""};
 constexpr std::array<const char*, 3> kSideSuffixes = {"_top", "_bottom",
 																											"_side"};
 constexpr std::array<const char*, 6> kCustomSuffixes = {
-		"_top", "_bottom", "_px", "_nx", "_pz", "_nz"};
+		"_top", "_bottom", "_back", "_front", "_right", "_left"};
 
 }  // namespace
 

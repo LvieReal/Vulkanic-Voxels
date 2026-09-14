@@ -119,13 +119,6 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
   }
-  if (std::getenv("VV_SHADOW_SHARP")) {
-    m_shadowConeTan = 0.0f;
-    std::fprintf(stderr,
-                 "[vulkan] VV_SHADOW_SHARP: sun shadows use the exact "
-                 "single-ray march (no cone)\n");
-  }
-
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
       !pickPhysicalDevice(outError) || !createDevice(outError) ||
       !createCommandPool(outError) || !createVoxelWorldAndUpload(outError) ||
@@ -188,10 +181,9 @@ void VulkanRenderer::drawFrame() {
     farFade = static_cast<float>(
         std::min(elapsed / kFarFadeSeconds, 1.0));
   }
-  m_sceneUniform.update(
-      m_camera, m_timeSeconds, m_lighting,
-      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade, m_shadowConeTan,
-                0.0f));
+  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
+                        glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
+                                  0.0f, 0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -910,6 +902,8 @@ void VulkanRenderer::publishRegionTable(bool logHoles) {
     std::fprintf(stderr, "[vulkan] region table publish failed\n");
     return;
   }
+  const std::int32_t prevOriginX = m_tableOriginX;
+  const std::int32_t prevOriginZ = m_tableOriginZ;
   m_tableHalf = nextHalf;
   m_tableOriginX = m_streamTarget.x;
   m_tableOriginZ = m_streamTarget.z;
@@ -1756,6 +1750,7 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   texInfoBinding.descriptorCount = 1;
   texInfoBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
@@ -2150,8 +2145,8 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   poolSizes[0].descriptorCount = 8;  // voxel atlas, output, chunk table,
-                                     // palette, column heights, far LOD,
-                                     // chunk fade, texture info table
+                                    // palette, column heights, far LOD,
+                                    // chunk fade, texture info table
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;

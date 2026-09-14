@@ -41,7 +41,7 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 lightColor;
     vec4 skyLow;
     vec4 skyHigh;
-    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM (z, w unused)
+    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in (w unused)
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -99,7 +99,8 @@ layout(set = 0, binding = 8) uniform texture2D
 layout(set = 0, binding = 9) uniform sampler voxelSampler;
 
 // Per-type face table: 8 u32 per VoxelType. Words 0..5 = image index
-// for face id 0..5 (0 = +Y, 1 = -Y, 2 = +X, 3 = -X, 4 = +Z, 5 = -Z);
+// for face id 0..5 (0 = +Y top, 1 = -Y bottom, 2 = +X back, 3 = -X
+// front, 4 = +Z right, 5 = -Z left);
 // 0xFFFFFFFF = no texture for that face (palette color). Word 6 =
 // nominal texture size (the explicit-LOD estimate), word 7 unused.
 layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
@@ -375,37 +376,15 @@ float calculateAO(ivec3 voxel, vec3 n, vec3 hitPos)
 // beyond. Cheap because the sun is high: the ray ascends past all terrain
 // within a few dozen columns and the march ends there. Returns 1.0 lit /
 // 0.0 shadowed.
-// Sun shadows (pass 21): one ascending column march toward the sun -
-// the same 2D DDA + height-bound voxel walk that is pinned by the CPU
-// parity mirror in tests/terrain_world_tests.cpp - where every blocker
-// contributes a soft ANGULAR coverage instead of a binary hit:
-//
-//   cov = clamp(0.5 + (blockerTop - y) / (2 * coneTan * s), 0, 1)
-//
-// i.e. the blocker's top, at march distance s, covers that fraction of
-// the sun disk's angular diameter (coneTan = tan of the disk's half
-// angle, scene.misc.w; default tan 2.5 deg). The answer is 1 minus the
-// WORST blocker's coverage: a smooth penumbra that widens with
-// distance, while a surface the ray barely clears self-cancels (the
-// numerator shrinks as fast as the ray climbs). With coneTan = 0 (or
-// VV_SHADOW_SHARP=1) every coverage clamps to 0 or 1 and the march is
-// EXACTLY the old binary shadow ray - same columns, same voxel walks.
-// Single-march approximation: the disk's azimuthal extent is ignored
-// (occluders beside the ray lighten the penumbra slightly).
-float sunShadow(vec3 hitPosVox, vec3 n)
+// One exact binary shadow ray (the original march, parameterized by
+// direction): ascending column DDA + height-bound voxel walk, coarse
+// far cells beyond the near region. Pinned by the CPU parity mirror in
+// tests/terrain_world_tests.cpp - do not refactor blindly.
+bool sunRayEscapes(vec3 origin, vec3 sunV)
 {
-    const vec3 sunWorld = normalize(scene.lightDir.xyz);
-    if (sunWorld.y <= 0.05) {
-        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
+    if (sunV.y <= 0.05) {
+        return true;  // low/sunset sun: no cheap ascend bound, skip
     }
-    const float coneTan = scene.misc.w;
-    const bool soft = coneTan > 0.0;
-    const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
-    const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
-    // Lift off the surface (along the normal, then along the sun) to avoid
-    // self-shadow acne; the hit face's outward cell is air by construction.
-    vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
-
     const float EPS = 1e-6;
     const float maxTerr = float(pc.grid.w) + 1.0;
     int sStepX = (sunV.x > 0.0) ? 1 : -1;
@@ -434,19 +413,15 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     const ivec2 farDim = pc.far.zw;
     const vec2 farOrigin = vec2(pc.far.xy);
     float s = 0.0;  // world-unit parameter along sunV
-    float pen = 0.0;  // worst blocker coverage so far
 
     // A high sun lifts the ray above maxTerrain quickly; 256 columns covers
     // every realistic caster (and bounds the worst case for low suns).
     for (int i = 0; i < 256; ++i) {
         const float sExit = min(sMaxX, sMaxZ);
         const float y0 = origin.y + sunV.y * s;       // ascending (sun up)
-        // In soft mode the disk dips below the ray by coneTan * s; blockers
-        // down to that line can still cover part of the disk.
-        const float dip = soft ? coneTan * s : 0.0;
 
-        if (y0 - dip >= maxTerr) {
-            return 1.0 - pen;  // whole disk above all possible terrain
+        if (y0 >= maxTerr) {
+            return true;  // above all possible terrain: lit from here on
         }
 
         uint slot = 0u;
@@ -455,34 +430,19 @@ float sunShadow(vec3 hitPosVox, vec3 n)
             // Near region: the height bound says whether a blocker can
             // exist in this column at all.
             const uint bound = columnHeightBound(col.x, col.y);
-            if (bound != kNoHeightData && float(bound) > y0 - dip) {
-                // Walk only the cells the segment (widened by the dip in
-                // soft mode) occupies below the bound, ascending.
+            if (bound != kNoHeightData && float(bound) > y0) {
+                // Walk only the cells the segment occupies below the bound
+                // (ascending: from the entry cell up).
                 const float y1 = origin.y + sunV.y * sExit;
                 const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
                                      int(pc.chunkSize.y) - 1);
                 const uint colBase = uint(local.x) +
                                      uint(local.y) *
                                          (pc.chunkSize.x * pc.chunkSize.y);
-                for (int y = max(int(floor(y0 - dip)), 0); y <= yTop; ++y) {
+                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
                     if (fetchVoxel(slot,
                                    colBase + uint(y) * pc.chunkSize.x) != 0u) {
-                        // Solid cell [y, y+1): its top at distance s covers
-                        // this fraction of the sun disk (soft), or blocks
-                        // outright (sharp - identical to the old march).
-                        float cov;
-                        if (soft) {
-                            cov = clamp(
-                                0.5 + (float(y) + 1.0 - y0) /
-                                          (2.0 * coneTan * max(s, 1e-4)),
-                                0.0, 1.0);
-                        } else {
-                            cov = 1.0;
-                        }
-                        pen = max(pen, cov);
-                        if (pen >= 1.0) {
-                            return 0.0;
-                        }
+                        return false;
                     }
                 }
             }
@@ -497,16 +457,8 @@ float sunShadow(vec3 hitPosVox, vec3 n)
                     farLod.cells[farBase() + uint(fc.x) +
                                  uint(fc.y) * uint(farDim.x)];
                 const float h = float(packed & 0xFFFFu);
-                if (h > 0.0 && h > y0 - dip) {
-                    const float cov = soft
-                        ? clamp(0.5 + (h - y0) /
-                                          (2.0 * coneTan * max(s, 1e-4)),
-                                0.0, 1.0)
-                        : 1.0;
-                    pen = max(pen, cov);
-                    if (pen >= 1.0) {
-                        return 0.0;
-                    }
+                if (h > 0.0 && y0 < h) {
+                    return false;
                 }
             }
         }
@@ -519,7 +471,27 @@ float sunShadow(vec3 hitPosVox, vec3 n)
         col.x += takeX ? sStepX : 0;
         col.y += takeX ? 0 : sStepZ;
     }
-    return 1.0 - pen;
+    return true;
+}
+
+// Sun visibility at a hit position (voxel space): ONE exact binary
+// shadow ray - ascending column DDA + height-bound voxel walk, coarse
+// far cells beyond the near region (pass 25: the cone/heightmap soft
+// machinery of passes 21-24 is removed; soft shadows will return as a
+// CPU-built light grid). Far-LOD hits shadow through the same march:
+// from beyond the region it self-selects the cheap far-cell path.
+float sunShadow(vec3 hitPosVox, vec3 n)
+{
+    const vec3 sunWorld = normalize(scene.lightDir.xyz);
+    if (sunWorld.y <= 0.05) {
+        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
+    }
+    const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
+    const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
+    // Lift off the surface (along the normal, then along the sun) to avoid
+    // self-shadow acne; the hit face's outward cell is air by construction.
+    const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }
 
 float fogAmount(float dist)
