@@ -87,42 +87,33 @@ g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
 Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
 `~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 21)
+## Current status: REVERTED TO PASS 21 (owner decision)
 
-Owner-verified pass 20 (textures seamless). Pass 21 asks: (1) load
-textures from resources/textures/voxels (files on the owner's machine;
-plain-color fallback here), (2) nearest sampling by default, (3) three
-texture definition modes (uniform / side-uniform / custom), (4) soft
-shadows via CONE TRACING (chosen over flood-fill and opacity grid).
+After pass 26 (CPU flood-fill light grid) failed on the owner's machine
+(everything shadowed / 'sideways' shadows; Release-only immediate
+crash; Debug and VV_SUN_GRID=0 fine) and could not be root-caused
+remotely, the owner asked to return to the last state they consider
+stable: pass 21 below (file-based voxel textures, cone-traced soft sun
+shadows, chunk fade). The revert commit (ad0aa6b) on top of 5daf98f
+restores the tree byte-identical to dda0c0c; the pass-21 CPU test
+suite passes.
 
-Delivered:
-- File textures: Qt loader (src/render/VoxelTextureFiles.*) reads
-  <name>.png (uniform, all 6 faces), <name>_top/_bottom/_side.png
-  (side-uniform) or <name>_top/_bottom/_px/_nx/_pz/_nz.png (custom);
-  most specific complete set wins, missing -> plain palette colors.
-  Search: executableDir()/resources/textures/voxels then CWD (run
-  scripts launch from repo root -> new files work without rebuild).
-  Binding 8 = image array (capacity kMaxVoxelTextures=48, unused slots
-  bound to a 1x1 white dummy), binding 9 = sampler (NEAREST texels,
-  linear mips), binding 10 = per-type table SSBO (6 face image indices
-  or 0xFFFFFFFF = plain, word 6 = nominal size for the explicit LOD).
-  Textured faces use the file as ALBEDO; far-LOD hits sample deep mips
-  (average color) so the near/far seam stays consistent. The pass-20
-  procedural generator is GONE (replaced by files + plain fallback).
-- Soft sun shadows, cone-traced: ONE march (same column DDA + voxel
-  walk as the sharp march) where each blocker contributes an ANGULAR
-  coverage: cov = clamp(0.5 + (blockerTop - y)/(2*coneTan*s), 0, 1);
-  vis = 1 - worst coverage. coneTan = scene.misc.w (default tan 2.5
-  deg = 0.0437); VV_SHADOW_SHARP=1 (or 0) -> exact binary march
-  (byte-identical behavior, pinned by the parity test). Vertical-slice
-  approximation: azimuthal disk extent ignored (occluders beside the
-  ray lighten penumbrae slightly).
-- Tests: texture mode/suffix/face-map tables; shadow cone mirror vs an
-  independent 13-direction dense reference (mean |diff| 0.012, >=97%
-  within 0.25, quantization-graze outliers <=1% and only where the
-  exact sharp march also blocks - consistency invariant checked).
+If the light grid is ever revisited:
+- 5daf98f holds the complete pass-26.3 state: SunLightGrid module
+  (exhaustively validated on CPU - exact parity vs the march on
+  fixtures and real terrain, renderer-scale windows, nonzero origins,
+  moved regions, far rings), renderer integration, CrashLog telemetry
+  (vv-crash.log next to the exe - the Release exe is -mwindows, its
+  stderr is detached!), VV_SUN_DEBUG raw-field view, and a bit-exact
+  GPU sampling-path emulation test. All of it passed every CPU test and
+  still failed on the owner's GPU - uneliminated suspects: driver-
+  specific GENERAL-layout 3D-texture sampling, mingw -O3 codegen, and
+  the staging/copy/flip path.
+- Salvage-worthy standalone fix inside the reverted range: the pass-13
+  stuck m_streamActive bug (finishRegionMove ran every frame at rest;
+  fixed in 20ca086). The bug is PRESENT AGAIN in this tree (harmless
+  at rest, minor per-frame cost); cherry-pick just that hunk if a later
+  pass touches streaming.
 
-Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
-deep-tab files — use python span edits; heredoc re-typing of code invites
-typos — always verify anchors; `ctest`/`cmake` need the PATH export; a
-bare-PATH commit silently fails.
+Owner's stated next step after the shadow saga: their benchmark /
+optimization work (tips delivered in pass 20).
