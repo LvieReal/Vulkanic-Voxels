@@ -244,3 +244,26 @@ against the known wall (hard shadow under the top, partial grazing, lit
 well clear, monotonic). Validated: CPU tests green (sdf shadow: 2191
 shadowed, 9 penumbral, 800 lit of 3000; wall gradient 1,1,0.40,0,0),
 both builds warning-free, ctest green x2, smoke x2.
+
+Pass 33 follow-up (owner: "much better, but some stripes" + "are hard
+shadows combined with hard shadows?"): PIXEL-INTEGRATED SHADOW JITTER.
+The residual stripes are the classic "marching-step banding" the
+rmshadows article warns about: the penumbra is a lower envelope over
+the march's per-column samples, so evaluating it exactly at the pixel
+center stripes the shadow at ~1-column spacing (Aaltonen's triangulation
+helps but does not remove it). Fix: in SDF mode only, shadeSurfaceHit
+jitters the shadow ray origin to a stable pseudo-random sub-pixel
+position (integer hash of gl_GlobalInvocationID, no sin-hash, no
+temporal term - no shimmer, no TAA needed) within the hit face's plane
+(tangent axes from the normal, same convention as calculateAO; the face
+is a plane so the jittered origin can never go below the surface - no
+self-shadow acne). Each pixel then samples the envelope at a random
+sub-pixel phase, turning the regular stripes into fine dither noise.
+The exact-binary path is untouched (jitter = 0), so the reference stays
+bit-identical. Re: hard shadows - there is NO double application:
+sunShadow runs either the SDF march or the binary march (one if), and
+the result is applied once to ambient + direct. The hard edge is the
+umbra (fully-blocked sun), which is binary in ANY SDF soft shadow (see
+the article's reference images); only the penumbra (partial block) is
+soft. Validated: glslangValidator clean, both builds warning-free,
+ctest green, offscreen smoke identical to baseline (dialog, 0% CPU).
