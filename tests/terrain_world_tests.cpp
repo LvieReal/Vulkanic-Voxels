@@ -1771,6 +1771,148 @@ static void testVoxelTextures() {
 		}
 	}
 	check(plainOk, "textures: default set is plain colors");
+
+	// --- per-face resolution chains (pass 28) ---
+	{
+		using vv::voxel::kVoxelFaceSuffixChain;
+		const char* want[6][3] = {
+		    {"_top", "", nullptr},
+		    {"_bottom", "", nullptr},
+		    {"_back", "_side", ""},
+		    {"_front", "_side", ""},
+		    {"_right", "_side", ""},
+		    {"_left", "_side", ""},
+		};
+		bool chainOk = true;
+		for (int face = 0; face < 6; ++face) {
+			for (int c = 0; c < 3; ++c) {
+				const char* got = kVoxelFaceSuffixChain[face][c];
+				const char* exp = want[face][c];
+				if ((got == nullptr) != (exp == nullptr) ||
+				    (got != nullptr && std::string(got) != exp)) {
+					chainOk = false;
+				}
+			}
+		}
+		check(chainOk, "textures: per-face candidate chains");
+
+		// Mirror of the loader's per-face walk: given the set of
+		// existing suffixes, each face takes its first existing
+		// candidate; nullptr = no file (plain color for that face).
+		const auto resolve = [&](std::uint32_t face,
+		                         const std::vector<std::string>& existing) {
+			for (const char* s : kVoxelFaceSuffixChain[face]) {
+				if (s == nullptr) {
+					break;
+				}
+				if (std::find(existing.begin(), existing.end(), s) !=
+				    existing.end()) {
+					return std::string(s);
+				}
+			}
+			return std::string();
+		};
+
+		// THE reported scenario: grass_top.png + grass_side.png, no
+		// bottom file. Old rule: no complete side-uniform set -> the
+		// WHOLE type plain (the alias then textured only the bottom).
+		// New rule: top + all 4 sides textured, bottom waits for an
+		// alias (or stays plain).
+		{
+			const std::vector<std::string> files = {"_top", "_side"};
+			std::string perFace[6];
+			for (std::uint32_t f = 0; f < 6; ++f) {
+				perFace[f] = resolve(f, files);
+			}
+			check(perFace[0] == "_top" &&
+			          perFace[2] == "_side" && perFace[3] == "_side" &&
+			          perFace[4] == "_side" && perFace[5] == "_side" &&
+			          perFace[1].empty(),
+			      "textures: partial set works per face "
+			      "(grass top+side, bottom missing)");
+		}
+		// Complete custom set: every face its own file.
+		{
+			const std::vector<std::string> files = {
+			    "_top", "_bottom", "_back", "_front", "_right",
+			    "_left", "_side", ""};
+			bool ok = true;
+			const char* wantFace[6] = {"_top", "_bottom", "_back",
+			                           "_front", "_right", "_left"};
+			for (std::uint32_t f = 0; f < 6; ++f) {
+				ok = ok && resolve(f, files) == wantFace[f];
+			}
+			check(ok, "textures: complete custom set uses per-face files");
+		}
+		// Side file only: sides textured, top/bottom plain.
+		{
+			const std::vector<std::string> files = {"_side"};
+			check(resolve(0, files).empty() && resolve(1, files).empty() &&
+			          resolve(3, files) == "_side",
+			      "textures: side-only set textures just the sides");
+		}
+		// Custom front + uniform file: front specific, rest uniform.
+		{
+			const std::vector<std::string> files = {"_front", ""};
+			check(resolve(3, files) == "_front" &&
+			          resolve(0, files) == "" &&
+			          resolve(2, files) == "",
+			      "textures: custom face beats the uniform fallback");
+		}
+	}
+
+	// --- alias source resolution (per-face; pass 28) ---
+	{
+		using vv::voxel::VoxelTextureSet;
+		using vv::voxel::kNoFaceTexture;
+		// A uniform source: all faces share image 7.
+		VoxelTextureSet uni;
+		uni.textured = true;
+		for (std::uint32_t f = 0; f < 6; ++f) {
+			uni.faceIndex[f] = 7;
+		}
+		// A partial side-uniform source: top=3, sides=9, no bottom.
+		VoxelTextureSet partial;
+		partial.textured = true;
+		partial.faceIndex[0] = 3;
+		partial.faceIndex[2] = partial.faceIndex[3] = 9;
+		partial.faceIndex[4] = partial.faceIndex[5] = 9;
+
+		check(vv::voxel::resolveFaceTextureIndex(uni, "bottom") == 7u,
+		      "textures: uniform source serves any face");
+		check(vv::voxel::resolveFaceTextureIndex(partial, "top") == 3u &&
+		          vv::voxel::resolveFaceTextureIndex(partial, "bottom") ==
+		              kNoFaceTexture &&
+		          vv::voxel::resolveFaceTextureIndex(partial, "front") ==
+		              9u,
+		      "textures: partial source resolves per face");
+		check(vv::voxel::resolveFaceTextureIndex(partial, "side") == 9u,
+		      "textures: 'side' resolves to the side texture");
+		check(vv::voxel::resolveFaceTextureIndex(partial, "wat") ==
+		          kNoFaceTexture,
+		      "textures: unknown face name -> no texture");
+		const VoxelTextureSet untextured{};
+		check(vv::voxel::resolveFaceTextureIndex(untextured, "top") ==
+		          kNoFaceTexture,
+		      "textures: untextured source -> no texture");
+
+		// Face name mapping round trip.
+		bool namesOk = true;
+		const char* names[6] = {"top", "bottom", "back",
+		                        "front", "right", "left"};
+		for (std::uint32_t f = 0; f < 6; ++f) {
+			std::uint32_t id = 99;
+			namesOk = namesOk &&
+			          vv::voxel::voxelFaceIdFromName(names[f], id) &&
+			          id == f &&
+			          std::string(vv::voxel::voxelFaceNameOfId(f)) ==
+			              names[f];
+		}
+		std::uint32_t dummy = 0;
+		namesOk = namesOk &&
+		          !vv::voxel::voxelFaceIdFromName("sides", dummy);
+		check(namesOk, "textures: face name <-> id mapping");
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -95,6 +95,22 @@ go too): file-based voxel textures + pass-22 aliases intact, sun
 shadows back to the single exact binary march, no light grid, no cone
 machinery. Owner-verified base: 3ff725f.
 
+Pass 28 (textures): PARTIAL TEXTURE SETS NOW WORK PER FACE. Owner
+report: grass_top.png + grass_side.png + "grass bottom = dirt" in
+aliases.txt still rendered grass as plain colors. Root cause: a mode
+only applied when ALL its files existed (the README's own example was
+impossible), so grass had no complete side-uniform set -> entirely
+plain, and the alias then textured only the rarely-visible bottom face.
+Fix: per-face resolution - each face independently uses the first of
+its candidate files that exists (top/bottom: _top/_bottom then the
+uniform file; side faces: the custom name, then _side, then uniform);
+unresolved faces stay plain or take an alias. The startup log now says
+per type "N files, M/6 faces (missing: bottom ...)" so gaps point at
+their fix. Pure logic (suffix chains, face-name mapping, alias-source
+resolution) moved to voxel/VoxelTextures.hpp and unit tested incl. the
+exact reported scenario. README/header docs updated. Validated: both
+builds warning-free, ctest green, smoke ok.
+
 Pass 27 (first of the fix-one-by-one round): STREAMING PRIORITY WAS
 BACKWARDS. The pump stocks m_genRequests by iterating the sorted
 pending list in reverse (best first), but the workers popped the BACK -

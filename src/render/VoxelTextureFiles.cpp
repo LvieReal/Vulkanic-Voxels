@@ -48,33 +48,8 @@ bool loadImageRGBA(const std::filesystem::path& path,
 	return true;
 }
 
-// Face ids match voxel/VoxelTextures.hpp: 0 = +Y top, 1 = -Y bottom,
-// 2 = +X back, 3 = -X front, 4 = +Z right, 5 = -Z left.
-bool faceIdFromName(const std::string& name, std::uint32_t& faceId) {
-	if (name == "top") {
-		faceId = 0;
-	} else if (name == "bottom") {
-		faceId = 1;
-	} else if (name == "back") {
-		faceId = 2;
-	} else if (name == "front") {
-		faceId = 3;
-	} else if (name == "right") {
-		faceId = 4;
-	} else if (name == "left") {
-		faceId = 5;
-	} else {
-		return false;
-	}
-	return true;
-}
-
-const char* faceNameOfId(std::uint32_t faceId) {
-	static const char* kNames[6] = {"top", "bottom", "back",
-																	"front", "right", "left"};
-	return faceId < 6 ? kNames[faceId] : "top";
-}
-
+// Face ids/names and alias-source resolution live in
+// voxel/VoxelTextures.hpp now (unit tested there).
 int voxelTypeFromName(const std::string& name) {
 	for (std::uint32_t t = 0; t < vv::voxel::kVoxelTypeCount; ++t) {
 		if (name == vv::voxel::kVoxelTypeNames[t]) {
@@ -82,33 +57,6 @@ int voxelTypeFromName(const std::string& name) {
 		}
 	}
 	return -1;
-}
-
-// Resolves a face NAME through a source type's mode to one of the
-// source set's image indices (see the header comment).
-std::uint32_t resolveSourceFaceIndex(const vv::voxel::VoxelTextureSet& set,
-																		 vv::voxel::VoxelTextureMode mode,
-																		 const std::string& name) {
-	if (!set.textured) {
-		return vv::voxel::kNoFaceTexture;
-	}
-	if (mode == vv::voxel::VoxelTextureMode::Uniform) {
-		return set.faceIndex[0];
-	}
-	if (mode == vv::voxel::VoxelTextureMode::SideUniform) {
-		if (name == "top") {
-			return set.faceIndex[0];
-		}
-		if (name == "bottom") {
-			return set.faceIndex[1];
-		}
-		return set.faceIndex[2];  // every side-ish name
-	}
-	std::uint32_t faceId = 0;
-	if (!faceIdFromName(name, faceId)) {
-		return vv::voxel::kNoFaceTexture;
-	}
-	return set.faceIndex[faceId];
 }
 
 std::string trim(const std::string& s) {
@@ -139,66 +87,71 @@ bool loadVoxelTextureFiles(
 	// Deduplicate repeated file paths across types (aliases and types
 	// sharing art upload each file once).
 	std::map<std::filesystem::path, std::uint32_t> imageIndexOf;
-	std::vector<vv::voxel::VoxelTextureMode> modes(
-			vv::voxel::kVoxelTypeCount, vv::voxel::VoxelTextureMode::Uniform);
 
-	// Most specific mode first: custom (6 files), side-uniform (3),
-	// uniform (1). A mode counts only when ALL its files exist.
-	const vv::voxel::VoxelTextureMode modesByDetail[] = {
-			vv::voxel::VoxelTextureMode::Custom,
-			vv::voxel::VoxelTextureMode::SideUniform,
-			vv::voxel::VoxelTextureMode::Uniform};
-
+	// PER-FACE resolution (pass 28): every face independently uses the
+	// first of its candidate files that exists (kVoxelFaceSuffixChain,
+	// most specific first); a face with no file keeps kNoFaceTexture
+	// (plain color) unless an alias fills it below. This replaces the
+	// old rule that a mode only applied when ALL its files existed -
+	// which made the README's own example (grass_top + grass_side +
+	// "grass bottom = dirt") render grass as PLAIN COLORS: no complete
+	// side-uniform set, so nothing applied and the alias textured only
+	// the rarely-visible bottom face.
 	for (std::uint32_t type = 1; type < vv::voxel::kVoxelTypeCount; ++type) {
 		const std::string name = vv::voxel::kVoxelTypeNames[type];
-		bool done = false;
-		for (vv::voxel::VoxelTextureMode mode : modesByDetail) {
-			const std::uint32_t files = vv::voxel::voxelTextureFileCount(mode);
-
-			// Resolve every file of the mode first; bail out on any miss.
-			std::vector<vv::voxel::VoxelTextureImage> loaded(files);
-			std::vector<std::filesystem::path> paths(files);
-			bool complete = true;
-			for (std::uint32_t f = 0; f < files; ++f) {
-				paths[f] = dir / (name + vv::voxel::voxelTextureSuffix(mode, f) +
-													".png");
-				if (!loadImageRGBA(paths[f], loaded[f])) {
-					complete = false;
+		vv::voxel::VoxelTextureSet& set = outSets[type];
+		std::uint32_t facesFromFile = 0;
+		std::uint32_t fileCount = 0;
+		for (std::uint32_t face = 0; face < 6; ++face) {
+			for (const char* suffix :
+			     vv::voxel::kVoxelFaceSuffixChain[face]) {
+				if (suffix == nullptr) {
 					break;
 				}
-			}
-			if (!complete) {
-				continue;
-			}
-
-			vv::voxel::VoxelTextureSet& set = outSets[type];
-			set.textured = true;
-			for (std::uint32_t face = 0; face < 6; ++face) {
-				const std::uint32_t f = vv::voxel::faceTextureFile(mode, face);
-				auto it = imageIndexOf.find(paths[f]);
-				if (it == imageIndexOf.end()) {
-					it = imageIndexOf
-									 .emplace(paths[f],
-														static_cast<std::uint32_t>(outImages.size()))
-									 .first;
-					outImages.push_back(std::move(loaded[f]));
+				const std::filesystem::path path =
+				    dir / (name + suffix + ".png");
+				if (!fileExists(path)) {
+					continue;
 				}
-				set.faceIndex[face] = it->second;
+				vv::voxel::VoxelTextureImage img;
+				if (!loadImageRGBA(path, img)) {
+					continue;  // unreadable: try the next candidate
+				}
+				std::uint32_t idx = 0;
+				auto it = imageIndexOf.find(path);
+				if (it == imageIndexOf.end()) {
+					idx = static_cast<std::uint32_t>(outImages.size());
+					imageIndexOf.emplace(path, idx);
+					outImages.push_back(std::move(img));
+					++fileCount;
+				} else {
+					idx = it->second;
+				}
+				set.faceIndex[face] = idx;
+				++facesFromFile;
+				break;
 			}
-			modes[type] = mode;
-			const char* modeName = mode == vv::voxel::VoxelTextureMode::Custom
-																 ? "custom"
-																 : (mode == vv::voxel::VoxelTextureMode::SideUniform
-																				? "side-uniform"
-																				: "uniform");
-			outLog += "voxel textures: " + name + " -> " + modeName + " (" +
-								std::to_string(files) + " files)\n";
-			done = true;
-			break;
 		}
-		if (!done) {
+		set.textured = facesFromFile > 0;
+		if (facesFromFile == 0) {
 			outLog += "voxel textures: " + name +
-								" -> plain colors (no files)\n";
+			           " -> plain colors (no files)\n";
+		} else if (facesFromFile == 6) {
+			outLog += "voxel textures: " + name + " -> " +
+			           std::to_string(fileCount) + " files, 6/6 faces\n";
+		} else {
+			// Partial: say which faces are still untextured so the log
+			// points straight at the fix (add the file or an alias).
+			outLog += "voxel textures: " + name + " -> " +
+			           std::to_string(fileCount) + " files, " +
+			           std::to_string(facesFromFile) + "/6 faces (missing:";
+			for (std::uint32_t face = 0; face < 6; ++face) {
+				if (set.faceIndex[face] == vv::voxel::kNoFaceTexture) {
+					outLog += std::string(" ") +
+					           vv::voxel::voxelFaceNameOfId(face);
+				}
+			}
+			outLog += ")\n";
 		}
 	}
 
@@ -248,7 +201,7 @@ bool loadVoxelTextureFiles(
 					faceMask = 0x3Fu;
 				} else {
 					std::uint32_t faceId = 0;
-					if (!faceIdFromName(faceToken, faceId)) {
+					if (!vv::voxel::voxelFaceIdFromName(faceToken, faceId)) {
 						outLog += "voxel textures: alias skipped (unknown face): " +
 											line + "\n";
 						continue;
@@ -268,9 +221,11 @@ bool loadVoxelTextureFiles(
 						continue;
 					}
 					const std::string faceName =
-							sourceFace.empty() ? faceNameOfId(faceId) : sourceFace;
-					const std::uint32_t idx = resolveSourceFaceIndex(
-							src, modes[static_cast<std::size_t>(sourceIdx)], faceName);
+							sourceFace.empty()
+							    ? vv::voxel::voxelFaceNameOfId(faceId)
+							    : sourceFace;
+					const std::uint32_t idx = vv::voxel::resolveFaceTextureIndex(
+							src, faceName);
 					if (idx == vv::voxel::kNoFaceTexture) {
 						outLog += "voxel textures: alias face '" + faceName +
 											"' not present on source: " + line + "\n";

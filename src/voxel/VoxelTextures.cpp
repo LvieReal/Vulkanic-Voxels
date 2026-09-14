@@ -26,4 +26,44 @@ const char* voxelTextureSuffix(VoxelTextureMode mode, std::uint32_t file) {
 	}
 }
 
+bool voxelFaceIdFromName(const std::string& name, std::uint32_t& faceId) {
+	if (name == "top") {
+		faceId = 0;
+	} else if (name == "bottom") {
+		faceId = 1;
+	} else if (name == "back") {
+		faceId = 2;
+	} else if (name == "front") {
+		faceId = 3;
+	} else if (name == "right") {
+		faceId = 4;
+	} else if (name == "left") {
+		faceId = 5;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+const char* voxelFaceNameOfId(std::uint32_t faceId) {
+	static const char* kNames[6] = {"top", "bottom", "back",
+													 "front", "right", "left"};
+	return faceId < 6 ? kNames[faceId] : "top";
+}
+
+std::uint32_t resolveFaceTextureIndex(const VoxelTextureSet& set,
+                                      const std::string& sourceFaceName) {
+	if (!set.textured) {
+		return kNoFaceTexture;
+	}
+	if (sourceFaceName == "side" || sourceFaceName == "sides") {
+		return set.faceIndex[2];
+	}
+	std::uint32_t faceId = 0;
+	if (!voxelFaceIdFromName(sourceFaceName, faceId)) {
+		return kNoFaceTexture;
+	}
+	return set.faceIndex[faceId];
+}
+
 }  // namespace vv::voxel

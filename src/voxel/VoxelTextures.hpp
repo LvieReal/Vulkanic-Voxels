@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace vv::voxel {
@@ -59,6 +60,30 @@ constexpr std::uint32_t faceTextureFile(VoxelTextureMode mode,
 									: faceId);
 }
 
+// Per-face FILE resolution (pass 28). A type no longer needs a
+// COMPLETE mode set: every face independently uses the FIRST of its
+// candidate files that exists (most specific first), and faces with no
+// file fall back to plain colors (or an alias). The candidate chain
+// per face id: top/bottom try their own name then the uniform file;
+// each side face tries its custom name, then the shared side file,
+// then the uniform file. nullptr terminates a chain.
+//
+// This is what makes the README's own example work: grass_top.png +
+// grass_side.png + "grass bottom = dirt" (aliases.txt) previously
+// produced PLAIN grass (no complete side-uniform set), with the alias
+// texturing only the invisible bottom face.
+constexpr const char* kVoxelFaceSuffixChain[6][3] = {
+    {"_top", "", nullptr},     {"_bottom", "", nullptr},
+    {"_back", "_side", ""},    {"_front", "_side", ""},
+    {"_right", "_side", ""},   {"_left", "_side", ""},
+};
+
+// Face NAME <-> face id (alias parsing and log messages): top, bottom,
+// back, front, right, left. Pure - unit tested.
+bool voxelFaceIdFromName(const std::string& name, std::uint32_t& faceId);
+const char* voxelFaceNameOfId(std::uint32_t faceId);
+
+
 // One RGBA8 image (any size; squareness not required). Produced by the
 // file loader (vv::render::loadVoxelTextureFiles) and consumed by
 // VoxelResources::createVoxelTextures.
@@ -87,5 +112,15 @@ struct VoxelTextureSet {
 																kNoFaceTexture, kNoFaceTexture};
 	std::uint32_t nominalSize = 32;
 };
+
+// Resolves a source-face NAME against a type's per-face assignments
+// (alias source resolution): a specific face name returns that face's
+// image; "side"/"sides" returns the back face's image (side-uniform
+// sources share one file across sides); anything else (or an
+// untextured source) yields kNoFaceTexture. A uniform source serves
+// every name because all six faces hold its single image. Pure - unit
+// tested.
+std::uint32_t resolveFaceTextureIndex(const VoxelTextureSet& set,
+                                      const std::string& sourceFaceName);
 
 }  // namespace vv::voxel

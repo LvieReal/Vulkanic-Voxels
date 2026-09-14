@@ -8,22 +8,29 @@ One file set per voxel type, named after the type (lowercase):
 `air` (never sampled), `grass`, `dirt`, `stone`, `sand`, `snow`,
 `bedrock`.
 
-Three definition modes per type - the most specific COMPLETE set of
-files wins (custom > side-uniform > uniform):
+Face resolution is PER FACE (pass 28): each face independently uses
+the most specific file that exists, falling back down this chain:
 
-| Mode         | Files                                                    | Faces |
-|--------------|----------------------------------------------------------|-------|
-| uniform      | `<name>.png`                                             | all 6 faces share one texture |
-| side-uniform | `<name>_top.png` `<name>_bottom.png` `<name>_side.png`   | top / bottom / all 4 sides |
-| custom       | `<name>_top.png` `<name>_bottom.png` `<name>_front.png` `<name>_back.png` `<name>_right.png` `<name>_left.png` | every face its own |
+| Face           | File candidates, in order                                  |
+|----------------|------------------------------------------------------------|
+| top            | `<name>_top.png` → `<name>.png`                             |
+| bottom         | `<name>_bottom.png` → `<name>.png`                          |
+| each side face | `<name>_front/_back/_right/_left.png` → `<name>_side.png` → `<name>.png` |
+
+So complete sets behave like the three classic modes (uniform = one
+file everywhere; side-uniform = top/bottom/side; custom = six files),
+but PARTIAL sets now work too: e.g. `grass_top.png` + `grass_side.png`
+gives grass a textured top and sides while the bottom falls back to an
+alias or the plain color.
 
 Custom face names map to world axes: **front = −X**, **back = +X**,
 **right = +Z**, **left = −Z** (top = +Y, bottom = −Y).
 
 Notes:
 
-- A mode only applies when ALL of its files exist; a type with no
-  complete set uses plain colors.
+- A face with no file (and no alias) uses the plain palette color; a
+  type with no files at all is entirely plain. The startup log lists
+  per type how many faces got files and which are still missing.
 - Reuse another type's textures instead of duplicating files with an
   optional `aliases.txt` in this directory:
 
@@ -35,10 +42,10 @@ Notes:
 
   Faces: `top`, `bottom`, `front`, `back`, `right`, `left`, `sides`
   (all 4 sides), `all`. The source face defaults to the target face's
-  name, resolved through the SOURCE's mode (a uniform source serves any
-  face; a side-uniform source maps side faces to its side texture; a
-  custom source needs the explicit face name). Aliases override
-  file-based assignments for those faces.
+  name and resolves against the source's per-face assignments (a
+  uniform source serves any face; `side`/`sides` uses the source's side
+  texture). Aliases override file-based assignments for those faces
+  and can fill faces the files left plain.
 - Any reasonable PNG/JPG size works (square or not; mip chain is
   generated). Textures should be tileable - they repeat per voxel
   (1 texture unit = 1 voxel).

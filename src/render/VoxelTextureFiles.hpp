@@ -9,22 +9,23 @@
 namespace vv::render {
 
 // Loads the per-type voxel textures from a texture directory (see
-// resources/textures/voxels/README.md for the file naming and the three
-// definition modes). For every VoxelType the most specific complete
-// mode wins (custom 6 files > side-uniform 3 > uniform 1); a type whose
-// files are missing entirely falls back to plain palette colors
-// (set.textured = false) - which is exactly what happens in checkouts
-// without texture files, e.g. CI/sandboxes.
+// resources/textures/voxels/README.md for the file naming). Resolution
+// is PER FACE (pass 28): each face uses the most specific of its
+// candidate files that exists (own name > _side > uniform file); faces
+// without a file keep the plain palette color unless an alias fills
+// them. A type with no files at all is entirely plain
+// (set.textured = false) - e.g. checkouts without texture files
+// (CI/sandboxes).
 //
 // An optional aliases.txt in the directory reuses one type's textures
 // for another type's faces, e.g. "grass bottom = dirt" or
 // "grass sides = dirt side" (no file duplication). Lines:
 //   <type> <face> = <source type> [<source face>]
 // with face in {top, bottom, front, back, right, left, sides, all};
-// the source face defaults to the target face's name, resolved through
-// the source's mode (a uniform source serves any face, side-uniform
-// maps side faces to its side texture). Aliases override file-based
-// face assignments.
+// the source face defaults to the target face's name and resolves
+// against the source's per-face assignments (a uniform source serves
+// any face; side/sides uses the source's side texture). Aliases
+// override file-based assignments and can fill plain faces.
 //
 // outImages receives one RGBA8 image per loaded FILE (deduplicated per
 // file path); outSets is resized to kVoxelTypeCount with faceIndex
