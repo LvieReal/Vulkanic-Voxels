@@ -44,6 +44,23 @@ class Chunk final {
 		return (static_cast<std::uint64_t>(m_sizeX) * m_sizeZ + 1u) / 2u;
 	}
 
+	// Per-BLOCK max height for the hierarchical DDA (pass 30): one u16
+	// per kHeightBlockVoxels^2 block of columns = the MAX column bound
+	// in the block (0 = whole block air). Layout: blockX + blockZ *
+	// blocksX, packed two per u32 (block i even -> low half) like the
+	// heightmap - a sync contract with the shader's BlockHeights buffer
+	// (binding 11). Recomputed together with the heightmap (dirty flag).
+	const std::vector<std::uint16_t>& blockHeightMap() const;
+	const std::vector<std::uint32_t>& blockHeightMapWords() const;
+	// Block-atlas slot stride in u32 words (sync contract with the
+	// shader).
+	std::uint64_t blockHeightWordStride() const {
+		const std::uint32_t b = kHeightBlockVoxels;
+		const std::uint64_t blocksX = (m_sizeX + b - 1u) / b;
+		const std::uint64_t blocksZ = (m_sizeZ + b - 1u) / b;
+		return (blocksX * blocksZ + 1u) / 2u;
+	}
+
 	vv::voxel::VoxelType get(std::uint32_t x, std::uint32_t y,
 													 std::uint32_t z) const;
 	void set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
@@ -69,6 +86,8 @@ class Chunk final {
 
 	mutable std::vector<std::uint16_t> m_heightMap;
 	mutable std::vector<std::uint32_t> m_heightMapWords;
+	mutable std::vector<std::uint16_t> m_blockHeightMap;
+	mutable std::vector<std::uint32_t> m_blockHeightMapWords;
 	mutable bool m_heightMapDirty = true;
 };
 

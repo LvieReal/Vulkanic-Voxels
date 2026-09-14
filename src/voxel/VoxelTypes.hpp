@@ -23,6 +23,14 @@ enum class VoxelType : std::uint8_t {
 
 constexpr std::uint32_t kVoxelTypeCount = 7;
 
+// Hierarchical-DDA block size (pass 30): the near march skips whole
+// kHeightBlockVoxels^2 column blocks whose max height bound stays below
+// the ray. Must divide chunkSizeX/Z (32/8 = 4 blocks per chunk side) and
+// matches kBlockVoxels in resources/shaders/pixels_rgba.comp - a sync
+// contract (see Chunk::blockHeightMapWords and the shader's
+// BlockHeights buffer, binding 11).
+constexpr std::uint32_t kHeightBlockVoxels = 8;
+
 // Capacity of the GPU voxel palette, in entries per face. Must match the
 // array sizes in the shader's VoxelPalette block (top/side/bottom[8]).
 constexpr std::uint32_t kPaletteCapacity = 8;

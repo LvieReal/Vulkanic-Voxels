@@ -58,6 +58,27 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 		return false;
 	}
 
+	// Block max-height atlas (pass 30): u16 per kHeightBlockVoxels^2
+	// block, packed two per u32, one slot per chunk (8 words at 32^2
+	// chunks / 8-voxel blocks - tiny).
+	{
+		const std::uint32_t b = vv::voxel::kHeightBlockVoxels;
+		const std::uint64_t blocksX = (config.chunkSizeX + b - 1u) / b;
+		const std::uint64_t blocksZ = (config.chunkSizeZ + b - 1u) / b;
+		m_blockHeightSlotWords = (blocksX * blocksZ + 1u) / 2u;
+	}
+	const VkDeviceSize blockHeightBytes =
+			static_cast<VkDeviceSize>(m_slotCount) * m_blockHeightSlotWords * 4u;
+	if (!utils::createBuffer(device, physicalDevice, blockHeightBytes,
+	                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	                         m_blockHeightBuffer, m_blockHeightMemory,
+	                         outError)) {
+		cleanup(device);
+		return false;
+	}
+
 	// Per-slot fade-in alphas (binding 7; one float per atlas slot).
 	// HOST_VISIBLE + COHERENT: the renderer rewrites the whole (tiny)
 	// array every frame; the draw-frame barrier makes the writes visible
@@ -581,7 +602,8 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			return false;
 		}
 		totalBytes += static_cast<VkDeviceSize>(m_slotByteStride) +
-		              static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+			              static_cast<VkDeviceSize>(m_heightSlotWords) * 4u +
+			              static_cast<VkDeviceSize>(m_blockHeightSlotWords) * 4u;
 	}
 
 	// Wait for in-flight frames before mutating the atlas; region updates are
@@ -610,13 +632,17 @@ bool VoxelResources::uploadChunks(VkDevice device,
 	std::memset(mapped, 0, static_cast<std::size_t>(totalBytes));
 	{
 		// Staging layout: [voxel data for all uploads][heightmaps for all
-		// uploads], so each section is copied with contiguous per-upload
-		// regions.
+		// uploads][block maxima for all uploads], so each section is
+		// copied with contiguous per-upload regions.
 		std::size_t voxelOffset = 0;
 		std::size_t heightOffset =
 				static_cast<std::size_t>(m_slotByteStride) * uploads.size();
 		const std::size_t heightBytesPerSlot =
 				static_cast<std::size_t>(m_heightSlotWords) * 4u;
+		std::size_t blockOffset = heightOffset +
+		        heightBytesPerSlot * uploads.size();
+		const std::size_t blockBytesPerSlot =
+		        static_cast<std::size_t>(m_blockHeightSlotWords) * 4u;
 		for (const ChunkUpload& upload : uploads) {
 			const auto& types = upload.chunk->voxelTypes();
 			std::memcpy(static_cast<std::uint8_t*>(mapped) + voxelOffset,
@@ -627,6 +653,11 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			std::memcpy(static_cast<std::uint8_t*>(mapped) + heightOffset,
 									heights.data(), heights.size() * sizeof(std::uint32_t));
 			heightOffset += heightBytesPerSlot;
+			const auto& blocks = upload.chunk->blockHeightMapWords();
+			std::memcpy(static_cast<std::uint8_t*>(mapped) + blockOffset,
+			            blocks.data(),
+			            blocks.size() * sizeof(std::uint32_t));
+			blockOffset += blockBytesPerSlot;
 		}
 	}
 	vkUnmapMemory(device, stagingMemory);
@@ -665,7 +696,9 @@ bool VoxelResources::uploadChunks(VkDevice device,
 	// bound 0 -> every ray was air-skipped -> "voxels disappeared".)
 	std::vector<VkBufferCopy> voxelRegions;
 	std::vector<VkBufferCopy> heightRegions;
+	std::vector<VkBufferCopy> blockRegions;
 	voxelRegions.reserve(uploads.size());
+	blockRegions.reserve(uploads.size());
 	heightRegions.reserve(uploads.size());
 	{
 		VkDeviceSize voxelOffset = 0;
@@ -674,6 +707,11 @@ bool VoxelResources::uploadChunks(VkDevice device,
 				static_cast<VkDeviceSize>(uploads.size());
 		const VkDeviceSize heightBytesPerSlot =
 				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+		VkDeviceSize blockOffset = heightOffset +
+		        heightBytesPerSlot *
+		                static_cast<VkDeviceSize>(uploads.size());
+		const VkDeviceSize blockBytesPerSlot =
+		        static_cast<VkDeviceSize>(m_blockHeightSlotWords) * 4u;
 		for (const ChunkUpload& upload : uploads) {
 			VkBufferCopy voxelRegion{};
 			voxelRegion.srcOffset = voxelOffset;
@@ -690,14 +728,25 @@ bool VoxelResources::uploadChunks(VkDevice device,
 			heightRegion.size = heightBytesPerSlot;
 			heightRegions.push_back(heightRegion);
 			heightOffset += heightBytesPerSlot;
+
+			VkBufferCopy blockRegion{};
+			blockRegion.srcOffset = blockOffset;
+			blockRegion.dstOffset =
+					static_cast<VkDeviceSize>(upload.slot) * blockBytesPerSlot;
+			blockRegion.size = blockBytesPerSlot;
+			blockRegions.push_back(blockRegion);
+			blockOffset += blockBytesPerSlot;
 		}
 	}
 	vkCmdCopyBuffer(cmd, stagingBuffer, m_voxelBuffer,
 								 static_cast<std::uint32_t>(voxelRegions.size()),
 								 voxelRegions.data());
 	vkCmdCopyBuffer(cmd, stagingBuffer, m_heightBuffer,
-								 static_cast<std::uint32_t>(heightRegions.size()),
-								 heightRegions.data());
+	                static_cast<std::uint32_t>(heightRegions.size()),
+	                heightRegions.data());
+	vkCmdCopyBuffer(cmd, stagingBuffer, m_blockHeightBuffer,
+	                static_cast<std::uint32_t>(blockRegions.size()),
+	                blockRegions.data());
 
 	if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 		outError = "Failed to end chunk upload command buffer.";
@@ -745,7 +794,8 @@ bool VoxelResources::uploadChunksStreaming(
 	// pre-write wait targets a submit TWO uploads old - always retired.
 	if (m_streamStaging[0] == VK_NULL_HANDLE) {
 		const VkDeviceSize bytes = static_cast<VkDeviceSize>(m_slotByteStride) +
-				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+				static_cast<VkDeviceSize>(m_heightSlotWords) * 4u +
+				static_cast<VkDeviceSize>(m_blockHeightSlotWords) * 4u;
 		for (std::uint32_t k = 0; k < 2; ++k) {
 			if (!utils::createBuffer(device, physicalDevice, bytes,
 														 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -793,13 +843,18 @@ bool VoxelResources::uploadChunksStreaming(
 		m_streamFencePending[idx] = false;
 	}
 
-	// Staging layout: [voxel bytes][heightmap words].
+	// Staging layout: [voxel bytes][heightmap words][block maxima].
 	const auto& types = upload.chunk->voxelTypes();
 	std::memcpy(m_streamStagingMapped[idx], types.data(), types.size());
 	const auto& heights = upload.chunk->heightMapWords();
 	std::memcpy(static_cast<std::uint8_t*>(m_streamStagingMapped[idx]) +
 								static_cast<std::size_t>(m_slotByteStride),
 					heights.data(), heights.size() * sizeof(std::uint32_t));
+	const auto& blocks = upload.chunk->blockHeightMapWords();
+	std::memcpy(static_cast<std::uint8_t*>(m_streamStagingMapped[idx]) +
+	                    static_cast<std::size_t>(m_slotByteStride) +
+	                    static_cast<std::size_t>(m_heightSlotWords) * 4u,
+	            blocks.data(), blocks.size() * sizeof(std::uint32_t));
 
 	VkResult r = vkResetCommandBuffer(m_streamCmd[idx], 0);
 	if (r != VK_SUCCESS) {
@@ -829,6 +884,16 @@ bool VoxelResources::uploadChunksStreaming(
 														static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
 	vkCmdCopyBuffer(m_streamCmd[idx], m_streamStaging[idx], m_heightBuffer, 1,
 								&heightRegion);
+	VkBufferCopy blockRegion{};
+	blockRegion.srcOffset =
+			static_cast<VkDeviceSize>(m_slotByteStride) +
+			static_cast<VkDeviceSize>(m_heightSlotWords) * 4u;
+	blockRegion.size = static_cast<VkDeviceSize>(m_blockHeightSlotWords) * 4u;
+	blockRegion.dstOffset =
+			static_cast<VkDeviceSize>(upload.slot) *
+			static_cast<VkDeviceSize>(m_blockHeightSlotWords) * 4u;
+	vkCmdCopyBuffer(m_streamCmd[idx], m_streamStaging[idx],
+	                m_blockHeightBuffer, 1, &blockRegion);
 	r = vkEndCommandBuffer(m_streamCmd[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to end streaming command buffer.";
@@ -1132,6 +1197,14 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_heightMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_heightMemory, nullptr);
 		m_heightMemory = VK_NULL_HANDLE;
+	}
+	if (m_blockHeightBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_blockHeightBuffer, nullptr);
+		m_blockHeightBuffer = VK_NULL_HANDLE;
+	}
+	if (m_blockHeightMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_blockHeightMemory, nullptr);
+		m_blockHeightMemory = VK_NULL_HANDLE;
 	}
 	if (m_mappedFade != nullptr) {
 		vkUnmapMemory(device, m_fadeMemory);

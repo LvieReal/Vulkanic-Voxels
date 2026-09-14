@@ -450,6 +450,43 @@ void testChunkHeightMap() {
 	}
 	check(packed, "heightmap: u16 pairs packed two-per-u32");
 
+	// Block max-height atlas (pass 30): the 8x8x16 test chunk is exactly
+	// ONE block, so its bound = the max column bound; set() must
+	// invalidate the cache.
+	check(chunk.blockHeightWordStride() == 1,
+			"blockmap: 8x8 chunk has a single 1-word block slot");
+	check(chunk.blockHeightMap().size() == 1,
+			"blockmap: 8x8 chunk has exactly one block");
+	check(chunk.blockHeightMap()[0] == 16,
+			"blockmap: single block bound is the max column bound");
+	{
+		const std::uint32_t w0 = chunk.blockHeightMapWords()[0];
+		check((w0 & 0xFFFFu) == 16u && (w0 >> 16u) == 0u,
+				"blockmap: block 0 packed in the low half, high half 0");
+	}
+	chunk.set(4, 15, 4, vv::voxel::VoxelType::Stone);
+	check(chunk.heightMap()[4 + 4 * 8] == 16 &&
+			chunk.blockHeightMap()[0] == 16,
+			"blockmap: set() re-dirties the block map (still 16)");
+	chunk.set(4, 7, 4, vv::voxel::VoxelType::Air);
+	check(chunk.blockHeightMap()[0] == 16,
+			"blockmap: clearing the top solid keeps the block bound");
+
+	// A chunk whose size is NOT a multiple of the block size rounds UP
+	// the block grid (9 columns -> 2 blocks per axis).
+	{
+		vv::voxel::Chunk odd(0, 0, 9, 16, 9);
+		odd.set(8, 4, 8, vv::voxel::VoxelType::Stone);
+		check(odd.blockHeightWordStride() == 2,
+				"blockmap: 9x9 chunk rounds up to 2x2 blocks (2 words)");
+		check(odd.blockHeightMap().size() == 4,
+				"blockmap: 9x9 chunk has 4 block entries");
+		check(odd.blockHeightMap()[1 + 1 * 2] == 5,
+				"blockmap: corner block holds the max of its columns");
+		check(odd.blockHeightMap()[0] == 0,
+				"blockmap: empty block stays 0");
+	}
+
 	// Generated chunks: heightmap equals an independent scan of their data.
 	vv::voxel::World world(vv::terrain::TerrainConfig{}, 32, 128, 32);
 	std::vector<const vv::voxel::Chunk*> created;
@@ -473,6 +510,39 @@ void testChunkHeightMap() {
 		}
 	}
 	check(genMatches, "heightmap: generated chunks match ground-truth scan");
+
+	// Block atlas on generated 32x32 chunks: 4x4 blocks, 8 words, each
+	// entry = max over its 64 columns, packed two per u32 (even block
+	// index -> low half).
+	bool blockOk = true;
+	for (const vv::voxel::Chunk* c : created) {
+		check(c->blockHeightWordStride() == 8,
+				"blockmap: 32x32 chunk slot is 8 words (16 blocks)");
+		for (std::uint32_t bz = 0; bz < 4 && blockOk; ++bz) {
+			for (std::uint32_t bx = 0; bx < 4 && blockOk; ++bx) {
+				std::uint16_t expected = 0;
+				for (std::uint32_t z = bz * 8; z < bz * 8 + 8; ++z) {
+					for (std::uint32_t x = bx * 8; x < bx * 8 + 8; ++x) {
+						expected = std::max(
+							expected,
+							c->heightMap()[std::size_t(x) +
+							               std::size_t(z) * 32]);
+					}
+				}
+				const std::uint32_t blk = bx + bz * 4;
+				const std::uint32_t w =
+					c->blockHeightMapWords()[std::size_t(blk >> 1)];
+				const std::uint32_t got =
+					((blk & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+				if (got != expected ||
+					c->blockHeightMap()[std::size_t(blk)] != expected) {
+					blockOk = false;
+				}
+			}
+		}
+	}
+	check(blockOk,
+			"blockmap: generated chunk blocks are column maxima, packed");
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +566,10 @@ struct TestWorld {
 	int wx = 64, wz = 64, wh = 48;
 	std::vector<std::uint8_t> cells;    // x + y*wx + z*wx*wh
 	std::vector<std::uint16_t> heights; // max solid + 1, 0xFFFF = no data
+	// Per 8x8 block of columns: the MAX column bound in the block (pass
+	// 30 hierarchical DDA mirror; same semantics as the shader's
+	// BlockHeights atlas). 0xFFFF = no data.
+	std::vector<std::uint16_t> blockBounds;
 
 	std::uint8_t at(int x, int y, int z) const {
 		if (x < 0 || x >= wx || y < 0 || y >= wh || z < 0 || z >= wz) {
@@ -524,6 +598,35 @@ struct TestWorld {
 				}
 			}
 		}
+		// Block maxima over the 8x8 grid (the test world models one big
+		// chunk, so the grid aligns with the world origin like the
+		// shader's per-chunk local grid).
+		const int bx = (wx + 7) / 8;
+		const int bz = (wz + 7) / 8;
+		blockBounds.assign(static_cast<std::size_t>(bx) * bz, 0);
+		for (int bzI = 0; bzI < bz; ++bzI) {
+			for (int bxI = 0; bxI < bx; ++bxI) {
+				std::uint16_t m = 0;
+				for (int z = bzI * 8; z < std::min((bzI + 1) * 8, wz); ++z) {
+					for (int x = bxI * 8; x < std::min((bxI + 1) * 8, wx); ++x) {
+						m = std::max(m, heights[x + z * wx]);
+					}
+				}
+				blockBounds[bxI + bzI * bx] = m;
+			}
+		}
+	}
+	// Max bound over the 8x8 block containing (x, z); 0xFFFF outside.
+	std::uint16_t blockBoundAt(int x, int z) const {
+		const int bx = (wx + 7) / 8;
+		const int bz = (wz + 7) / 8;
+		const int bxI = x / 8;
+		const int bzI = z / 8;
+		if (bxI < 0 || bxI >= bx || bzI < 0 || bzI >= bz) {
+			return 0xFFFFu;
+		}
+		return blockBounds[static_cast<std::size_t>(bxI) +
+		                   static_cast<std::size_t>(bzI) * bx];
 	}
 };
 
@@ -698,6 +801,182 @@ RayHit traceNew(const TestWorld& w, const double ro[3], const double rd[3],
 	return out;
 }
 
+static inline int bFloorDiv(int a, int b) {
+	return (a >= 0) ? (a / b) : -((-a + b - 1) / b);
+}
+
+struct TraceStats {
+	int columns = 0;         // per-column iterations actually run
+	int blockSkips = 0;      // whole-block skips taken
+	int skippedColumns = 0;  // DDA crossings inside skips (old cost)
+};
+
+// Hierarchical algorithm (pass 30): traceNew + the whole-block air-skip
+// over the 8x8 block max heights (mirror of the shader's BlockHeights
+// path, including the fast-forward, block-exit resume and the ulp-safety
+// re-entry guard). Must produce identical hits to traceOld/traceNew.
+RayHit traceHier(const TestWorld& w, const double ro[3], const double rd[3],
+							double tEnd, int budget, TraceStats* stats = nullptr) {
+	RayHit out;
+	double start[3] = {ro[0], ro[1], ro[2]};
+	for (int a = 0; a < 3; ++a) {
+		start[a] += rd[a] * 1e-4;
+	}
+	int cell[3] = {int(std::floor(start[0])), int(std::floor(start[1])),
+								 int(std::floor(start[2]))};
+	int step[2] = {(rd[0] > 0.0) ? 1 : -1, (rd[2] > 0.0) ? 1 : -1};
+	double tMax[2], tDelta[2];
+	for (int a = 0; a < 2; ++a) {
+		const int axis = (a == 0) ? 0 : 2;
+		tMax[a] = 1e30;
+		tDelta[a] = 1e30;
+		if (std::abs(rd[axis]) > 1e-6) {
+			const double next = double(cell[axis] + ((step[a] > 0) ? 1 : 0));
+			tMax[a] = (next - start[axis]) / rd[axis];
+			tDelta[a] = std::abs(1.0 / rd[axis]);
+		} else {
+			step[a] = 0;
+		}
+	}
+	const int worldTop = w.wh - 1;
+	int lastAxis = -1;
+	double t = 0.0;
+	int curBX = -0x40000000;  // current block (never a real block id)
+	int curBZ = -0x40000000;
+	bool curBlockSkippable = false;
+	double tBlockExitCache = 0.0;
+	for (int i = 0; i < budget; ++i) {
+		if (t >= tEnd) {
+			break;
+		}
+		const double tColExit = std::min(std::min(tMax[0], tMax[1]), tEnd);
+		const double y0 = start[1] + rd[1] * t;
+		const double y1 = start[1] + rd[1] * tColExit;
+		const double yMin = std::min(y0, y1);
+		// --- Hierarchical block skip (mirror of the shader) ---
+		const int bx = bFloorDiv(cell[0], 8);
+		const int bz = bFloorDiv(cell[2], 8);
+		if (bx != curBX || bz != curBZ) {
+			curBX = bx;
+			curBZ = bz;
+			double tBlockExit = tEnd;
+			if (std::abs(rd[0]) > 1e-6) {
+				const double edgeX =
+					double((bx + ((step[0] > 0) ? 1 : 0)) * 8);
+				tBlockExit = std::min(tBlockExit, (edgeX - start[0]) / rd[0]);
+			}
+			if (std::abs(rd[2]) > 1e-6) {
+				const double edgeZ =
+					double((bz + ((step[1] > 0) ? 1 : 0)) * 8);
+				tBlockExit = std::min(tBlockExit, (edgeZ - start[2]) / rd[2]);
+			}
+			const std::uint16_t blockMax = w.blockBoundAt(cell[0], cell[2]);
+			const double yBExit = start[1] + rd[1] * tBlockExit;
+			curBlockSkippable = (blockMax != 0xFFFFu) &&
+				(std::min(y0, yBExit) >= double(blockMax));
+			tBlockExitCache = tBlockExit;
+		}
+		if (curBlockSkippable) {
+			if (stats) {
+				++stats->blockSkips;
+			}
+			for (int g = 0; g < 2 * 8 + 2; ++g) {
+				const double tNext = std::min(tMax[0], tMax[1]);
+				if (tNext > tBlockExitCache) {
+					break;
+				}
+				t = tNext;
+				const bool ffx = tMax[0] < tMax[1];
+				tMax[0] += ffx ? tDelta[0] : 0.0;
+				tMax[1] += ffx ? 0.0 : tDelta[1];
+				cell[0] += ffx ? step[0] : 0;
+				cell[2] += ffx ? 0 : step[1];
+				lastAxis = ffx ? 0 : 2;
+				if (stats) {
+					++stats->skippedColumns;
+				}
+			}
+			if (t < tBlockExitCache) {
+				t = tBlockExitCache;
+			}
+			if (bFloorDiv(cell[0], 8) == curBX &&
+				bFloorDiv(cell[2], 8) == curBZ) {
+				curBlockSkippable = false;
+			}
+			continue;
+		}
+		if (stats) {
+			++stats->columns;
+		}
+		const std::uint16_t bound = w.boundAt(cell[0], cell[2]);
+		const bool skip = (bound != 0xFFFFu) && (yMin >= double(bound));
+		if (!skip) {
+			int yFirst = std::min(int(std::floor(y0)), worldTop);
+			if (bound != 0xFFFFu) {
+				yFirst = std::min(yFirst, int(bound) - 1);
+			}
+			const int yLast = int(std::floor(y1));
+			int yHit = -1;
+			bool entryCell = false;
+			if (rd[1] < 0.0) {
+				for (int y = yFirst; y >= std::max(yLast, 0); --y) {
+					if (w.at(cell[0], y, cell[2]) != 0) {
+						yHit = y;
+						entryCell = (y == int(std::floor(y0)));
+						break;
+					}
+				}
+			} else {
+				const int yTop = std::min(yLast, worldTop);
+				for (int y = std::max(yFirst, 0); y <= yTop; ++y) {
+					if (bound != 0xFFFFu && y >= int(bound)) {
+						break;
+					}
+					if (w.at(cell[0], y, cell[2]) != 0) {
+						yHit = y;
+						entryCell = (y == int(std::floor(y0)));
+						break;
+					}
+				}
+			}
+			if (yHit >= 0) {
+				out.hit = true;
+				out.cell[0] = cell[0];
+				out.cell[1] = yHit;
+				out.cell[2] = cell[2];
+				out.type = w.at(cell[0], yHit, cell[2]);
+				if (entryCell) {
+					out.t = t;
+					out.axis = lastAxis;
+					out.sign = (lastAxis < 0) ? 0
+								: (lastAxis == 0) ? -step[0] : -step[1];
+				} else if (rd[1] < 0.0) {
+					out.t = (double(yHit + 1) - start[1]) / rd[1];
+					out.axis = 1;
+					out.sign = 1;   // top face
+				} else {
+					out.t = (double(yHit) - start[1]) / rd[1];
+					out.axis = 1;
+					out.sign = -1;  // bottom face
+				}
+				return out;
+			}
+		}
+		if (tMax[0] < tMax[1]) {
+			t = tMax[0];
+			tMax[0] += tDelta[0];
+			cell[0] += step[0];
+			lastAxis = 0;
+		} else {
+			t = tMax[1];
+			tMax[1] += tDelta[1];
+			cell[2] += step[1];
+			lastAxis = 2;
+		}
+	}
+	return out;
+}
+
 void testTraversalParity() {
 	// World 1: pure heightfield (rolling hills) - the common case.
 	// World 2: heightfield + floating slabs + a carved hole + a wall -
@@ -752,6 +1031,9 @@ void testTraversalParity() {
 		};
 		int checked = 0;
 		int mismatches = 0;
+		long statColumns = 0;
+		long statBlockSkips = 0;
+		long statSkippedColumns = 0;
 		for (int ray = 0; ray < 6000; ++ray) {
 			double ro[3], rd[3];
 			if (ray % 6 == 0) {
@@ -810,12 +1092,23 @@ void testTraversalParity() {
 			}
 			const RayHit a = traceOld(w, ro, rd, tEnd, 4096);
 			const RayHit b = traceNew(w, ro, rd, tEnd, 4096);
+			TraceStats st;
+			const RayHit c = traceHier(w, ro, rd, tEnd, 4096, &st);
 			++checked;
-			const bool equal = (a.hit == b.hit) && (!a.hit ||
-					(a.cell[0] == b.cell[0] && a.cell[1] == b.cell[1] &&
-					 a.cell[2] == b.cell[2] && a.type == b.type &&
-					 a.axis == b.axis && a.sign == b.sign &&
-					 std::abs(a.t - b.t) < 1e-9));
+			statColumns += st.columns;
+			statBlockSkips += st.blockSkips;
+			statSkippedColumns += st.skippedColumns;
+			const bool equal = (a.hit == b.hit) && (a.hit == c.hit) &&
+				(!a.hit ||
+				 (a.cell[0] == b.cell[0] && a.cell[1] == b.cell[1] &&
+				  a.cell[2] == b.cell[2] && a.type == b.type &&
+				  a.axis == b.axis && a.sign == b.sign &&
+				  std::abs(a.t - b.t) < 1e-9)) &&
+				(!a.hit ||
+				 (a.cell[0] == c.cell[0] && a.cell[1] == c.cell[1] &&
+				  a.cell[2] == c.cell[2] && a.type == c.type &&
+				  a.axis == c.axis && a.sign == c.sign &&
+				  std::abs(a.t - c.t) < 1e-9));
 			if (!equal) {
 				if (++mismatches <= 3) {
 					std::printf("FAIL parity w%d ray %d: old(h=%d c=%d,%d,%d "
@@ -833,7 +1126,15 @@ void testTraversalParity() {
 					"traversal: column DDA parity with 3D DDA (heightfield + "
 					"overhang content)");
 		check(checked > 5000, "traversal: parity actually exercised");
-		std::printf("parity world %d: %d rays checked\n", worldKind, checked);
+		std::printf(
+			"parity world %d: %d rays checked, %ld column iterations, "
+			"%ld block skips covering %ld columns\n",
+			worldKind, checked, statColumns, statBlockSkips,
+			statSkippedColumns);
+		// The hierarchical skip must actually fire on these scenes
+		// (otherwise the mirror would be vacuously identical).
+		check(statBlockSkips > 1000,
+				"traversal: hierarchical block skip actually exercised");
 	}
 }
 

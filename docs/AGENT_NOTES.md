@@ -139,3 +139,23 @@ verifies before the next.
 
 Owner's stated next step after the shadow saga: their benchmark /
 optimization work (tips delivered in pass 20).
+
+Pass 30 (first optimization pass, owner-requested): HIERARCHICAL DDA.
+New per-chunk "block max" atlas: one u16 per 8x8 block of columns = the
+MAX column bound in the block (kHeightBlockVoxels in voxel/VoxelTypes.hpp
+== kBlockVoxels in the shader; 0 = all-air block), packed two per u32,
+8 words per 32x32 slot, uploaded with each chunk (binding 11, the slot
+freed by the light-grid revert). In the march's column loop: on entering
+a new block, one fetch decides whether the ray provably stays above
+every column of the block until it exits - if so the whole block is
+crossed with branchless ALU-only DDA steps (no chunk-table resolve, no
+column-height fetch, no Y-walk per column). Safety: block exit
+mid-column resumes exactly at the exit t; a re-entry guard handles
+ulp-level boundary misses (stops skipping that block, normal column
+logic advances out); kNoHeightData blocks are never skipped. The skip
+condition implies each skipped column's own air-skip condition, so the
+image is bit-identical. CPU mirror traceHier + 3-way parity
+(old/new/hierarchical, 6000 rays x 2 worlds) green; iteration counts:
+world 0 84,033 -> 36,259 (-57%), world 1 69,924 -> 33,668 (-52%).
+Block-map packing unit tests added (single-block chunk, 9x9 round-up,
+generated 32x32 chunks vs ground truth).

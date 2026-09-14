@@ -1731,15 +1731,24 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   texInfoBinding.descriptorCount = 1;
   texInfoBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // Block max-height atlas (pass 30 hierarchical DDA): u16 per
+  // kHeightBlockVoxels^2 block of columns, packed two per u32, one slot
+  // per chunk - lets the march skip whole empty blocks in one step.
+  VkDescriptorSetLayoutBinding blockHeightBinding{};
+  blockHeightBinding.binding = 11;
+  blockHeightBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  blockHeightBinding.descriptorCount = 1;
+  blockHeightBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
-      textureArrayBinding, textureSamplerBinding, texInfoBinding};
+      textureArrayBinding, textureSamplerBinding, texInfoBinding,
+      blockHeightBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 11;
+  info.bindingCount = 12;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -2125,9 +2134,10 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 8;  // voxel atlas, output, chunk table,
+  poolSizes[0].descriptorCount = 9;  // voxel atlas, output, chunk table,
                                     // palette, column heights, far LOD,
-                                    // chunk fade, texture info table
+                                    // chunk fade, texture info table,
+                                    // block max heights (pass 30)
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2198,7 +2208,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[11] = {};
+  VkWriteDescriptorSet writes[12] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2303,7 +2313,19 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[10].pBufferInfo = &texInfoInfo;
 
-  vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
+  // Block max-height atlas (pass 30; binding 11).
+  VkDescriptorBufferInfo blockHeightInfo{};
+  blockHeightInfo.buffer = m_voxelResources.blockHeightBuffer();
+  blockHeightInfo.offset = 0;
+  blockHeightInfo.range = VK_WHOLE_SIZE;
+  writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[11].dstSet = m_descriptorSet;
+  writes[11].dstBinding = 11;
+  writes[11].descriptorCount = 1;
+  writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[11].pBufferInfo = &blockHeightInfo;
+
+  vkUpdateDescriptorSets(m_device, 12, writes, 0, nullptr);
   return true;
 }
 

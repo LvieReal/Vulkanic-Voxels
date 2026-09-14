@@ -140,6 +140,11 @@ class VoxelResources final {
 	VkBuffer voxelBuffer() const { return m_voxelBuffer; }
 	VkBuffer chunkTableBuffer() const { return m_chunkTableBuffer; }
 	VkBuffer heightBuffer() const { return m_heightBuffer; }
+
+	// Block max-height atlas (pass 30 hierarchical DDA; binding 11): one
+	// u16 per kHeightBlockVoxels^2 block of columns, packed two per u32,
+	// one slot per chunk - same contract as the height atlas.
+	VkBuffer blockHeightBuffer() const { return m_blockHeightBuffer; }
 	VkBuffer fadeBuffer() const { return m_fadeBuffer; }
 
 	// Bindless texture array (one image per texture FILE plus the white
@@ -173,6 +178,8 @@ class VoxelResources final {
 
 	VkBuffer m_heightBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_heightMemory = VK_NULL_HANDLE;
+	VkBuffer m_blockHeightBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_blockHeightMemory = VK_NULL_HANDLE;
 
 	// Per-slot fade-in alphas (see writeChunkFade).
 	VkBuffer m_fadeBuffer = VK_NULL_HANDLE;
@@ -237,6 +244,7 @@ class VoxelResources final {
 	std::uint32_t m_slotCount = 0;
 	std::uint64_t m_slotByteStride = 0;
 	std::uint64_t m_heightSlotWords = 0;
+	std::uint64_t m_blockHeightSlotWords = 0;
 	std::uint64_t m_tableElements = 0;
 };
 

@@ -107,6 +107,16 @@ layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
     uint perType[];
 } voxelTexInfo;
 
+// Block max-height atlas (pass 30 hierarchical DDA): per chunk slot, one
+// u16 per kBlockVoxels^2 block of columns = the MAX column bound in the
+// block (0 = whole block air), packed two per u32 (block i even -> low
+// half), blockX + blockZ * blocksPerChunkX layout. Built by
+// Chunk::blockHeightMapWords and uploaded with each chunk.
+const int kBlockVoxels = 8;  // sync with vv::voxel::kHeightBlockVoxels
+layout(set = 0, binding = 11) readonly buffer BlockHeights {
+    uint data[];
+} blockHeights;
+
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
 uint farBase()
@@ -221,6 +231,26 @@ uint columnHeightBound(int voxX, int voxZ)
     const uint col = uint(local.x) + uint(local.y) * pc.chunkSize.x;
     const uint word = heights.data[slot * heightStride + (col >> 1u)];
     return ((col & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
+}
+
+// Max height bound over the kBlockVoxels^2 block of columns containing
+// (voxX, voxZ) (pass 30): the max column bound in the block (so a ray
+// staying at/above it provably clears EVERY column of the block), or
+// kNoHeightData when the block's chunk is not loaded.
+uint blockHeightBound(int voxX, int voxZ)
+{
+    uint slot = 0u;
+    ivec2 local = ivec2(0);
+    if (!resolveColumn(voxX, voxZ, slot, local)) {
+        return kNoHeightData;
+    }
+    const int blocksX = int(pc.chunkSize.x) / kBlockVoxels;
+    const int blocksZ = int(pc.chunkSize.z) / kBlockVoxels;
+    const uint blockStride = (uint(blocksX * blocksZ) + 1u) / 2u;
+    const uint blk = uint(local.x / kBlockVoxels) +
+                     uint(local.y / kBlockVoxels) * uint(blocksX);
+    const uint word = blockHeights.data[slot * blockStride + (blk >> 1u)];
+    return ((blk & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
 }
 
 // Voxel type at a global (possibly negative) voxel coordinate. Returns 0
@@ -742,6 +772,15 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     float t = 0.0;
     const int worldTop = int(pc.chunkSize.y) - 1;
 
+    // Hierarchical-DDA block cache (pass 30): the block the current
+    // column belongs to and whether it was found skippable. The block
+    // bound is fetched ONCE per block entry; while the ray stays above
+    // it, whole blocks cross with pure-ALU DDA steps.
+    int curBX = -0x40000000;
+    int curBZ = -0x40000000;
+    bool curBlockSkippable = false;
+    float tBlockExitCache = 0.0;
+
     if (nearMarch) {
     for (int i = 0; i < int(pc.chunkSize.w); ++i) {
         if (t >= tEnd) {
@@ -759,6 +798,70 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         if (rd.y > 0.0 && y0 >= maxTerrainY + 1.0) {
             termCause = TERM_ASCEND;
             break;
+        }
+
+        // --- Hierarchical block skip (pass 30) ---------------------
+        // On entering a new kBlockVoxels^2 block, ONE fetch of the
+        // block's max height decides whether the ray provably stays
+        // above EVERY column of the block until it exits: if so, the
+        // whole block is crossed with branchless DDA steps and no
+        // per-column table/height fetches at all. The skip condition
+        // implies each skipped column's own air-skip condition (bound_c
+        // <= blockMax <= min y over the block segment <= min y over the
+        // column segment), so the hit sequence is bit-identical - pinned
+        // by the traversal parity test (traceHier mirror).
+        const int bx = floorDiv(cell.x, kBlockVoxels);
+        const int bz = floorDiv(cell.z, kBlockVoxels);
+        if (bx != curBX || bz != curBZ) {
+            curBX = bx;
+            curBZ = bz;
+            float tBlockExit = tEnd;
+            if (abs(rd.x) > EPS) {
+                const float edgeX =
+                    float((bx + ((stepX > 0) ? 1 : 0)) * kBlockVoxels);
+                tBlockExit = min(tBlockExit, (edgeX - start.x) / rd.x);
+            }
+            if (abs(rd.z) > EPS) {
+                const float edgeZ =
+                    float((bz + ((stepZ > 0) ? 1 : 0)) * kBlockVoxels);
+                tBlockExit = min(tBlockExit, (edgeZ - start.z) / rd.z);
+            }
+            const uint blockMax = blockHeightBound(cell.x, cell.z);
+            const float yBExit = start.y + rd.y * tBlockExit;
+            curBlockSkippable =
+                (blockMax != kNoHeightData) &&
+                (min(y0, yBExit) >= float(blockMax));
+            tBlockExitCache = tBlockExit;
+        }
+        if (curBlockSkippable) {
+            // Fast-forward the column DDA to the block exit. Bounded by
+            // 2*kBlockVoxels crossings per block; no memory traffic.
+            for (int g = 0; g < 2 * kBlockVoxels + 2; ++g) {
+                const float tNext = min(tMaxX, tMaxZ);
+                if (tNext > tBlockExitCache) {
+                    break;
+                }
+                t = tNext;
+                const bool ffx = tMaxX < tMaxZ;
+                tMaxX += ffx ? tDeltaX : 0.0;
+                tMaxZ += ffx ? 0.0 : tDeltaZ;
+                cell.x += ffx ? stepX : 0;
+                cell.z += ffx ? 0 : stepZ;
+                lastAxis = ffx ? 0 : 2;
+            }
+            if (t < tBlockExitCache) {
+                // Block exit mid-column: the current column is provably
+                // air up to here; resume from the exit point.
+                t = tBlockExitCache;
+            }
+            // Ulp-safety: if the DDA did not actually leave the block
+            // (block-exit boundary missed by rounding), stop skipping
+            // this block - the normal column logic advances us out.
+            if (floorDiv(cell.x, kBlockVoxels) == curBX &&
+                floorDiv(cell.z, kBlockVoxels) == curBZ) {
+                curBlockSkippable = false;
+            }
+            continue;
         }
 
         const uint bound = columnHeightBound(cell.x, cell.z);
