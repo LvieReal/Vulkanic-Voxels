@@ -41,7 +41,7 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 lightColor;
     vec4 skyLow;
     vec4 skyHigh;
-    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in (w unused)
+    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = SDF shadows
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -304,6 +304,32 @@ bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out f
     return tmax >= max(tmin, 0.0);
 }
 
+// The far field is a height field, so it is only meaningful inside the
+// world's vertical slab. Keeping this interval separate from the near-box
+// interval is important when the camera is below bedrock: a downward ray can
+// miss the near box entirely, but must not be allowed to query a far surface
+// at t = 0 and turn the underground sky into a grass-colored hit.
+bool worldYInterval(vec3 ro, vec3 rd, out float tEnter, out float tExit)
+{
+    const float yMin = 0.0;
+    const float yMax = float(pc.chunkSize.y);
+    if (abs(rd.y) < 1e-6) {
+        if (ro.y < yMin || ro.y > yMax) {
+            tEnter = 1.0;
+            tExit = 0.0;
+            return false;
+        }
+        tEnter = -1e30;
+        tExit = 1e30;
+        return true;
+    }
+    const float a = (yMin - ro.y) / rd.y;
+    const float b = (yMax - ro.y) / rd.y;
+    tEnter = min(a, b);
+    tExit = max(a, b);
+    return tExit >= max(tEnter, 0.0);
+}
+
 // Sky WITHOUT the sun: horizon/zenith gradient + haze. This is what
 // terrain shading and fog use - ambient, rim and the fog target must never
 // show the sun disc/glow through voxels (the pass-5 port fused them and
@@ -513,6 +539,167 @@ bool sunRayEscapes(vec3 origin, vec3 sunV)
     return true;
 }
 
+// Distance to the next voxel boundary along a ray. The small floor keeps
+// sphere tracing moving when a sample lands exactly on a boundary after
+// floating-point rounding.
+float nextShadowCellDistance(vec3 p, vec3 d)
+{
+    float tx = 1e30;
+    float ty = 1e30;
+    float tz = 1e30;
+    if (abs(d.x) > 1e-6) {
+        const float edgeX = (d.x > 0.0) ? ceil(p.x) : floor(p.x);
+        tx = max((edgeX - p.x) / d.x, 1e-4);
+    }
+    if (abs(d.y) > 1e-6) {
+        const float edgeY = (d.y > 0.0) ? ceil(p.y) : floor(p.y);
+        ty = max((edgeY - p.y) / d.y, 1e-4);
+    }
+    if (abs(d.z) > 1e-6) {
+        const float edgeZ = (d.z > 0.0) ? ceil(p.z) : floor(p.z);
+        tz = max((edgeZ - p.z) / d.z, 1e-4);
+    }
+    return min(min(tx, ty), tz);
+}
+
+// Material hook for the SDF shadow experiment. Current voxel materials are
+// opaque. A future leaf/grass-foliage material should return a fractional
+// opacity here: the marcher will read its occupancy, attenuate the ray, and
+// continue through the cell instead of treating foliage as a hard decal.
+// Keeping that policy here avoids coupling shadow projection to the primary
+// surface hit and makes foliage a data/material change rather than a new
+// traversal.
+float shadowOpacity(uint type)
+{
+    return type == 0u ? 0.0 : 1.0;
+}
+
+// Approximate signed distance used by the optional shadow experiment. Near
+// terrain uses the exact voxel occupancy when a sample is inside a column;
+// above a column it uses the uploaded top bound to jump over clear air. The
+// step is always clipped to the next cell boundary, so overhangs and future
+// foliage are still visited through voxelTypeAt instead of being projected
+// from a surface normal. Far cells use the coarse height field conservatively.
+// `occupiedType` is non-zero when the sample is in known solid material;
+// `known` is false outside all resident data, which has the same meaning as
+// the exact marcher: no loaded blocker remains to test.
+float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known)
+{
+    occupiedType = 0u;
+    known = true;
+
+    if (p.y < 0.0 || p.y >= float(pc.chunkSize.y)) {
+        return 1e30;
+    }
+
+    const ivec3 cell = ivec3(floor(p));
+    uint slot = 0u;
+    ivec2 local = ivec2(0);
+    if (resolveColumn(cell.x, cell.z, slot, local)) {
+        const uint idx = uint(local.x) + uint(cell.y) * pc.chunkSize.x +
+                         uint(local.y) * (pc.chunkSize.x * pc.chunkSize.y);
+        occupiedType = fetchVoxel(slot, idx);
+        if (occupiedType != 0u) {
+            return 0.0;
+        }
+
+        const uint bound = columnHeightAt(slot, local);
+        const float vertical = (bound != kNoHeightData &&
+                                p.y >= float(bound))
+            ? p.y - float(bound)
+            : 0.25;  // air inside a folded/overhung column: inspect occupancy
+        return min(max(vertical, 0.05), nextShadowCellDistance(p, d));
+    }
+
+    if (pc.far.z > 0) {
+        const float cellSize = pc.farParams.x;
+        const ivec2 farDim = pc.far.zw;
+        const vec2 farOrigin = vec2(pc.far.xy);
+        const ivec2 fc = ivec2(floor((p.xz - farOrigin) / cellSize));
+        if (all(greaterThanEqual(fc, ivec2(0))) &&
+            all(lessThan(fc, farDim))) {
+            const uint packed = farLod.cells[farBase() + uint(fc.x) +
+                                               uint(fc.y) * uint(farDim.x)];
+            const float height = float(packed & 0xFFFFu);
+            const vec2 edge = vec2(
+                farOrigin.x + float(fc.x + ((d.x > 0.0) ? 1 : 0)) * cellSize,
+                farOrigin.y + float(fc.y + ((d.z > 0.0) ? 1 : 0)) * cellSize);
+            float tx = 1e30;
+            float tz = 1e30;
+            if (abs(d.x) > 1e-6) {
+                tx = max((edge.x - p.x) / d.x, 1e-4);
+            }
+            if (abs(d.z) > 1e-6) {
+                tz = max((edge.y - p.z) / d.z, 1e-4);
+            }
+            const float farExit = min(tx, tz);
+            if (height > 0.0 && p.y < height) {
+                occupiedType = (packed >> 16u) & 0xFFu;
+                return 0.0;
+            }
+            if (height > 0.0) {
+                return min(max(p.y - height, 0.05), farExit);
+            }
+            // Empty coarse cells are skipped as cells, not as individual
+            // voxels; otherwise the experiment would spend its budget on
+            // air before reaching the next populated far cell.
+            return farExit;
+        }
+    }
+
+    known = false;
+    return 1e30;
+}
+
+// Sphere-traced/occupancy-aware shadow ray. This is intentionally an
+// experiment selected by VV_SDF_SHADOWS=1; the exact binary column march
+// remains the default reference. It returns fractional visibility so foliage
+// can be marched through later without changing the primary hit/decal path.
+float sunRayEscapesSdf(vec3 origin, vec3 sunV)
+{
+    if (sunV.y <= 0.05) {
+        return 1.0;
+    }
+
+    const float maxTerr = float(pc.grid.w) + 1.0;
+    float visibility = 1.0;
+    float s = 0.0;
+    for (int i = 0; i < 128; ++i) {
+        const vec3 p = origin + sunV * s;
+        if (p.y >= maxTerr || p.y >= float(pc.chunkSize.y)) {
+            return visibility;
+        }
+        if (p.y < 0.0) {
+            return visibility;
+        }
+
+        uint occupiedType = 0u;
+        bool known = false;
+        const float sdfDistance =
+            shadowSdfDistance(p, sunV, occupiedType, known);
+        if (!known) {
+            return visibility;
+        }
+        if (occupiedType != 0u) {
+            visibility *= 1.0 - shadowOpacity(occupiedType);
+            if (visibility <= 0.01) {
+                return 0.0;
+            }
+            // A fractional-opacity foliage cell is not a blocker: move to
+            // its next boundary and keep reading occupancy beyond it.
+            s += max(nextShadowCellDistance(p, sunV) + 1e-3, 0.02);
+        } else {
+            // Stay conservative near the implicit surface. Clipping to cell
+            // boundaries in shadowSdfDistance prevents a height-bound jump
+            // from tunnelling into a neighboring column's overhang.
+            s += max(min(sdfDistance * 0.85, 32.0), 0.02);
+        }
+    }
+    // A bounded experiment should fail open, matching the exact marcher when
+    // it leaves the resident region without finding a known blocker.
+    return visibility;
+}
+
 // Sun visibility at a hit position (voxel space): ONE exact binary
 // shadow ray - ascending column DDA + height-bound voxel walk, coarse
 // far cells beyond the near region (pass 25: the cone/heightmap soft
@@ -530,6 +717,9 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     // Lift off the surface (along the normal, then along the sun) to avoid
     // self-shadow acne; the hit face's outward cell is air by construction.
     const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    if (scene.misc.w > 0.5) {
+        return sunRayEscapesSdf(origin, sunV);
+    }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }
 
@@ -686,6 +876,9 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     // Primary ray terminator: the fog cut (99.8% opaque at 1 / fogDensity).
     const float tEndFog = (1.0 / max(pc.camera.y, 1e-6)) - tEntryOffset;
     float tEnd = min(tEndRegion, tEndFog);
+    float worldYEnter = 0.0;
+    float worldYExit = 0.0;
+    const bool worldYHit = worldYInterval(ro, rd, worldYEnter, worldYExit);
     if (tEnd <= 0.0 && pc.far.z == 0) {
         // Fog cut before the near region even starts. With far LOD ACTIVE
         // this must NOT return sky: from above the world (camera out of
@@ -1048,10 +1241,25 @@ vec3 traceRay(vec2 uv, bool debugTerm)
     bool holeDbgFar = false;
     bool holeVisitedFar = false;
     bool holeEmptyFar = false;
-    if (!hit && pc.far.z > 0) {
+    if (!hit && pc.far.z > 0 && worldYHit) {
         const float cell = pc.farParams.x;
         const ivec2 farDim = pc.far.zw;
         const vec2 farOrigin = vec2(pc.far.xy);
+
+        // Restrict the far height-field march to the world's vertical slab.
+        // In particular, a camera below bedrock looking down has no forward
+        // Y interval and must return sky rather than sampling a far column at
+        // the camera position.
+        const float yStart = worldYEnter - tEntryOffset;
+        const float yEnd = worldYExit - tEntryOffset;
+        const float farStartRaw = max(max(tEndRegion, yStart), 0.0);
+        const float farEnd = min(tEndFog, yEnd);
+        const bool farEndIsFog = tEndFog <= yEnd;
+        const float farStart = farStartRaw + 1e-4;
+        if (farEnd <= farStart) {
+            // There is no forward part of this ray inside the world slab.
+            // Leave farHit false; the normal sky path below is correct.
+        } else {
 
         int fStepX = (rd.x > 0.0) ? 1 : -1;
         int fStepZ = (rd.z > 0.0) ? 1 : -1;
@@ -1060,7 +1268,8 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         float fDeltaX = 1e30;
         float fDeltaZ = 1e30;
 
-        const vec2 p = start.xz + rd.xz * tEndRegion;
+        const vec3 farStartPos = start + rd * farStart;
+        const vec2 p = farStartPos.xz;
         ivec2 c2 = ivec2(floor((p - farOrigin) / cell));
         if (abs(rd.x) > EPS) {
             float nextX =
@@ -1079,8 +1288,9 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             fStepZ = 0;
         }
 
-        float ft = tEndRegion;  // entry param of the current far cell
+        float ft = farStart;  // entry param of the current far cell
         int fLastAxis = -1;
+        bool firstFarCell = true;
         // VV_DEBUG_HOLE instrumentation: farParams.z = targetChunkX + 4096
         // (the on-flag), farParams.w = targetChunkZ. Tracks whether the
         // march crossed the target chunk's cells and whether any was
@@ -1100,11 +1310,11 @@ vec3 traceRay(vec2 uv, bool debugTerm)
         // A ray can cross at most dim.x + dim.y cells of the grid.
         const int farBudget = farDim.x + farDim.y;
         for (int i = 0; i < farBudget; ++i) {
-            if (ft >= tEndFog) {
-                termCause = TERM_FOG_CUT;
+            if (ft >= farEnd) {
+                termCause = farEndIsFog ? TERM_FOG_CUT : TERM_REGION_EXIT;
                 break;
             }
-            const float ftExit = min(min(fMaxX, fMaxZ), tEndFog);
+            const float ftExit = min(min(fMaxX, fMaxZ), farEnd);
             const float fy0 = start.y + rd.y * ft;
             const float fy1 = start.y + rd.y * ftExit;
 
@@ -1132,16 +1342,22 @@ vec3 traceRay(vec2 uv, bool debugTerm)
 
             if (fh > 0.0 && fy0 < fh) {
                 // Entered this cell below the surface top: side-face hit.
-                // (fh > 0: an all-air column or a cell outside the grid has
-                // no surface - a ray below y = 0 there must NOT hit.)
+                // A far cell can also be entered through the world's bottom
+                // when the camera is outside the near region. The height
+                // field has no underside material, so use bedrock and the
+                // bottom normal for that one boundary case instead of
+                // painting a grass top into the underground view.
+                const bool bottomEntry = firstFarCell && rd.y > 0.0 &&
+                    abs(start.y + rd.y * farStartRaw) < 0.01;
                 farHit = true;
-                hitType = (packed >> 16u) & 0xFFu;
+                hitType = bottomEntry ? 6u : ((packed >> 16u) & 0xFFu);
                 tHit = ft;
-                normal = (fLastAxis == 0)
-                    ? vec3(-float(fStepX), 0.0, 0.0)
-                    : (fLastAxis == 2)
-                        ? vec3(0.0, 0.0, -float(fStepZ))
-                        : vec3(0.0, 1.0, 0.0);
+                normal = bottomEntry ? vec3(0.0, -1.0, 0.0)
+                    : (fLastAxis == 0)
+                        ? vec3(-float(fStepX), 0.0, 0.0)
+                        : (fLastAxis == 2)
+                            ? vec3(0.0, 0.0, -float(fStepZ))
+                            : vec3(0.0, 1.0, 0.0);
                 termCause = TERM_HIT;
                 break;
             }
@@ -1163,7 +1379,9 @@ vec3 traceRay(vec2 uv, bool debugTerm)
             c2.x += fTakeX ? fStepX : 0;
             c2.y += fTakeX ? 0 : fStepZ;
             fLastAxis = fTakeX ? 0 : 2;
+            firstFarCell = false;
         }
+        }  // valid vertical far interval
     }
 
     // Base layer: the hit behind everything (or the miss/sky result).

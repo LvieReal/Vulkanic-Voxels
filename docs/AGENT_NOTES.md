@@ -63,6 +63,11 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   too low), yellow = march never crossed the chunk.
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
 - VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
+- VV_FAR_LOD=1: opt into the coarse terrain LOD field (OFF by default).
+- VV_SDF_SHADOWS=1: occupancy-aware signed-distance shadow experiment;
+  exact binary shadows remain the default reference. The SDF marcher keeps
+  occupancy/material policy separate so future foliage can attenuate and be
+  marched through instead of requiring precise decal projection.
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation

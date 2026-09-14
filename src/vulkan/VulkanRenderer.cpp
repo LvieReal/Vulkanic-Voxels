@@ -81,6 +81,17 @@ bool extensionSupported(const char* name,
                      });
 }
 
+bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return false;
+  }
+  return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "on") == 0 || std::strcmp(value, "yes") == 0;
+}
+
+constexpr std::uint32_t kDefaultFarLodRadiusChunks = 64;
+
 }  // namespace
 
 VulkanRenderer::~VulkanRenderer() {
@@ -96,6 +107,23 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
         "Invalid native window handle (platform backend not resolved).";
     return false;
   }
+
+  // Terrain LOD is an explicit experiment, not a hidden default. Keep this
+  // guard here as well as in setWorldConfig() so a renderer that uses the
+  // built-in config follows the same contract.
+  const bool farLodRequested = envFlagEnabled("VV_FAR_LOD");
+  if (farLodRequested && m_voxelConfig.farLodRadiusChunks == 0) {
+    m_voxelConfig.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
+  } else if (!farLodRequested) {
+    m_voxelConfig.farLodRadiusChunks = 0;
+  }
+  m_sdfShadows = envFlagEnabled("VV_SDF_SHADOWS");
+  if (envFlagEnabled("VV_SHADOW_SHARP")) {
+    m_sdfShadows = false;
+  }
+  std::fprintf(stderr, "[vulkan] far LOD: %s (VV_FAR_LOD=1), shadows: %s\n",
+               farLodRequested ? "on" : "off",
+               m_sdfShadows ? "SDF experiment" : "exact binary");
 
   // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
   // colors each pixel by ray-termination cause.
@@ -184,7 +212,7 @@ void VulkanRenderer::drawFrame() {
   }
   m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
                         glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
-                                  0.0f, 0.0f));
+                                  m_sdfShadows ? 1.0f : 0.0f, 0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -379,15 +407,20 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
     return;
   }
 
-  if (!config.isValid()) {
+  vv::voxel::VoxelConfig adjusted = config;
+  const bool farLodRequested = envFlagEnabled("VV_FAR_LOD");
+  if (farLodRequested && adjusted.farLodRadiusChunks == 0) {
+    adjusted.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
+  } else if (!farLodRequested) {
+    adjusted.farLodRadiusChunks = 0;
+  }
+  adjusted.renderRadiusChunks = std::min(adjusted.renderRadiusChunks, 16u);
+  adjusted.maxTraceSteps = std::min(adjusted.maxTraceSteps, 4096u);
+
+  if (!adjusted.isValid()) {
     return;
   }
-
-  m_voxelConfig = config;
-  m_voxelConfig.renderRadiusChunks =
-      std::min(m_voxelConfig.renderRadiusChunks, 16u);
-  m_voxelConfig.maxTraceSteps =
-      std::min(m_voxelConfig.maxTraceSteps, 4096u);
+  m_voxelConfig = adjusted;
 }
 
 void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
@@ -625,7 +658,7 @@ void VulkanRenderer::rebuildStreamPending() {
   // mountain terrain by up to ~25 voxels (the "missing chunks at the
   // render-distance edge" holes).
   m_streamRingPending.clear();
-  if (m_world != nullptr) {
+  if (m_voxelConfig.farLodRadiusChunks != 0 && m_world != nullptr) {
     for (int32_t dz = -r - 1; dz <= r + 1; ++dz) {
       for (int32_t dx = -r - 1; dx <= r + 1; ++dx) {
         if (dx >= -r && dx <= r && dz >= -r && dz <= r) {
@@ -944,8 +977,10 @@ void VulkanRenderer::finishRegionMove() {
   std::vector<vv::voxel::ChunkCoord> evicted;
   // Amortized (max 8 per swap): freeing a whole crossing row of 128 KB
   // chunk buffers in one call was visible allocator churn.
-  m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
-                        cfg.renderRadiusChunks + 1, evicted, 8);
+  const std::uint32_t cacheRadius =
+      cfg.renderRadiusChunks + (cfg.farLodRadiusChunks != 0 ? 1u : 0u);
+  m_world->evictOutside(m_streamTarget.x, m_streamTarget.z, cacheRadius, evicted,
+                        8);
 
   // Final publish (logs holes: after completion every region cell must
   // have a slot; an empty one is a real missing chunk).
@@ -1872,13 +1907,14 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   m_farEverActivated = false;
 
   // Startup is ASYNC now: the old synchronous initial region blocked the
-  // first frame for ~10 s on slow machines (729 chunks x ~15 ms). The far
-  // build starts first (it needs the longest head start), then the region
-  // streams in through the normal worker + pump path from frame one -
-  // the world pops in around the camera over a couple of seconds instead
-  // of freezing. The table halves start zeroed (= all empty slots), so
-  // the first frames simply show far-LOD terrain everywhere.
-  launchFarFieldBuild(0, 0);
+  // first frame for ~10 s on slow machines (729 chunks x ~15 ms). When the
+  // optional far field is enabled it starts first (it needs the longest head
+  // start), then the region streams in through the normal worker + pump path
+  // from frame one. With LOD off there is no extra ring or background field;
+  // the near region is still streamed normally.
+  if (m_voxelConfig.farLodRadiusChunks != 0) {
+    launchFarFieldBuild(0, 0);
+  }
   beginRegionMove(0, 0);
 
   // Safety net above the fog cut: the budget must never bind before the fog
@@ -1936,10 +1972,11 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
 
   std::vector<const vv::voxel::Chunk*> newChunks;
   std::vector<vv::voxel::ChunkCoord> evicted;
-  // radius + 1: the seam-patch ring (see rebuildStreamPending) must be
-  // generated here too - the far cells one chunk beyond the region edge
-  // need real column tops or folded terrain shows holes there.
-  m_world->ensureRegion(centerChunkX, centerChunkZ, radius + 1, newChunks,
+  // The extra ring exists only for far-LOD seam patching. With LOD off,
+  // don't generate terrain that can never be sampled.
+  const std::uint32_t cacheRadius =
+      radius + (m_voxelConfig.farLodRadiusChunks != 0 ? 1u : 0u);
+  m_world->ensureRegion(centerChunkX, centerChunkZ, cacheRadius, newChunks,
                         evicted);
   syncLog.generated = newChunks.size();
 
@@ -2159,7 +2196,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolCreateInfo pool{};
   pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool.maxSets = 1;
-  pool.poolSizeCount = 2;
+  pool.poolSizeCount = 4;
   pool.pPoolSizes = poolSizes;
 
   VkResult r =
@@ -2502,8 +2539,8 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[3].buffer = m_voxelResources.fadeBuffer();
-  preComputeBarriers[2].offset = 0;
-  preComputeBarriers[2].size = VK_WHOLE_SIZE;
+  preComputeBarriers[3].offset = 0;
+  preComputeBarriers[3].size = VK_WHOLE_SIZE;
 
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |

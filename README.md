@@ -77,6 +77,14 @@ A small pure-logic test suite (noise, terrain layering, chunked world) builds
 alongside by default — run it with `ctest --test-dir build` (or disable with
 `-DVV_BUILD_TESTS=OFF`).
 
+### Render experiments
+
+The full-detail terrain region is the default. Set `VV_FAR_LOD=1` to enable
+the optional coarse terrain field beyond it; without that variable LOD is off,
+so no far-field build or seam ring is generated. Set `VV_SDF_SHADOWS=1` to try
+the occupancy-aware signed-distance shadow marcher. Exact binary sun shadows
+remain the default reference; `VV_SHADOW_SHARP=1` explicitly selects them.
+
 Both the X11 (XCB) and Wayland surface backends are compiled in when their
 headers are found; the correct one is picked at run time from the Qt platform.
 
