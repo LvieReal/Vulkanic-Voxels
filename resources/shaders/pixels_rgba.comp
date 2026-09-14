@@ -262,48 +262,6 @@ uint blockHeightAt(uint slot, ivec2 local)
     return ((blk & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
 }
 
-// Smooth the height-bound signal used only by the SDF penumbra estimate. The
-// voxel hit test remains exact below; bilinear interpolation here prevents a
-// one-column height step from becoming a wireframe when a wide penumbra takes
-// the minimum over many samples. If any neighbor is not resident, fall back to
-// the exact current-column bound rather than inventing terrain.
-bool sampleColumnHeight(int voxX, int voxZ, out float height)
-{
-    uint slot = 0u;
-    ivec2 local = ivec2(0);
-    if (!resolveColumn(voxX, voxZ, slot, local)) {
-        height = 0.0;
-        return false;
-    }
-    const uint bound = columnHeightAt(slot, local);
-    if (bound == kNoHeightData) {
-        height = 0.0;
-        return false;
-    }
-    height = float(bound);
-    return true;
-}
-
-float smoothColumnHeight(vec2 p, float fallback)
-{
-    const ivec2 b = ivec2(floor(p));
-    const vec2 f = fract(p);
-    float h00 = 0.0;
-    float h10 = 0.0;
-    float h01 = 0.0;
-    float h11 = 0.0;
-    const bool ok00 = sampleColumnHeight(b.x,     b.y,     h00);
-    const bool ok10 = sampleColumnHeight(b.x + 1, b.y,     h10);
-    const bool ok01 = sampleColumnHeight(b.x,     b.y + 1, h01);
-    const bool ok11 = sampleColumnHeight(b.x + 1, b.y + 1, h11);
-    if (!(ok00 && ok10 && ok01 && ok11)) {
-        return fallback;
-    }
-    const float hx0 = mix(h00, h10, f.x);
-    const float hx1 = mix(h01, h11, f.x);
-    return mix(hx0, hx1, f.y);
-}
-
 // Voxel type at a global (possibly negative) voxel coordinate. Returns 0
 // (air) for anything outside the loaded region, in an empty slot, or
 // outside the world's Y range.
@@ -649,17 +607,12 @@ float shadowSdfDistance(vec3 p, vec3 d, out uint occupiedType, out bool known,
         }
 
         const uint bound = columnHeightAt(slot, local);
+        const float vertical = (bound != kNoHeightData &&
+                                p.y >= float(bound))
+            ? p.y - float(bound)
+            : 0.25;  // air inside a folded/overhung column: inspect occupancy
         stepLimit = nextShadowCellDistance(p, d);
-        const float surface = smoothColumnHeight(
-            p.xz, bound == kNoHeightData ? p.y : float(bound));
-        if (p.y >= surface) {
-            return max(p.y - surface, 0.05);
-        }
-        // This is air below a column's bound: usually an overhang/cavity.
-        // It must still be sampled for occupancy, but the arbitrary old 0.25
-        // distance made every such voxel draw a dark wireframe in wide
-        // penumbras. Advance to the next cell without penalizing visibility.
-        return 1e30;
+        return max(vertical, 0.05);
     }
 
     if (pc.far.z > 0) {
