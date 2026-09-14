@@ -34,8 +34,7 @@ struct SceneUBO final {
 	glm::vec4 lightColor{};
 	glm::vec4 skyLow{};
 	glm::vec4 skyHigh{};
-	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in,
-	                  // w = sun-field ramp divisor 8*bleed budget (pass 26)
+	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = shadow cone tan (0 = sharp)
 };
 
 }  // namespace vv::render

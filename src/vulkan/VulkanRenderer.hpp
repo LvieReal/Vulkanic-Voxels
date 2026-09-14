@@ -20,7 +20,6 @@
 #include "render/LightingConfig.hpp"
 #include "render/SceneUniform.hpp"
 #include "terrain/FarField.hpp"
-#include "terrain/SunLightGrid.hpp"
 #include "voxel/VoxelConfig.hpp"
 #include "voxel/World.hpp"
 #include "vulkan/VoxelResources.hpp"
@@ -37,9 +36,7 @@ class VulkanRenderer final {
     uint32_t height = 0;
   };
 
-  // Out-of-line (pimpl-style members like the sun-grid adapter must stay
-  // incomplete in this header).
-  VulkanRenderer();
+  VulkanRenderer() = default;
   ~VulkanRenderer();
 
   VulkanRenderer(const VulkanRenderer&) = delete;
@@ -88,19 +85,6 @@ class VulkanRenderer final {
   // extent grows only over chunks actually scanned. Folded mountains can
   // under-estimate by 20+ voxels -> holes at the seam without this.
   std::size_t drainFarPatch();
-
-  // --- Sun light grid (pass 26) ---
-  // Owns the GPU side: 3D texture (two ping-pong halves), staging buffer
-  // (the grid's publish target), sampler, and the sliced CPU build.
-  bool createSunGridResources();
-  void cleanupSunGridResources();
-  // Per-frame driver: follows the camera window (origin snap), applies
-  // deferred origin/sun changes at cycle boundaries, advances the build
-  // by m_sunBuildBudgetMs. Call once per frame before recording.
-  void tickSunGrid();
-
-  // Voxel source for the light grid builder (World + far LOD mirror).
-  class SunGridVoxels;
 
   // Suggested camera spawn: above the terrain at the center of chunk (0,0).
   glm::vec3 spawnPosition() const;
@@ -303,61 +287,6 @@ class VulkanRenderer final {
   std::int32_t m_farPatchMinZ = 0;
   std::int32_t m_farPatchMaxX = -1;
   std::int32_t m_farPatchMaxZ = -1;
-  // --- Sun light grid (pass 26) ---
-  // Fixed light window: kSunGridXZ^2 x worldHeight cells around the
-  // camera (origin snapped to kSunGridOriginSnap). CRITICAL INVARIANT:
-  // the window must ALWAYS contain the active chunk-table region (the
-  // march's near<->far switch boundary). The module switches cone
-  // columns to far-LOD at the WINDOW edge, the march at the REGION
-  // edge; if the region pokes out of the window, the module tests
-  // conservative far max-heights where the march reads real voxels ->
-  // spurious umbra bands along the sun-facing window edges (the pass-26
-  // release bug, reproduced + pinned by the sunprobe/test parity cases).
-  // Geometry: region = 2r+1 chunks wide, camera-centered within +/-
-  // half a chunk; origin o = floor((cam - W/2)/S)*S, so
-  // o in [cam - W/2 - S + 1, cam - W/2]. Window contains the region
-  // (worst edge cam + (r + 0.5)*chunk + 1) iff W/2 - S + 1 >= that
-  // edge offset; with W = 1088 (34 chunks), S = 64, r = 12, chunk 32:
-  // 544 - 64 + 1 = 481 >= 416, margin 65 voxels of mid-cycle camera
-  // drift. Columns inside the window but outside the region (or in the
-  // streaming ring) seed from far-LOD heights exactly like the march
-  // (the adapter bounds queries by the table region). The GPU texture
-  // stacks TWO fields along depth (ping-pong halves): the GPU samples
-  // one half while the next completed build is copied into the other;
-  // the half index and window origin travel in push constants (per-CB
-  // snapshot: no shared-UBO in-flight race), and the light ramp divisor
-  // (8 * bleed budget) in scene.misc.w. farParams.z/w carry the half +
-  // enabled flag and are shared with VV_DEBUG_HOLE instrumentation (the
-  // two modes exclude each other).
-  static constexpr std::uint32_t kSunGridXZ = 1088;
-  static constexpr std::uint32_t kSunGridOriginSnap = 64;
-  static constexpr std::uint32_t kSunFillBudgetVoxels = 14;  // bleed depth
-  vv::terrain::SunLightGrid m_sunGrid;
-  std::unique_ptr<SunGridVoxels> m_sunVoxels;
-  bool m_sunGridWanted = true;     // VV_SUN_GRID=0 requested it off
-  bool m_sunDebugField = false;    // VV_SUN_DEBUG: raw field view
-  bool m_sunGridEnabled = false;   // resource failure: off (march fallback)
-  bool m_sunGridReady = false;     // first field published (shader gate)
-  bool m_sunUploadPending = false; // publish finished; record GPU copy
-  std::uint32_t m_sunFieldHalf = 0;    // half the GPU currently samples
-  std::int32_t m_sunOriginX = 0;       // origin of the SERVED field (push)
-  std::int32_t m_sunOriginZ = 0;
-  std::int32_t m_sunAppliedOriginX = 0x7FFFFFFF;  // setOrigin() applied
-  std::int32_t m_sunAppliedOriginZ = 0x7FFFFFFF;
-  std::int32_t m_sunCycleOriginX = 0;  // origin of the building cycle
-  std::int32_t m_sunCycleOriginZ = 0;
-  double m_sunDir[3] = {0.0, 0.0, 0.0};  // configure()'d sun direction
-  double m_sunBuildBudgetMs = 3.0;       // VV_SUN_MS override
-  double m_perfSunMs = 0.0;
-  // GPU resources (valid while m_sunGridEnabled).
-  VkImage m_sunImage = VK_NULL_HANDLE;
-  VkDeviceMemory m_sunImageMemory = VK_NULL_HANDLE;
-  VkImageView m_sunImageView = VK_NULL_HANDLE;
-  VkSampler m_sunSampler = VK_NULL_HANDLE;
-  VkBuffer m_sunStaging = VK_NULL_HANDLE;
-  VkDeviceMemory m_sunStagingMemory = VK_NULL_HANDLE;
-  std::uint8_t* m_sunStagingMapped = nullptr;
-
   // Active chunk-table half (push-constant index; triple-buffered) and
   // the chunk-grid origin of the table content in that half (during
   // streaming this is the TARGET grid, published incrementally).
@@ -375,6 +304,10 @@ class VulkanRenderer final {
   bool m_farEverActivated = false;
   std::chrono::steady_clock::time_point m_farFadeStart{};
 
+  // Sun-shadow softness (pass 21): tan of the cone half-angle traced
+  // toward the sun (default tan(2.5 deg) - soft penumbrae). 0 = the
+  // exact single-ray march (VV_SHADOW_SHARP=1). Lands in scene.misc.w.
+  float m_shadowConeTan = 0.0437f;
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
   std::int32_t m_farCenterChunkZ = 0;

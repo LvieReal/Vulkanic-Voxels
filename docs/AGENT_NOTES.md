@@ -62,10 +62,7 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   far cell (data hole), cyan = data present but ray passed over (height
   too low), yellow = march never crossed the chunk.
 - `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
-- `VV_SUN_GRID=0` — disable the pass-26 flood-fill light grid (exact
-  binary march fallback). Default on.
-- `VV_SUN_MS=<double>` — per-frame CPU build slice for the light grid
-  (default 3.0 ms).
+- VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - `VV_PRESENT=fifo` — vsync.
 
 ## Sandbox validation
@@ -83,59 +80,47 @@ QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH=/tmp/deps/qt6/lib:/tmp/deps/prefix/lib
     timeout 8 ./build/release/bin/game            # must exit cleanly (Vulkan dialog, no crash)
 # CPU tests without the toolchain:
 g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
-    src/terrain/{Noise,Noise3D,TerrainGenerator,FarField,SunLightGrid}.cpp \
+    src/terrain/{Noise,Noise3D,TerrainGenerator,FarField}.cpp \
     src/voxel/{Chunk,VoxelTypes,VoxelTextures,World}.cpp -o /tmp/t && /tmp/t
 ```
 
-Toolchain: `sh scripts/build-linux-toolchain.sh "$HOME/.cache/vv-deps"`
-(~17 min) and `ln -s ~/.cache/vv-deps /tmp/deps`. NOTE: `~/.cache` is
-excluded from workspace snapshots — EVERY sandbox restart needs the
-rebuild + reconfigure of build/release and build/debug.
+Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
+`~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
 
-## Current status (pass 26.3 — diagnostics + sampling proof)
+## Current status (pass 21)
 
-Owner report on 26.2: "no logs in release, just immediate crash" and
-"the shadows are quite literally still laying sideways - it's most
-likely the sampling in the shader itself".
+Owner-verified pass 20 (textures seamless). Pass 21 asks: (1) load
+textures from resources/textures/voxels (files on the owner's machine;
+plain-color fallback here), (2) nearest sampling by default, (3) three
+texture definition modes (uniform / side-uniform / custom), (4) soft
+shadows via CONE TRACING (chosen over flood-fill and opacity grid).
 
-Both taken at face value; findings:
-- NO LOGS EXPLAINED: GameTarget.cmake links the Windows Release build
-  with -mwindows (GUI subsystem) - stderr is detached from any console,
-  so every fprintf(stderr) breadcrumb was invisible. Fixed with durable
-  telemetry: src/platform/CrashLog.{hpp,cpp} - crumbs append to
-  <exe dir>/vv-crash.log (truncated per run), a Win32
-  SetUnhandledExceptionFilter writes the exception code + address, and
-  main.cpp installs it first thing. Renderer crumbs: init steps, sun
-  grid init steps, cycle complete, publish recorded, frame heartbeats
-  (every 64 frames up to 1024, with the sun phase).
-- SAMPLING PROVEN (the demanded test): a bit-exact CPU emulation of the
-  whole GPU path - staging layout, vkCmdCopyBufferToImage semantics
-  into the ping-pong 3D texture, the shader's UVW math and trilinear
-  fetch, ported verbatim - now runs in testSunLightGrid: every fixture
-  air cell at its center samples EXACTLY its own field cell (117k
-  cells), interpolation midpoints average the correct world-axis
-  neighbors (343k checks - the 'sideways' detector), ping-pong half
-  selection and clamp-to-edge verified. The shader source as written
-  cannot produce axis-swapped sampling.
-- VV_SUN_DEBUG=1: shades surfaces by the RAW field (white = lit,
-  black = umbra) via a negative scene.misc.w (sign-encoded, still
-  constant = race-free). Visual ground truth for orientation.
-- Reminder: the owner's 'sideways' report was on 26.1, whose first
-  field was garbage (built mid-stream - fixed in 26.2, NOT yet tested
-  by the owner). Expected Release timeline now: ~2-4 s region stream
-  (exact march shadows until then), then the first soft field at
-  ~6-8 s.
-
-NEEDED from the owner after a Release crash: build/release/bin/
-vv-crash.log (or next to the exe wherever it is installed) - it holds
-the crumb trail + the exception record. Plus a VV_SUN_DEBUG=1 run to
-eyeball the field orientation.
-
-Workspace note: sandbox restarts can return a FRESH CLONE at the base
-commit with the working tree preserved (happened twice: before pass 24
-and before pass 25). Recovery that worked both times: `git fetch origin
-<branch>`, verify the tree matches FETCH_HEAD, `git reset FETCH_HEAD`,
-continue. Push often.
+Delivered:
+- File textures: Qt loader (src/render/VoxelTextureFiles.*) reads
+  <name>.png (uniform, all 6 faces), <name>_top/_bottom/_side.png
+  (side-uniform) or <name>_top/_bottom/_px/_nx/_pz/_nz.png (custom);
+  most specific complete set wins, missing -> plain palette colors.
+  Search: executableDir()/resources/textures/voxels then CWD (run
+  scripts launch from repo root -> new files work without rebuild).
+  Binding 8 = image array (capacity kMaxVoxelTextures=48, unused slots
+  bound to a 1x1 white dummy), binding 9 = sampler (NEAREST texels,
+  linear mips), binding 10 = per-type table SSBO (6 face image indices
+  or 0xFFFFFFFF = plain, word 6 = nominal size for the explicit LOD).
+  Textured faces use the file as ALBEDO; far-LOD hits sample deep mips
+  (average color) so the near/far seam stays consistent. The pass-20
+  procedural generator is GONE (replaced by files + plain fallback).
+- Soft sun shadows, cone-traced: ONE march (same column DDA + voxel
+  walk as the sharp march) where each blocker contributes an ANGULAR
+  coverage: cov = clamp(0.5 + (blockerTop - y)/(2*coneTan*s), 0, 1);
+  vis = 1 - worst coverage. coneTan = scene.misc.w (default tan 2.5
+  deg = 0.0437); VV_SHADOW_SHARP=1 (or 0) -> exact binary march
+  (byte-identical behavior, pinned by the parity test). Vertical-slice
+  approximation: azimuthal disk extent ignored (occluders beside the
+  ray lighten penumbrae slightly).
+- Tests: texture mode/suffix/face-map tables; shadow cone mirror vs an
+  independent 13-direction dense reference (mean |diff| 0.012, >=97%
+  within 0.25, quantization-graze outliers <=1% and only where the
+  exact sharp march also blocks - consistency invariant checked).
 
 Gotchas: tabs (most src) vs 2-space (vulkan/render); edit_file fails on
 deep-tab files — use python span edits; heredoc re-typing of code invites

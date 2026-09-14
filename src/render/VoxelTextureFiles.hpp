@@ -16,16 +16,6 @@ namespace vv::render {
 // (set.textured = false) - which is exactly what happens in checkouts
 // without texture files, e.g. CI/sandboxes.
 //
-// An optional aliases.txt in the directory reuses one type's textures
-// for another type's faces, e.g. "grass bottom = dirt" or
-// "grass sides = dirt side" (no file duplication). Lines:
-//   <type> <face> = <source type> [<source face>]
-// with face in {top, bottom, front, back, right, left, sides, all};
-// the source face defaults to the target face's name, resolved through
-// the source's mode (a uniform source serves any face, side-uniform
-// maps side faces to its side texture). Aliases override file-based
-// face assignments.
-//
 // outImages receives one RGBA8 image per loaded FILE (deduplicated per
 // file path); outSets is resized to kVoxelTypeCount with faceIndex
 // pointing into outImages. outLog collects one status line per type.

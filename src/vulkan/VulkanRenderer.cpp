@@ -12,7 +12,6 @@
 
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
-#include "platform/CrashLog.hpp"
 #include "platform/VulkanSurfaceFactory.hpp"
 #include "render/SceneData.hpp"
 #include "render/VoxelTextureFiles.hpp"
@@ -83,8 +82,6 @@ bool extensionSupported(const char* name,
 
 }  // namespace
 
-VulkanRenderer::VulkanRenderer() = default;
-
 VulkanRenderer::~VulkanRenderer() {
   cleanup();
 }
@@ -122,33 +119,16 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     std::fprintf(stderr, "[vulkan] VV_DEBUG_TERM: on (miss pixels colored by "
                          "termination cause; see AGENT_NOTES)\n");
   }
-  // Pass 26 sun light grid (soft shadows via CPU flood fill). Default on;
-  // VV_SUN_GRID=0 falls back to the exact binary march. Mutually exclusive
-  // with VV_DEBUG_HOLE (both ride in farParams.zw).
-  if (const char* sunEnv = std::getenv("VV_SUN_GRID")) {
-    if (std::strcmp(sunEnv, "0") == 0) {
-      m_sunGridWanted = false;
-    }
+  if (std::getenv("VV_SHADOW_SHARP")) {
+    m_shadowConeTan = 0.0f;
+    std::fprintf(stderr,
+                 "[vulkan] VV_SHADOW_SHARP: sun shadows use the exact "
+                 "single-ray march (no cone)\n");
   }
-  if (const char* sunMsEnv = std::getenv("VV_SUN_MS")) {
-    double ms = 0.0;
-    if (std::sscanf(sunMsEnv, "%lf", &ms) == 1 && ms >= 0.05 && ms <= 100.0) {
-      m_sunBuildBudgetMs = ms;
-    }
-  }
-  // VV_SUN_DEBUG: shade surfaces by the RAW light field (white = lit,
-  // black = umbra) instead of the shadow ramp - makes the field's
-  // orientation directly visible (pass 26.2).
-  m_sunDebugField = std::getenv("VV_SUN_DEBUG") != nullptr;
-  if (m_sunDebugField) {
-    std::fprintf(stderr, "[vulkan] VV_SUN_DEBUG: raw light-field view\n");
-  }
-  vv::platform::crashLogCrumb("init: starting (release console logs are "
-                              "detached: -mwindows; trail lives here)");
+
   if (!createInstance(info, outError) || !createSurface(info, outError) ||
       !pickPhysicalDevice(outError) || !createDevice(outError) ||
       !createCommandPool(outError) || !createVoxelWorldAndUpload(outError) ||
-      !createSunGridResources() ||
       !createDescriptorSetLayout(outError) || !createSceneResources(outError)) {
     cleanup();
     return false;
@@ -184,10 +164,6 @@ void VulkanRenderer::drawFrame() {
     return;
   }
 
-  // Sliced sun-light-grid build (pass 26): pure CPU work on the mapped
-  // staging buffer; overlapped with the GPU while the fence is pending.
-  tickSunGrid();
-
   {
     const auto t0 = std::chrono::steady_clock::now();
     vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE,
@@ -212,19 +188,10 @@ void VulkanRenderer::drawFrame() {
     farFade = static_cast<float>(
         std::min(elapsed / kFarFadeSeconds, 1.0));
   }
-  // sceneFlags.z lands in scene.misc.w = the light-field ramp divisor
-  // (8 x bleed budget; pass 26) - constant in practice, so the shared-UBO
-  // in-flight window can never observe a change. NEGATIVE = VV_SUN_DEBUG
-  // (the shader then shows the raw field instead of the ramp; the
-  // divisor is |misc.w|).
-  const float sunRamp =
-      m_sunGridEnabled ? static_cast<float>(8u * kSunFillBudgetVoxels)
-                       : 0.0f;
-  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
-                        glm::vec4(m_debugTerminators ? 1.0f : 0.0f,
-                                  farFade,
-                                  m_sunDebugField ? -sunRamp : sunRamp,
-                                  0.0f));
+  m_sceneUniform.update(
+      m_camera, m_timeSeconds, m_lighting,
+      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade, m_shadowConeTan,
+                0.0f));
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -305,9 +272,9 @@ void VulkanRenderer::drawFrame() {
                 .count() > 250.0) {
       std::fprintf(stderr,
                    "[perf] frame %u: %.1f ms | world %.1f (pump %.1f, "
-                   "sync %.1f, far %.1f, sun %.1f) | gpu-wait %.1f\n",
+                   "sync %.1f, far %.1f) | gpu-wait %.1f\n",
                    m_frameCounter, frameMs, m_perfWorldMs, m_perfPumpMs,
-                   m_perfSyncMs, m_perfFarMs, m_perfSunMs, m_perfGpuMs);
+                   m_perfSyncMs, m_perfFarMs, m_perfGpuMs);
       m_perfLastLog = now;
     }
     m_perfLastFrame = now;
@@ -315,16 +282,7 @@ void VulkanRenderer::drawFrame() {
     m_perfPumpMs = 0.0;
     m_perfSyncMs = 0.0;
     m_perfFarMs = 0.0;
-    m_perfSunMs = 0.0;
     m_perfGpuMs = 0.0;
-  }
-  // Early-run heartbeat: pins "crashed at frame N, sun phase X" for the
-  // open Release-only crash (the release exe has no console).
-  if (m_frameCounter < 1024u && (m_frameCounter & 63u) == 0u) {
-    char crumb[96];
-    std::snprintf(crumb, sizeof(crumb), "frame %u, sun grid %s",
-                  m_frameCounter, m_sunGrid.phaseName());
-    vv::platform::crashLogCrumb(crumb);
   }
   m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
   ++m_frameCounter;
@@ -369,7 +327,6 @@ void VulkanRenderer::cleanup() {
   cleanupSwapchain();
   cleanupSceneResources();
   cleanupVoxelResources();
-  cleanupSunGridResources();
 
   if (m_descriptorSetLayout) {
     vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
@@ -480,9 +437,7 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
   // hash lookup per region cell when everything is patched).
   {
     const auto t0 = std::chrono::steady_clock::now();
-    if (drainFarPatch() > 0) {
-      m_sunGrid.requestRebuild();  // seam cells feed the light seeding
-    }
+    drainFarPatch();
     m_perfFarMs += std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - t0)
                        .count();
@@ -800,7 +755,6 @@ void VulkanRenderer::pumpRegionStreaming() {
   const std::size_t uploadCap =
       deficit > 2 ? kStreamSprintChunks : kStreamChunksPerFrame;
   std::size_t uploaded = 0;
-  bool worldInstalled = false;  // light grid (pass 26): rebuild trigger
   for (GeneratedChunk& gen : done) {
     if (!m_streamActive) {
       gen.types.clear();  // streaming aborted: discard (never re-queue)
@@ -824,7 +778,6 @@ void VulkanRenderer::pumpRegionStreaming() {
     if (std::find(m_streamRingPending.begin(), m_streamRingPending.end(),
                   gen.coord) != m_streamRingPending.end()) {
       m_world->installChunk(gen.coord, std::move(gen.types));
-      worldInstalled = true;
       m_streamRingPending.erase(std::remove(m_streamRingPending.begin(),
                                             m_streamRingPending.end(),
                                             gen.coord),
@@ -841,7 +794,6 @@ void VulkanRenderer::pumpRegionStreaming() {
     m_freeSlots.pop_back();
     const vv::voxel::Chunk* chunk =
         m_world->installChunk(gen.coord, std::move(gen.types));
-    worldInstalled = true;
     m_slotOf[gen.coord] = slot;
     m_slotFadeStart[slot] = std::chrono::steady_clock::now();
     std::string error;
@@ -866,11 +818,6 @@ void VulkanRenderer::pumpRegionStreaming() {
   // visible during crossings too.
   if (uploaded > 0) {
     publishRegionTable(false);
-  }
-  if (worldInstalled) {
-    // New voxel data: the light field builds from one cycle ago; flag the
-    // next cycle (never restarts a running build).
-    m_sunGrid.requestRebuild();
   }
   // Leftovers (not uploaded this frame) go back for the next pump.
   if (!done.empty()) {
@@ -963,8 +910,6 @@ void VulkanRenderer::publishRegionTable(bool logHoles) {
     std::fprintf(stderr, "[vulkan] region table publish failed\n");
     return;
   }
-  const std::int32_t prevOriginX = m_tableOriginX;
-  const std::int32_t prevOriginZ = m_tableOriginZ;
   m_tableHalf = nextHalf;
   m_tableOriginX = m_streamTarget.x;
   m_tableOriginZ = m_streamTarget.z;
@@ -1031,15 +976,6 @@ void VulkanRenderer::finishRegionMove() {
   // have a slot; an empty one is a real missing chunk).
   publishRegionTable(true);
 
-  // Stream COMPLETE (this was missing since pass 13 - only the teleport
-  // fallback cleared the flag, so the pump's finished-check kept calling
-  // this every frame at rest: harmless-ish before, but with the pass-26
-  // rebuild hook it meant a permanent light-grid rebuild loop).
-  m_streamActive = false;
-
-  // The light grid window may have moved with the region; the new voxel
-  // data needs a fresh build cycle (pass 26).
-  m_sunGrid.requestRebuild();
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1153,9 +1089,6 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
                    "at (%d,%d) (seam band patched from %zu chunks)\n",
                    m_farDim, m_farDim, m_farCell, m_farOriginVoxX,
                    m_farOriginVoxZ, m_slotOf.size());
-      // Far heights seed every light-grid column without a loaded chunk:
-      // a swapped field changes those seeds (pass 26).
-      m_sunGrid.requestRebuild();
     } else {
       std::fprintf(stderr,
                    "[vulkan] far LOD build rejected (dim %u vs %u, cell %u vs "
@@ -1196,420 +1129,6 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
       launchFarFieldBuild(centerChunkX, centerChunkZ);
     }
   }
-}
-
-// --- Sun light grid (pass 26) ---
-
-// Voxel source over the live CPU world: near columns from the chunk cache
-// (the same bytes the GPU atlas serves; nullptr = chunk not loaded, which
-// makes the grid seed that column from far-LOD heights), far cells beyond.
-// All queries run on the render thread inside SunLightGrid::tick; chunk
-// installs also happen on the render thread, so no locking is needed.
-class VulkanRenderer::SunGridVoxels final
-    : public vv::terrain::SunLightVoxels {
- public:
-  explicit SunGridVoxels(VulkanRenderer* renderer) : m_r(renderer) {}
-
-  const std::uint8_t* columnVoxels(std::int32_t x,
-                                    std::int32_t z) const override {
-    // Bounded by the ACTIVE chunk-table region (the same grid the shader
-    // march's resolveColumn uses): chunks in the streaming ring beyond it
-    // exist in the World cache, but the MARCH tests far cells there - the
-    // light grid must switch to far at the same boundary or the seeding
-    // diverges from the exact march along the region edge.
-    const std::int32_t cs =
-        static_cast<std::int32_t>(m_r->m_voxelConfig.chunkSizeX);
-    const std::int32_t r =
-        static_cast<std::int32_t>(m_r->m_voxelConfig.renderRadiusChunks);
-    const std::int32_t minX = (m_r->m_tableOriginX - r) * cs;
-    const std::int32_t maxX = (m_r->m_tableOriginX + r + 1) * cs;
-    const std::int32_t minZ = (m_r->m_tableOriginZ - r) * cs;
-    const std::int32_t maxZ = (m_r->m_tableOriginZ + r + 1) * cs;
-    if (x < minX || x >= maxX || z < minZ || z >= maxZ) {
-      return nullptr;  // outside the region: far-LOD fallback
-    }
-    const std::int32_t cx = static_cast<std::int32_t>(
-        std::floor(static_cast<double>(x) / cs));
-    const std::int32_t cz = static_cast<std::int32_t>(
-        std::floor(static_cast<double>(z) / cs));
-    const vv::voxel::Chunk* chunk = m_r->m_world->findChunk({cx, cz});
-    if (!chunk || chunk->voxelTypes().empty()) {
-      return nullptr;  // not streamed yet: far-LOD fallback in the builder
-    }
-    const std::size_t height = m_r->m_world->worldHeight();
-    const std::size_t lx = static_cast<std::size_t>(x - cx * cs);
-    const std::size_t lz = static_cast<std::size_t>(z - cz * cs);
-    // Column base of the X + Y*chunkX + Z*chunkX*H layout (consecutive
-    // y bytes are chunkSizeX apart = the builder's columnStride).
-    return chunk->voxelTypes().data() +
-           (lx + lz * cs * height);
-  }
-
-  std::uint16_t farHeightAt(std::int32_t x, std::int32_t z) const override {
-    if (!m_r->m_farFieldActive || m_r->m_farDim == 0) {
-      return 0;
-    }
-    // Same convention as the shader march: the cell containing the column
-    // CENTER.
-    const double fx = std::floor(
-        (static_cast<double>(x) + 0.5 - m_r->m_farOriginVoxX) /
-        static_cast<double>(m_r->m_farCell));
-    const double fz = std::floor(
-        (static_cast<double>(z) + 0.5 - m_r->m_farOriginVoxZ) /
-        static_cast<double>(m_r->m_farCell));
-    if (fx < 0.0 || fz < 0.0 ||
-        fx >= static_cast<double>(m_r->m_farDim) ||
-        fz >= static_cast<double>(m_r->m_farDim)) {
-      return 0;
-    }
-    return static_cast<std::uint16_t>(
-        m_r->m_farCells[static_cast<std::size_t>(fx) +
-                        static_cast<std::size_t>(fz) * m_r->m_farDim] &
-        0xFFFFu);
-  }
-
- private:
-  VulkanRenderer* m_r;
-};
-
-bool VulkanRenderer::createSunGridResources() {
-  if (!m_sunGridWanted) {
-    std::fprintf(stderr, "[vulkan] sun grid disabled (VV_SUN_GRID=0)\n");
-    vv::platform::crashLogCrumb("sungrid: disabled (VV_SUN_GRID=0)");
-    return true;  // explicitly disabled: march fallback
-  }
-  if (m_holeDebugX != kHoleDebugOff) {
-    std::fprintf(stderr,
-                 "[vulkan] sun grid off: VV_DEBUG_HOLE owns farParams.zw\n");
-    return true;
-  }
-
-  const std::uint32_t height = m_voxelConfig.worldHeight;
-  const VkDeviceSize fieldBytes =
-      static_cast<VkDeviceSize>(kSunGridXZ) * kSunGridXZ * height;
-  // The field memory is x + z*cols + y*cols*rows (y-planes last), so the
-  // texture maps x -> width, z -> height, y -> depth. The two ping-pong
-  // halves stack along DEPTH: extent = (XZ, XZ, 2 * worldHeight).
-  const std::uint32_t depth = 2u * height;
-
-  // Graceful-disable helper: any resource failure falls back to the march
-  // instead of failing init (shadows are a quality feature, not a
-  // prerequisite).
-  const auto bail = [this](const char* why) {
-    std::fprintf(stderr, "[vulkan] sun grid off: %s\n", why);
-    cleanupSunGridResources();
-    return true;
-  };
-
-  VkPhysicalDeviceProperties props{};
-  vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
-  if (props.limits.maxImageDimension3D < depth ||
-      props.limits.maxImageDimension3D < kSunGridXZ) {
-    return bail("3D image dimension limit too small");
-  }
-
-  // Persistently mapped staging buffer = the grid's publish target
-  // (SunLightGrid::configure's fieldStorage; the publish phase memcpys
-  // the finished field into it slice by slice).
-  vv::platform::crashLogCrumb("sungrid: init begin");
-  VkBufferCreateInfo stagingInfo{};
-  stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  stagingInfo.size = fieldBytes;
-  stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  if (vkCreateBuffer(m_device, &stagingInfo, nullptr, &m_sunStaging) !=
-      VK_SUCCESS) {
-    return bail("staging buffer creation failed");
-  }
-  VkMemoryRequirements stagingReq{};
-  vkGetBufferMemoryRequirements(m_device, m_sunStaging, &stagingReq);
-  const uint32_t stagingType = utils::findMemoryTypeIndex(
-      m_physicalDevice, stagingReq.memoryTypeBits,
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  if (stagingType == UINT32_MAX) {
-    return bail("no host-visible memory for the staging buffer");
-  }
-  VkMemoryAllocateInfo stagingAlloc{};
-  stagingAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  stagingAlloc.allocationSize = stagingReq.size;
-  stagingAlloc.memoryTypeIndex = stagingType;
-  if (vkAllocateMemory(m_device, &stagingAlloc, nullptr,
-                       &m_sunStagingMemory) != VK_SUCCESS) {
-    return bail("staging memory allocation failed");
-  }
-  if (vkBindBufferMemory(m_device, m_sunStaging, m_sunStagingMemory, 0) !=
-      VK_SUCCESS) {
-    return bail("staging memory bind failed");
-  }
-  if (vkMapMemory(m_device, m_sunStagingMemory, 0, VK_WHOLE_SIZE, 0,
-                  reinterpret_cast<void**>(&m_sunStagingMapped)) !=
-      VK_SUCCESS) {
-    return bail("staging memory map failed");
-  }
-  std::memset(m_sunStagingMapped, 0, static_cast<std::size_t>(fieldBytes));
-
-  vv::platform::crashLogCrumb("sungrid: staging ok");
-  // 3D texture: two ping-pong fields stacked along depth. GENERAL layout
-  // for its whole lifetime (transfers + sampling without layout churn).
-  VkImageCreateInfo imageInfo{};
-  imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  imageInfo.imageType = VK_IMAGE_TYPE_3D;
-  imageInfo.format = VK_FORMAT_R8_UNORM;
-  imageInfo.extent = {kSunGridXZ, kSunGridXZ, depth};
-  imageInfo.mipLevels = 1;
-  imageInfo.arrayLayers = 1;
-  imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-  imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-  imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                    VK_IMAGE_USAGE_SAMPLED_BIT;
-  imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(m_device, &imageInfo, nullptr, &m_sunImage) !=
-      VK_SUCCESS) {
-    return bail("3D image creation failed");
-  }
-  VkMemoryRequirements imageReq{};
-  vkGetImageMemoryRequirements(m_device, m_sunImage, &imageReq);
-  uint32_t imageType = utils::findMemoryTypeIndex(
-      m_physicalDevice, imageReq.memoryTypeBits,
-      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (imageType == UINT32_MAX) {
-    imageType = utils::findMemoryTypeIndex(
-        m_physicalDevice, imageReq.memoryTypeBits, 0);
-  }
-  if (imageType == UINT32_MAX) {
-    return bail("no memory type for the 3D image");
-  }
-  VkMemoryAllocateInfo imageAlloc{};
-  imageAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  imageAlloc.allocationSize = imageReq.size;
-  imageAlloc.memoryTypeIndex = imageType;
-  if (vkAllocateMemory(m_device, &imageAlloc, nullptr, &m_sunImageMemory) !=
-      VK_SUCCESS) {
-    return bail("3D image memory allocation failed");
-  }
-  if (vkBindImageMemory(m_device, m_sunImage, m_sunImageMemory, 0) !=
-      VK_SUCCESS) {
-    return bail("3D image memory bind failed");
-  }
-
-  vv::platform::crashLogCrumb("sungrid: image ok");
-  VkImageViewCreateInfo viewInfo{};
-  viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  viewInfo.image = m_sunImage;
-  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
-  viewInfo.format = VK_FORMAT_R8_UNORM;
-  viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_sunImageView) !=
-      VK_SUCCESS) {
-    return bail("3D image view creation failed");
-  }
-
-  // Trilinear, no mipmaps, clamped: the field is a smooth scalar over the
-  // world - the ONE fetch per pixel that replaces the shadow march.
-  VkSamplerCreateInfo samplerInfo{};
-  samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-  samplerInfo.magFilter = VK_FILTER_LINEAR;
-  samplerInfo.minFilter = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.maxLod = 0.0f;
-  if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_sunSampler) !=
-      VK_SUCCESS) {
-    return bail("sampler creation failed");
-  }
-
-  // One-shot UNDEFINED -> GENERAL transition.
-  {
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = m_commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-      return bail("layout-init command buffer allocation failed");
-    }
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-      vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-      return bail("layout-init begin failed");
-    }
-    VkImageMemoryBarrier toGeneral{};
-    toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toGeneral.srcAccessMask = 0;
-    toGeneral.dstAccessMask = 0;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toGeneral.image = m_sunImage;
-    toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT |
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-      vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-      return bail("layout-init end failed");
-    }
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) !=
-            VK_SUCCESS ||
-        vkQueueWaitIdle(m_graphicsQueue) != VK_SUCCESS) {
-      vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-      return bail("layout-init submit failed");
-    }
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-  }
-
-  std::fprintf(stderr,
-               "[vulkan] sun grid: resources created (%ux%ux%u image, "
-               "%.1f MB staging mapped)\n",
-               kSunGridXZ, kSunGridXZ, m_voxelConfig.worldHeight,
-               double(fieldBytes) / (1024.0 * 1024.0));
-
-  vv::platform::crashLogCrumb("sungrid: view+sampler+layout ok");
-  m_sunVoxels = std::make_unique<SunGridVoxels>(this);
-  const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
-  m_sunDir[0] = sun.x;
-  m_sunDir[1] = sun.y;
-  m_sunDir[2] = sun.z;
-  m_sunGrid.configure(kSunGridXZ, kSunGridXZ, height,
-                      m_voxelConfig.chunkSizeX, sun.x, sun.y, sun.z,
-                      static_cast<std::uint32_t>(m_maxTerrainVoxelY),
-                      m_sunVoxels.get(), m_sunStagingMapped);
-  m_sunGridEnabled = true;
-  std::fprintf(stderr,
-               "[vulkan] sun grid on: %ux%ux%u field (two halves), fill "
-               "budget %u voxels, %.1f ms/frame build slice\n",
-               kSunGridXZ, kSunGridXZ, height, kSunFillBudgetVoxels,
-               m_sunBuildBudgetMs);
-  vv::platform::crashLogCrumb("sungrid: configured + enabled");
-  return true;
-}
-
-void VulkanRenderer::cleanupSunGridResources() {
-  m_sunGridEnabled = false;
-  m_sunGridReady = false;
-  m_sunUploadPending = false;
-  m_sunVoxels.reset();
-  if (m_sunSampler != VK_NULL_HANDLE) {
-    vkDestroySampler(m_device, m_sunSampler, nullptr);
-    m_sunSampler = VK_NULL_HANDLE;
-  }
-  if (m_sunImageView != VK_NULL_HANDLE) {
-    vkDestroyImageView(m_device, m_sunImageView, nullptr);
-    m_sunImageView = VK_NULL_HANDLE;
-  }
-  if (m_sunImage != VK_NULL_HANDLE) {
-    vkDestroyImage(m_device, m_sunImage, nullptr);
-    m_sunImage = VK_NULL_HANDLE;
-  }
-  if (m_sunStagingMapped != nullptr) {
-    vkUnmapMemory(m_device, m_sunStagingMemory);
-    m_sunStagingMapped = nullptr;
-  }
-  if (m_sunStaging != VK_NULL_HANDLE) {
-    vkDestroyBuffer(m_device, m_sunStaging, nullptr);
-    m_sunStaging = VK_NULL_HANDLE;
-  }
-  if (m_sunImageMemory != VK_NULL_HANDLE) {
-    vkFreeMemory(m_device, m_sunImageMemory, nullptr);
-    m_sunImageMemory = VK_NULL_HANDLE;
-  }
-  if (m_sunStagingMemory != VK_NULL_HANDLE) {
-    vkFreeMemory(m_device, m_sunStagingMemory, nullptr);
-    m_sunStagingMemory = VK_NULL_HANDLE;
-  }
-}
-
-void VulkanRenderer::tickSunGrid() {
-  if (!m_sunGridEnabled || !m_world) {
-    return;
-  }
-  const auto t0 = std::chrono::steady_clock::now();
-
-  // Camera voxel position: drives the center-out build order and the
-  // window origin.
-  const auto& vs = m_voxelConfig.voxelSize;
-  const double camVoxX = static_cast<double>(m_camera.position().x) /
-                         static_cast<double>(vs.x);
-  const double camVoxZ = static_cast<double>(m_camera.position().z) /
-                         static_cast<double>(vs.z);
-  m_sunGrid.setCenter(camVoxX, camVoxZ);
-
-  // Reconfiguration only happens at cycle boundaries so a running build
-  // stays coherent (its columns map to one origin/sun). Chunk installs
-  // and far swaps just flag requestRebuild() - the next cycle picks the
-  // new data up.
-  if (m_sunGrid.idle()) {
-    const double half = 0.5 * kSunGridXZ;
-    const double snap = static_cast<double>(kSunGridOriginSnap);
-    const std::int32_t ox = static_cast<std::int32_t>(
-                                std::floor((camVoxX - half) / snap)) *
-                            kSunGridOriginSnap;
-    const std::int32_t oz = static_cast<std::int32_t>(
-                                std::floor((camVoxZ - half) / snap)) *
-                            kSunGridOriginSnap;
-    if (ox != m_sunAppliedOriginX || oz != m_sunAppliedOriginZ) {
-      m_sunGrid.setOrigin(ox, oz);
-      m_sunAppliedOriginX = ox;
-      m_sunAppliedOriginZ = oz;
-      m_sunGrid.requestRebuild();
-    }
-    const glm::vec3 sun = glm::normalize(m_lighting.lightDir);
-    if (std::abs(static_cast<double>(sun.x) - m_sunDir[0]) > 1e-9 ||
-        std::abs(static_cast<double>(sun.y) - m_sunDir[1]) > 1e-9 ||
-        std::abs(static_cast<double>(sun.z) - m_sunDir[2]) > 1e-9) {
-      m_sunDir[0] = sun.x;
-      m_sunDir[1] = sun.y;
-      m_sunDir[2] = sun.z;
-      m_sunGrid.configure(kSunGridXZ, kSunGridXZ,
-                          m_voxelConfig.worldHeight,
-                          m_voxelConfig.chunkSizeX, sun.x, sun.y, sun.z,
-                          static_cast<std::uint32_t>(m_maxTerrainVoxelY),
-                          m_sunVoxels.get(), m_sunStagingMapped);
-      m_sunGrid.requestRebuild();
-    }
-    // The cycle that may start in this tick builds with this origin.
-    m_sunCycleOriginX = m_sunAppliedOriginX;
-    m_sunCycleOriginZ = m_sunAppliedOriginZ;
-  }
-
-  // No NEW cycle while the region streams (initial load or a crossing):
-  // columns whose chunks have not installed yet would seed from far-LOD
-  // max heights and publish a garbage-dark field (the pass-26.1 release
-  // report: 'everything is shadowed'). A RUNNING cycle finishes - it is
-  // coherent for its origin; install-triggered requestRebuild() flags
-  // accumulate while held. Until the first publish the shader keeps the
-  // exact-march shadows (enabled flag off), and during crossings the
-  // previously published field still covers the camera (the window is
-  // wider than the region), so nothing visible regresses.
-  const bool holding = m_sunGrid.idle() && m_streamActive;
-  if (!holding && m_sunGrid.tick(m_sunBuildBudgetMs)) {
-    // A coherent field snapshot now sits in the staging buffer; the copy
-    // into the inactive texture half is recorded by the next
-    // recordCommandBuffer (the GPU keeps serving the previous half).
-    m_sunUploadPending = true;
-    char crumb[160];
-    std::snprintf(crumb, sizeof(crumb),
-                  "sungrid: cycle complete, origin (%d,%d), %llu lit",
-                  m_sunCycleOriginX, m_sunCycleOriginZ,
-                  static_cast<unsigned long long>(m_sunGrid.litCells()));
-    vv::platform::crashLogCrumb(crumb);
-  }
-
-  m_perfSunMs += std::chrono::duration<double, std::milli>(
-                     std::chrono::steady_clock::now() - t0)
-                     .count();
 }
 
 // Rewrites the far-LOD cells covered by the region's chunks with the REAL
@@ -2237,30 +1756,14 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   texInfoBinding.descriptorCount = 1;
   texInfoBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  // Sun light field (pass 26): one 3D texture with TWO ping-pong field
-  // halves stacked along depth + its own trilinear clamp sampler. The
-  // half index travels in farParams.z (push constants), so no descriptor
-  // update is needed when the halves flip.
-  VkDescriptorSetLayoutBinding sunFieldBinding{};
-  sunFieldBinding.binding = 11;
-  sunFieldBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-  sunFieldBinding.descriptorCount = 1;
-  sunFieldBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  VkDescriptorSetLayoutBinding sunSamplerBinding{};
-  sunSamplerBinding.binding = 12;
-  sunSamplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-  sunSamplerBinding.descriptorCount = 1;
-  sunSamplerBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
-      textureArrayBinding, textureSamplerBinding, texInfoBinding,
-      sunFieldBinding, sunSamplerBinding};
+      textureArrayBinding, textureSamplerBinding, texInfoBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 13;
+  info.bindingCount = 11;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -2557,10 +2060,6 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     }
   }
 
-  // Whole-region synchronous rebuild (teleport): the light field must
-  // rebuild against the new world data (pass 26).
-  m_sunGrid.requestRebuild();
-
   return true;
 }
 
@@ -2651,23 +2150,20 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   poolSizes[0].descriptorCount = 8;  // voxel atlas, output, chunk table,
-                                    // palette, column heights, far LOD,
-                                    // chunk fade, texture info table
+                                     // palette, column heights, far LOD,
+                                     // chunk fade, texture info table
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   poolSizes[1].descriptorCount = 1;
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-  // bindless texture array capacity + the sun light 3D field (pass 26)
-  poolSizes[2].descriptorCount = vv::voxel::kMaxVoxelTextures + 1;
+  poolSizes[2].descriptorCount =
+      vv::voxel::kMaxVoxelTextures;  // bindless texture array capacity
   poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-  poolSizes[3].descriptorCount = 2;  // voxel sampler + sun field sampler
+  poolSizes[3].descriptorCount = 1;
 
   VkDescriptorPoolCreateInfo pool{};
   pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool.maxSets = 1;
-  // All four size classes are actually allocated from (the old count of
-  // 2 predates the bindless texture passes and under-declared the pool;
-  // drivers happened to tolerate it, but the sun field makes it exact).
-  pool.poolSizeCount = 4;
+  pool.poolSizeCount = 2;
   pool.pPoolSizes = poolSizes;
 
   VkResult r =
@@ -2726,7 +2222,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[13] = {};
+  VkWriteDescriptorSet writes[11] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2831,39 +2327,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[10].pBufferInfo = &texInfoInfo;
 
-  // Sun light field (pass 26): the image lives in GENERAL layout for its
-  // whole lifetime (transfers + sampling), so the descriptor never needs
-  // an update - the halves flip via the push-constant index. When the grid
-  // is disabled the bindings stay unwritten: the shader only touches them
-  // under the push-constant enabled flag (farParams.w), so an undefined
-  // descriptor is never accessed.
-  uint32_t writeCount = 11;
-  if (m_sunImageView != VK_NULL_HANDLE) {
-    VkDescriptorImageInfo sunFieldInfo{};
-    sunFieldInfo.sampler = VK_NULL_HANDLE;
-    sunFieldInfo.imageView = m_sunImageView;
-    sunFieldInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[11].dstSet = m_descriptorSet;
-    writes[11].dstBinding = 11;
-    writes[11].descriptorCount = 1;
-    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    writes[11].pImageInfo = &sunFieldInfo;
-
-    VkDescriptorImageInfo sunSamplerInfo{};
-    sunSamplerInfo.sampler = m_sunSampler;
-    sunSamplerInfo.imageView = VK_NULL_HANDLE;
-    sunSamplerInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[12].dstSet = m_descriptorSet;
-    writes[12].dstBinding = 12;
-    writes[12].descriptorCount = 1;
-    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    writes[12].pImageInfo = &sunSamplerInfo;
-    writeCount = 13;
-  }
-
-  vkUpdateDescriptorSets(m_device, writeCount, writes, 0, nullptr);
+  vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
   return true;
 }
 
@@ -2996,57 +2460,6 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     return false;
   }
 
-  // Pass 26: publish the finished sun light field into the INACTIVE
-  // texture half, then flip the served half. The previous in-flight frame
-  // samples the old half via its own push-constant snapshot; the copy
-  // targets the other half, so the two never overlap.
-  if (m_sunUploadPending) {
-    m_sunUploadPending = false;
-    const std::uint32_t target = 1u - m_sunFieldHalf;
-    {
-      char crumb[96];
-      std::snprintf(crumb, sizeof(crumb),
-                    "sungrid: publishing field half %u into texture "
-                    "(frame %u)",
-                    target, m_frameCounter);
-      vv::platform::crashLogCrumb(crumb);
-    }
-    VkBufferImageCopy fieldCopy{};
-    fieldCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    fieldCopy.imageOffset = {
-        0, 0, static_cast<std::int32_t>(target * m_voxelConfig.worldHeight)};
-    fieldCopy.imageExtent = {
-        kSunGridXZ, kSunGridXZ, m_voxelConfig.worldHeight};
-    vkCmdCopyBufferToImage(cmd, m_sunStaging, m_sunImage,
-                           VK_IMAGE_LAYOUT_GENERAL, 1, &fieldCopy);
-    VkImageMemoryBarrier fieldBarrier{};
-    fieldBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    fieldBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    fieldBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    fieldBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    fieldBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    fieldBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    fieldBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    fieldBarrier.image = m_sunImage;
-    fieldBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &fieldBarrier);
-    m_sunFieldHalf = target;
-    // The push below must describe the field CONTENT just uploaded: the
-    // window origin of the cycle that produced it.
-    m_sunOriginX = m_sunCycleOriginX;
-    m_sunOriginZ = m_sunCycleOriginZ;
-    if (!m_sunGridReady) {
-      std::fprintf(stderr,
-                   "[vulkan] sun grid: first field published (origin "
-                   "(%d,%d), %llu lit cells)\n",
-                   m_sunOriginX, m_sunOriginZ,
-                   static_cast<unsigned long long>(m_sunGrid.litCells()));
-    }
-    m_sunGridReady = true;
-  }
-
   VkBufferMemoryBarrier preComputeBarriers[4] = {};
   preComputeBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
   preComputeBarriers[0].srcAccessMask = 0;
@@ -3107,9 +2520,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   push.chunkSize =
       glm::uvec4(m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
                  m_voxelConfig.chunkSizeZ, m_voxelConfig.maxTraceSteps);
-  // voxelSize.w doubles as the sun-grid window origin X (voxels; pass 26).
-  push.voxelSize = glm::vec4(m_voxelConfig.voxelSize,
-                             static_cast<float>(m_sunOriginX));
+  push.voxelSize = glm::vec4(m_voxelConfig.voxelSize, 0.0f);
   // The origin matches whatever table half is active - during streaming
   // that is the TARGET grid (published incrementally by the pump), not
   // the old region center.
@@ -3117,37 +2528,30 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
       m_tableOriginX - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
   const int32_t originZ =
       m_tableOriginZ - static_cast<int32_t>(m_voxelConfig.renderRadiusChunks);
-  // region.y doubles as the sun-grid window origin Z (voxels; pass 26);
   // region.w = chunk-table half (ping-pong; the swap path writes the
   // inactive half and flips this index - no device wait).
-  push.region = glm::ivec4(originX, m_sunOriginZ, originZ,
+  push.region = glm::ivec4(originX, 0, originZ,
                            static_cast<int32_t>(m_tableHalf));
   push.grid = glm::uvec4(m_voxelConfig.gridWidth(), m_voxelConfig.gridHeight(),
                          static_cast<uint32_t>(m_voxelResources.slotWordStride()),
                          static_cast<uint32_t>(m_maxTerrainVoxelY));
-  // farParams.z/w are shared by two mutually exclusive debug/feature
-  // channels: the sun light field half + enabled flag (pass 26; the grid
-  // is force-disabled when VV_DEBUG_HOLE is armed), or the VV_DEBUG_HOLE
-  // target chunk (z encodes x+4096 as the on-flag).
-  float sunZ = 0.0f;
-  float sunW = 0.0f;
-  if (m_sunGridEnabled && m_sunGridReady) {
-    sunZ = static_cast<float>(m_sunFieldHalf);
-    sunW = 1.0f;
-  } else if (m_holeDebugX != kHoleDebugOff) {
-    sunZ = static_cast<float>(m_holeDebugX + 4096);
-    sunW = static_cast<float>(m_holeDebugZ);
-  }
   if (m_farFieldActive) {
     push.far = glm::ivec4(m_farOriginVoxX, m_farOriginVoxZ,
                           static_cast<int32_t>(m_farDim),
                           static_cast<int32_t>(m_farDim));
     // farParams.y = far-field half (ping-pong; see uploadFarFieldHalf).
+    // z/w = VV_DEBUG_HOLE target chunk (z encodes x+4096 as the on-flag).
+    float holeZ = 0.0f;
+    float holeW = 0.0f;
+    if (m_holeDebugX != kHoleDebugOff) {
+      holeZ = static_cast<float>(m_holeDebugX + 4096);
+      holeW = static_cast<float>(m_holeDebugZ);
+    }
     push.farParams = glm::vec4(static_cast<float>(m_farCell),
-                               static_cast<float>(m_farHalf), sunZ, sunW);
+                               static_cast<float>(m_farHalf), holeZ, holeW);
   } else {
     push.far = glm::ivec4(0, 0, 0, 0);  // z = 0: far LOD off in the shader
-    push.farParams = glm::vec4(0.0f, 0.0f, sunZ, sunW);
+    push.farParams = glm::vec4(0.0f);
   }
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(push), &push);
