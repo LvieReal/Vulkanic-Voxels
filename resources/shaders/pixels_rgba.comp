@@ -671,6 +671,10 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
     const float maxTerr = float(pc.grid.w) + 1.0;
     float visibility = 1.0;
     float s = 0.0;
+    // Quilez/Aaltonen's triangulation uses the previous distance as well as
+    // the current one. Keeping this invalid across an empty coarse-cell jump
+    // avoids connecting unrelated samples when the marcher skips a region.
+    float previousDistance = 1e20;
     for (int i = 0; i < 128; ++i) {
         const vec3 p = origin + sunV * s;
         if (p.y >= maxTerr || p.y >= float(pc.chunkSize.y)) {
@@ -695,15 +699,38 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
             }
             // A fractional-opacity foliage cell is not a blocker: move to
             // its next boundary and keep reading occupancy beyond it.
+            previousDistance = 1e20;
             s += max(nextShadowCellDistance(p, sunV) + 1e-3, 0.02);
         } else {
-            // Ratio-based SDF soft shadows: clear space close to a blocker
-            // gets a fractional visibility instead of a binary boundary.
-            // `stepLimit` still clips traversal to the current cell/coarse
-            // cell, but does not flatten the distance used for the penumbra.
-            const float penumbra = clamp(
-                8.0 * sdfDistance / max(s, 0.01), 0.0, 1.0);
-            visibility = min(visibility, penumbra);
+            // Quilez's improved soft-shadow estimate triangulates between the
+            // previous and current SDF spheres. Sampling only the current
+            // sphere lets missed near-grazes show up as marching-step-shaped
+            // light leaks, which is the wireframe artifact this experiment is
+            // intended to avoid. The old k=8 behavior is retained by writing
+            // the improved estimate as k * d / (t - y).
+            float penumbra = 1.0;
+            const bool hasDistance = sdfDistance < 1e20;
+            if (hasDistance) {
+                if (previousDistance < 1e20) {
+                    const float y = sdfDistance * sdfDistance /
+                                    (2.0 * max(previousDistance, 0.05));
+                    const float d2 = max(
+                        sdfDistance * sdfDistance - y * y, 0.0);
+                    penumbra = 8.0 * sqrt(d2) /
+                               max(s - y, 0.01);
+                } else {
+                    // First valid sample after a skipped region: use the
+                    // original estimate until a pair of adjacent samples is
+                    // available for triangulation.
+                    penumbra = 8.0 * sdfDistance / max(s, 0.01);
+                }
+                previousDistance = sdfDistance;
+            } else {
+                // Do not triangulate across a coarse-cell skip: its distance
+                // is a traversal sentinel, not a sampled surface distance.
+                previousDistance = 1e20;
+            }
+            visibility = min(visibility, clamp(penumbra, 0.0, 1.0));
             s += max(min(sdfDistance * 0.85, stepLimit), 0.02);
         }
     }
