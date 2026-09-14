@@ -951,6 +951,16 @@ void VulkanRenderer::finishRegionMove() {
   // have a slot; an empty one is a real missing chunk).
   publishRegionTable(true);
 
+  // The streamed region is complete and fully published: adopt the
+  // target as the current region center and stop streaming. Without
+  // this, the pump re-ran this whole finish path every frame at rest
+  // (the pass-13 fix, lost in the light-grid reverts), and
+  // m_regionCenter stayed pinned to the last SYNCHRONOUS rebuild - so
+  // the idle check, the fog-cut box (far-LOD off) and the far-seam
+  // patch scan all keyed off a stale center after streamed moves.
+  m_regionCenter = m_streamTarget;
+  m_streamActive = false;
+
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.

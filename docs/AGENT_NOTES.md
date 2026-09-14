@@ -176,3 +176,28 @@ opcodes. Note for the optimization hunt: finishRegionMove() still never
 clears m_streamActive (the pass-13 bug, lost in the reverts), so the
 pump re-runs the full region-table publish every frame AT REST - a
 likely CPU-side constant cost; fix parked in 20ca086 as the next pass.
+
+Pass 32 (owner-directed, from the first Nsight profile): KILL THE INTEGER
+DIVISIONS + FIX THE STUCK STREAM FLAG. Nsight showed floorDiv's first two
+lines ('/' and '%') as the #1/#2 hotspots (14% + 12%) and resolveColumn's
+bounds check right behind. Three changes, image bit-identical:
+1) floorDiv power-of-two fast path: every divisor here is pow2 (chunk 32,
+block 8), and arithmetic >> log2(b) IS floor division for two's
+complement (SPIR-V OpShiftRightArithmetic is sign-extending by spec;
+identity pinned by a new CPU test). SPIR-V check: OpSDiv 5->1, OpUDiv
+3->1 (survivors = generic fallback + far-hole debug), shift count up.
+2) resolveColumn hoisted to ONCE per column in the march: the block
+bound, height bound and Y-walk all reuse the slot/local pair
+(columnHeightAt/blockHeightAt take the resolved pair; the old
+columnHeightBound/blockHeightBound re-resolved per call - 2-3
+resolveColumns per column). Shadow march ditto. The Y-walk's
+voxelTypeAt fallback for unresolved columns was always-0 dead work -
+unresolved columns now skip the walk entirely. Block-grid math in the
+shader now rounds UP like the CPU builder (no behavior change at 32).
+3) finishRegionMove() now adopts m_streamTarget as m_regionCenter and
+clears m_streamActive (pass-13 fix, lost in the reverts): without it the
+pump re-ran the full finish path EVERY FRAME AT REST, and m_regionCenter
+stayed pinned to the last synchronous rebuild (stale fog-cut box with
+far-LOD off + far-seam patch scan off-center after streamed moves).
+Validated: CPU parity 3-way unchanged, both builds warning-free, ctest
+green x2, smoke x2.
