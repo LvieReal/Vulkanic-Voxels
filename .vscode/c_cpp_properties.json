@@ -13,7 +13,8 @@
                 "UNICODE",
                 "_UNICODE",
                 "WIN32_LEAN_AND_MEAN",
-                "NOMINMAX"
+                "NOMINMAX",
+                "GLFW_INCLUDE_NONE=1"
             ],
             "windowsSdkVersion": "10.0.26100.0",
             "intelliSenseMode": "windows-gcc-x64",
@@ -27,12 +28,12 @@
                 "${workspaceFolder}/**",
                 "${workspaceFolder}/src/**",
                 "/usr/include/**",
-                "/usr/include/x86_64-linux-gnu/**",
-                "${QT_INCLUDE_DIR}/**"
+                "/usr/include/x86_64-linux-gnu/**"
             ],
             "defines": [
-                "VV_HAVE_XCB=1",
-                "VV_HAVE_WAYLAND=1"
+                "GLFW_INCLUDE_NONE=1",
+                "VV_WINDOW_BACKEND_X11=1",
+                "VV_WINDOW_BACKEND_WAYLAND=1"
             ],
             "intelliSenseMode": "linux-gcc-x64",
             "compilerPath": "/usr/bin/g++",

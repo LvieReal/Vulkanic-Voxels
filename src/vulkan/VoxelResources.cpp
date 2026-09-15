@@ -1,6 +1,7 @@
 #include "vulkan/VoxelResources.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -120,13 +121,63 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 		const VkDeviceSize farBytes =
 				static_cast<VkDeviceSize>(farDim) * farDim * 4u * kFarHalves;
 		if (!utils::createBuffer(device, physicalDevice, farBytes,
-															VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-																	VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-															VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-															m_farBuffer, m_farMemory, outError)) {
+								VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+								VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+								VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+								m_farBuffer, m_farMemory, outError)) {
 			cleanup(device);
 			return false;
 		}
+	}
+
+	// 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1; binding 12 + 13): the
+	// argmin-seed storage buffer (one u32 per SDF-box cell) + the box
+	// geometry uniform. Always created (like the far buffer) so the
+	// bindings are valid; the shader only reads them when the box
+	// uniform's active flag is set (VV_SDF_SHADOWS=1 AND a field uploaded).
+	// Box = 2*kSdfHalfChunks chunks on X/Z, full world height on Y.
+	{
+		const std::uint64_t sdfNx =
+				2u * kSdfHalfChunks * static_cast<std::uint64_t>(config.chunkSizeX);
+		const std::uint64_t sdfNy =
+				static_cast<std::uint64_t>(config.worldHeight);
+		const std::uint64_t sdfNz =
+				2u * kSdfHalfChunks * static_cast<std::uint64_t>(config.chunkSizeZ);
+		m_sdfCells = sdfNx * sdfNy * sdfNz;
+		// Two halves (pass 42): the copy fills the one no live box points at.
+		const VkDeviceSize sdfBytes =
+				static_cast<VkDeviceSize>(m_sdfCells) * 4u * vv::voxel::kSdfHalves;
+		if (!utils::createBuffer(device, physicalDevice, sdfBytes,
+								VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+								VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+								VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+								m_sdfBuffer, m_sdfMemory, outError)) {
+			cleanup(device);
+			return false;
+		}
+		// Box-geometry uniform (binding 13): ivec4 box + uvec4 dims (32
+		// bytes). HOST_VISIBLE + COHERENT: written from mapped memory.
+		// Starts INACTIVE (box.w = -1) so the shader uses the 2.5D
+		// fallback until a field is uploaded.
+		const VkDeviceSize sdfBoxBytes = 2u * 16u;
+		if (!utils::createBuffer(device, physicalDevice, sdfBoxBytes,
+								VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+								VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+								VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+								m_sdfBoxBuffer, m_sdfBoxMemory, outError)) {
+			cleanup(device);
+			return false;
+		}
+		VkResult sbr = vkMapMemory(device, m_sdfBoxMemory, 0, VK_WHOLE_SIZE, 0,
+								 &m_mappedSdfBox);
+		if (sbr != VK_SUCCESS || m_mappedSdfBox == nullptr) {
+			outError = "Failed to map the SDF box uniform.";
+			cleanup(device);
+			return false;
+		}
+		std::memset(m_mappedSdfBox, 0, static_cast<std::size_t>(sdfBoxBytes));
+		std::int32_t* boxI = static_cast<std::int32_t*>(m_mappedSdfBox);
+		boxI[3] = -1;  // box.w = inactive
 	}
 
 	// Triple-buffered (kTableHalves, see header): region swaps write the
@@ -358,12 +409,20 @@ bool VoxelResources::createVoxelTextures(
 		return false;
 	}
 
+	// Stage masks are parameters, not constants: srcAccessMask must be
+	// supported by srcStageMask and dstAccessMask by dstStageMask
+	// (VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02819/02820). A fixed
+	// TOP_OF_PIPE -> TRANSFER pair is only right for the first transition
+	// below: the mip transitions have a transfer WRITE to flush, and the last
+	// one hands the image over to the compute stage.
 	auto imageBarrier = [&](std::uint32_t image, std::uint32_t baseMip,
 													std::uint32_t mipCount,
 													VkImageLayout oldLayout,
 													VkImageLayout newLayout,
 													VkAccessFlags srcAccess,
-													VkAccessFlags dstAccess) {
+													VkPipelineStageFlags srcStage,
+													VkAccessFlags dstAccess,
+													VkPipelineStageFlags dstStage) {
 		VkImageMemoryBarrier b{};
 		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 		b.srcAccessMask = srcAccess;
@@ -378,15 +437,16 @@ bool VoxelResources::createVoxelTextures(
 		b.subresourceRange.levelCount = mipCount;
 		b.subresourceRange.baseArrayLayer = 0;
 		b.subresourceRange.layerCount = 1;
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-												 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-												 nullptr, 1, &b);
+		vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr,
+											 1, &b);
 	};
 
 	for (std::uint32_t i = 0; i < count; ++i) {
 		imageBarrier(i, 0, mips[i], VK_IMAGE_LAYOUT_UNDEFINED,
 								 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-								 VK_ACCESS_TRANSFER_WRITE_BIT);
+								 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+								 VK_ACCESS_TRANSFER_WRITE_BIT,
+								 VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 		VkBufferImageCopy region{};
 		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -404,7 +464,9 @@ bool VoxelResources::createVoxelTextures(
 			imageBarrier(i, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 									 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 									 VK_ACCESS_TRANSFER_WRITE_BIT,
-									 VK_ACCESS_TRANSFER_READ_BIT);
+									 VK_PIPELINE_STAGE_TRANSFER_BIT,
+									 VK_ACCESS_TRANSFER_READ_BIT,
+									 VK_PIPELINE_STAGE_TRANSFER_BIT);
 			const auto srcW = static_cast<std::int32_t>(
 					std::max<std::uint32_t>(all[i].width >> (m - 1), 1u));
 			const auto srcH = static_cast<std::int32_t>(
@@ -460,9 +522,11 @@ bool VoxelResources::createVoxelTextures(
 			imageBarrier(i, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 									 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 									 VK_ACCESS_TRANSFER_WRITE_BIT,
-									 VK_ACCESS_SHADER_READ_BIT);
-			// imageBarrier pipelines TOP_OF_PIPE -> TRANSFER; the final
-			// visibility to compute is guaranteed by the queue idle below.
+									 VK_PIPELINE_STAGE_TRANSFER_BIT,
+									 VK_ACCESS_SHADER_READ_BIT,
+									 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			// Submitted on its own and followed by a queue idle, so the compute
+			// stage is the one that reads the texture afterwards.
 		}
 	}
 
@@ -839,9 +903,13 @@ bool VoxelResources::uploadChunksStreaming(
 	const std::uint32_t idx = m_streamParity ^ 1u;
 	if (m_streamFencePending[idx]) {
 		vkWaitForFences(device, 1, &m_streamFence[idx], VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_streamFence[idx]);
 		m_streamFencePending[idx] = false;
 	}
+	// The fences are created SIGNALED so the first wait in a slot returns
+	// immediately, and a signaled fence must be reset before it is submitted
+	// again (VUID-vkQueueSubmit-fence-00063). Resetting here - rather than
+	// inside the pending branch - covers the first submit in each slot too.
+	vkResetFences(device, 1, &m_streamFence[idx]);
 
 	// Staging layout: [voxel bytes][heightmap words][block maxima].
 	const auto& types = upload.chunk->voxelTypes();
@@ -975,10 +1043,11 @@ bool VoxelResources::ensureFarUploadResources(
 }
 
 void VoxelResources::waitPreviousFarUpload(VkDevice device) {
+	// Waits only: every submit resets its own fence (they are created
+	// SIGNALED - VUID-vkQueueSubmit-fence-00063), pending or not.
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_farFencePending[k]) {
 			vkWaitForFences(device, 1, &m_farFence[k], VK_TRUE, UINT64_MAX);
-			vkResetFences(device, 1, &m_farFence[k]);
 			m_farFencePending[k] = false;
 		}
 	}
@@ -1033,6 +1102,7 @@ bool VoxelResources::uploadFarFieldHalf(
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &m_farCmd[idx];
+	vkResetFences(device, 1, &m_farFence[idx]);
 	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far field upload.";
@@ -1078,9 +1148,11 @@ bool VoxelResources::uploadFarFieldDelta(
 	const std::uint32_t idx = m_farParity ^ 1u;
 	if (m_farFencePending[idx]) {
 		vkWaitForFences(device, 1, &m_farFence[idx], VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_farFence[idx]);
 		m_farFencePending[idx] = false;
 	}
+	// See uploadChunksStreaming: the fence must be unsignaled for the submit,
+	// and it starts life signaled.
+	vkResetFences(device, 1, &m_farFence[idx]);
 
 	std::size_t src = 0;
 	auto* staging = static_cast<std::uint32_t*>(m_farStagingMapped[idx]);
@@ -1128,6 +1200,7 @@ bool VoxelResources::uploadFarFieldDelta(
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &m_farCmd[idx];
+	vkResetFences(device, 1, &m_farFence[idx]);
 	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far delta upload.";
@@ -1136,6 +1209,168 @@ bool VoxelResources::uploadFarFieldDelta(
 	m_farFencePending[idx] = true;  // async; the next far upload waits it
 	m_farParity = idx;
 	return true;
+}
+
+bool VoxelResources::ensureSdfUploadResources(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		std::string& outError) {
+	if (m_sdfStaging != VK_NULL_HANDLE) {
+		return true;
+	}
+	const VkDeviceSize bytes =
+			static_cast<VkDeviceSize>(m_sdfCells) * 4u;
+	if (bytes == 0) {
+		outError = "SDF buffer is not sized on this resource set.";
+		return false;
+	}
+	if (!utils::createBuffer(device, physicalDevice, bytes,
+							VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+							VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+							VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+							m_sdfStaging, m_sdfStagingMemory, outError)) {
+		return false;
+	}
+	VkResult r = vkMapMemory(device, m_sdfStagingMemory, 0, VK_WHOLE_SIZE, 0,
+							 &m_sdfStagingMapped);
+	if (r != VK_SUCCESS || m_sdfStagingMapped == nullptr) {
+		outError = "Failed to map SDF staging memory.";
+		return false;
+	}
+	VkCommandBufferAllocateInfo alloc{};
+	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	alloc.commandPool = commandPool;
+	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc.commandBufferCount = 1;
+	r = vkAllocateCommandBuffers(device, &alloc, &m_sdfCmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to allocate SDF upload command buffer.";
+		return false;
+	}
+	VkFenceCreateInfo fence{};
+	fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+	r = vkCreateFence(device, &fence, nullptr, &m_sdfFence);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to create SDF upload fence.";
+		return false;
+	}
+	m_sdfCommandPool = commandPool;
+	return true;
+}
+
+bool VoxelResources::beginSdfUpload(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		VkQueue queue, const std::vector<std::uint32_t>& seeds,
+		std::uint32_t half, std::int32_t boxX, std::int32_t boxY,
+		std::int32_t boxZ,
+		std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
+		std::string& outError) {
+	(void)boxX; (void)boxY; (void)boxZ; (void)nx; (void)ny; (void)nz;
+	if (m_sdfBuffer == VK_NULL_HANDLE) {
+		outError = "SDF buffer is not enabled on this resource set.";
+		return false;
+	}
+	if (seeds.size() != m_sdfCells) {
+		outError = "SDF size does not match the SDF buffer.";
+		return false;
+	}
+	if (half >= vv::voxel::kSdfHalves) {
+		outError = "SDF half index out of range.";
+		return false;
+	}
+	if (!ensureSdfUploadResources(device, physicalDevice, commandPool,
+								 outError)) {
+		return false;
+	}
+	// The staging buffer may only be rewritten once the previous copy out of
+	// it has landed. The caller never starts a new upload before the last one
+	// was published, and publishing requires this fence, so this wait is
+	// retired by construction - it is here for the safety of the invariant,
+	// not as a frame cost.
+	if (m_sdfFencePending) {
+		vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
+		m_sdfFencePending = false;
+	}
+	// Created SIGNALED (see uploadChunksStreaming): reset before every submit,
+	// not only for the submits that found it still pending.
+	vkResetFences(device, 1, &m_sdfFence);
+	std::memcpy(m_sdfStagingMapped, seeds.data(),
+				seeds.size() * sizeof(std::uint32_t));
+	VkResult r = vkResetCommandBuffer(m_sdfCmd, 0);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to reset SDF upload command buffer.";
+		return false;
+	}
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	r = vkBeginCommandBuffer(m_sdfCmd, &begin);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to begin SDF upload command buffer.";
+		return false;
+	}
+	VkBufferCopy region{};
+	region.srcOffset = 0;
+	// The spare half: the live one keeps holding exactly the seeds the
+	// published box describes for as long as any frame can read them.
+	region.dstOffset = static_cast<VkDeviceSize>(half) * m_sdfCells * 4u;
+	region.size = static_cast<VkDeviceSize>(seeds.size()) * 4u;
+	vkCmdCopyBuffer(m_sdfCmd, m_sdfStaging, m_sdfBuffer, 1, &region);
+	r = vkEndCommandBuffer(m_sdfCmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to end SDF upload command buffer.";
+		return false;
+	}
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &m_sdfCmd;
+	r = vkQueueSubmit(queue, 1, &submit, m_sdfFence);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit SDF upload.";
+		return false;
+	}
+	// Pass 42: hand back with the copy in flight. The frame polls
+	// sdfUploadComplete() and only then publishes the box, so nothing waits
+	// here - the copy rides the queue behind the frames that read the old
+	// pairing and lands on its own.
+	m_sdfFencePending = true;
+	return true;
+}
+
+bool VoxelResources::sdfUploadComplete(VkDevice device) {
+	if (!m_sdfFencePending || m_sdfFence == VK_NULL_HANDLE) {
+		return false;
+	}
+	return vkGetFenceStatus(device, m_sdfFence) == VK_SUCCESS;
+}
+
+void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
+		std::int32_t boxZ, std::uint32_t nx, std::uint32_t ny,
+		std::uint32_t nz, bool active, std::uint32_t half) {
+	if (m_mappedSdfBox == nullptr) {
+		return;
+	}
+	std::uint32_t* w = static_cast<std::uint32_t*>(m_mappedSdfBox);
+	// Payload first, `box.w` (the active word the shader tests) LAST: a
+	// dispatch that samples this buffer mid-write must not see "active"
+	// next to an origin that is still the previous build's (pass 42).
+	w[0] = static_cast<std::uint32_t>(boxX);
+	w[1] = static_cast<std::uint32_t>(boxY);
+	w[2] = static_cast<std::uint32_t>(boxZ);
+	w[4] = active ? nx : 0u;
+	w[5] = active ? ny : 0u;
+	w[6] = active ? nz : 0u;
+	w[7] = active ? half : 0u;  // dims.w = the half the seeds live in
+	std::atomic_thread_fence(std::memory_order_release);
+	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
+}
+
+void VoxelResources::clearSdfBox() {
+	if (m_mappedSdfBox == nullptr) {
+		return;
+	}
+	writeSdfBox(0, 0, 0, 0, 0, 0, false, 0);
 }
 
 bool VoxelResources::writeChunkTable(
@@ -1280,6 +1515,47 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_farMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_farMemory, nullptr);
 		m_farMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfStaging != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfStaging, nullptr);
+		m_sdfStaging = VK_NULL_HANDLE;
+	}
+	if (m_sdfStagingMemory != VK_NULL_HANDLE) {
+		if (m_sdfStagingMapped != nullptr) {
+			vkUnmapMemory(device, m_sdfStagingMemory);
+			m_sdfStagingMapped = nullptr;
+		}
+		vkFreeMemory(device, m_sdfStagingMemory, nullptr);
+		m_sdfStagingMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfCmd != VK_NULL_HANDLE && m_sdfCommandPool != VK_NULL_HANDLE) {
+		vkFreeCommandBuffers(device, m_sdfCommandPool, 1, &m_sdfCmd);
+		m_sdfCmd = VK_NULL_HANDLE;
+	}
+	m_sdfCommandPool = VK_NULL_HANDLE;
+	if (m_sdfFence != VK_NULL_HANDLE) {
+		vkDestroyFence(device, m_sdfFence, nullptr);
+		m_sdfFence = VK_NULL_HANDLE;
+	}
+	if (m_sdfBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfBuffer, nullptr);
+		m_sdfBuffer = VK_NULL_HANDLE;
+	}
+	if (m_sdfMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_sdfMemory, nullptr);
+		m_sdfMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfBoxBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfBoxBuffer, nullptr);
+		m_sdfBoxBuffer = VK_NULL_HANDLE;
+	}
+	if (m_sdfBoxMemory != VK_NULL_HANDLE) {
+		if (m_mappedSdfBox != nullptr) {
+			vkUnmapMemory(device, m_sdfBoxMemory);
+			m_mappedSdfBox = nullptr;
+		}
+		vkFreeMemory(device, m_sdfBoxMemory, nullptr);
+		m_sdfBoxMemory = VK_NULL_HANDLE;
 	}
 	if (m_paletteBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_paletteBuffer, nullptr);

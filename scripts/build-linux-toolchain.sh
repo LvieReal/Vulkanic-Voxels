@@ -1,37 +1,41 @@
 #!/bin/sh
 # =============================================================================
 # build-linux-toolchain.sh - self-contained Linux toolchain for building and
-# verifying this project in restricted environments (no apt, no distro Qt).
+# verifying this project in restricted environments (no apt, no windowing
+# development packages).
 #
 # Motivation: the Arena.ai agent sandbox only allows HTTPS to github.com and
 # pypi.org; Debian mirrors, freedesktop.org etc. are unreachable, so the usual
-# `apt install qt6-base-dev libvulkan-dev ...` does not work there. This
+# `apt install libglfw3-dev libvulkan-dev ...` does not work there. This
 # script builds everything the project needs from GitHub tarballs:
 #
 #   - CMake 3.31 + Ninja          (pip wheels, into $PREFIX/venv)
-#   - zlib 1.3.1                  (Qt's -system zlib)
-#   - Qt 6.8.3 (qtbase, minimal)  (offscreen/minimal QPA only: no xcb, no
-#                                  OpenGL, no Vulkan in Qt itself - the game
-#                                  only needs Widgets to *compile and link*)
+#   - GLFW 3.5.1                  (NULL platform only: no X11, no Wayland -
+#                                  the sandbox has neither their headers nor a
+#                                  display; the game then compiles and walks
+#                                  its headless path end to end)
 #   - Vulkan-Headers 1.4.357      (headers only)
 #   - Vulkan-Loader 1.4.357       (all WSI off; WSI entry points are resolved
 #                                  through vkGetInstanceProcAddr at run time)
 #   - glm 1.0.1                   (header-only)
 #   - glslang 16.5.0              (glslangValidator for the shader pipeline)
-#   - minimal xcb/wayland headers (ABI-identical opaque typedefs, for COMPILE
-#                                  VALIDATION only - see note at the bottom)
+#
+# Since pass 43 the game needs no toolkit at all (GLFW replaced Qt), so this
+# script is a few minutes instead of half an hour - the Qt build is gone.
 #
 # Usage:   scripts/build-linux-toolchain.sh [prefix-dir]
 # Default prefix: ~/.cache/vv-deps (PERSISTS across sandbox /tmp resets,
 # which wiped the toolchain 8+ times; /tmp/deps is created as a SYMLINK to
-# it so the documented /tmp/deps paths keep working). Takes roughly 20-30
-# minutes on 2 cores.
+# it so the documented /tmp/deps paths keep working).
 #
 # Afterwards, configure the game:
 #   export PATH="$PREFIX/venv/bin:$PREFIX/prefix/bin:$PATH"
 #   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-#         -DCMAKE_PREFIX_PATH="$PREFIX/qt6;$PREFIX/prefix"
+#         -DCMAKE_PREFIX_PATH="$PREFIX/prefix" -DVV_GLFW_NULL_ONLY=ON
 #   cmake --build build
+#
+# On a real Linux box (X11/Wayland development headers available) drop
+# -DVV_GLFW_NULL_ONLY=ON and install libglfw3-dev, or let CMake fetch GLFW.
 # =============================================================================
 set -eu
 
@@ -39,7 +43,6 @@ PREFIX="${1:-$HOME/.cache/vv-deps}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 SRC="$PREFIX/src"
 BUILD="$PREFIX/build"
-QT_PREFIX="$PREFIX/qt6"
 DEP_PREFIX="$PREFIX/prefix"
 
 say() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -56,7 +59,6 @@ fi
 command -v curl >/dev/null || die "curl is required"
 command -v g++ >/dev/null || die "g++ is required"
 command -v python3 >/dev/null || die "python3 is required"
-command -v perl >/dev/null || die "perl is required (Qt build)"
 curl -sI --max-time 10 -o /dev/null https://codeload.github.com/ || \
 	die "cannot reach codeload.github.com - this script needs GitHub access"
 
@@ -90,35 +92,18 @@ EOF
 	chmod +x "$PREFIX/venv/bin/pkg-config"
 fi
 
-# --- zlib (Qt's -system zlib) -------------------------------------------------
-fetch zlib.tar.gz madler/zlib v1.3.1
-if [ ! -f "$DEP_PREFIX/include/zlib.h" ]; then
-	say "Building zlib 1.3.1"
-	[ -d "$SRC/zlib-1.3.1" ] || tar xzf "$SRC/zlib.tar.gz" -C "$SRC"
-	cmake -S "$SRC/zlib-1.3.1" -B "$BUILD/zlib" -G Ninja \
+# --- GLFW (the windowing layer; null platform only here) ------------------------
+fetch glfw.tar.gz glfw/glfw 3.5.1
+if [ ! -f "$DEP_PREFIX/lib/libglfw3.a" ]; then
+	say "Building GLFW 3.5.1 (null platform: this box has no X11/Wayland headers)"
+	[ -d "$SRC/glfw-3.5.1" ] || tar xzf "$SRC/glfw.tar.gz" -C "$SRC"
+	cmake -S "$SRC/glfw-3.5.1" -B "$BUILD/glfw" -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEP_PREFIX" \
-		-DBUILD_SHARED_LIBS=ON > /dev/null
-	cmake --build "$BUILD/zlib" > /dev/null && cmake --install "$BUILD/zlib" > /dev/null
-fi
-
-# --- Qt 6.8.3 (minimal qtbase: Core, Gui, Widgets) -----------------------------
-fetch qtbase.tar.gz qt/qtbase v6.8.3
-if [ ! -f "$QT_PREFIX/lib/libQt6Widgets.so" ]; then
-	say "Building qtbase 6.8.3 (minimal, ~20 min) - offscreen QPA only"
-	[ -d "$SRC/qtbase-6.8.3" ] || tar xzf "$SRC/qtbase.tar.gz" -C "$SRC"
-	cmake -S "$SRC/qtbase-6.8.3" -B "$BUILD/qtbase" -G Ninja \
-		-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$QT_PREFIX" \
-		-DCMAKE_PREFIX_PATH="$DEP_PREFIX" \
-		-DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DQT_BUILD_TESTS=OFF \
-		-DINPUT_freetype=qt -DINPUT_harfbuzz=qt -DINPUT_pcre=qt \
-		-DINPUT_doubleconversion=qt -DINPUT_libpng=qt -DINPUT_libjpeg=qt \
-		-DINPUT_opengl=no \
-		-DQT_FEATURE_opengl=OFF -DQT_FEATURE_vulkan=OFF -DQT_FEATURE_dbus=OFF \
-		-DQT_FEATURE_glib=OFF -DQT_FEATURE_icu=OFF -DQT_FEATURE_xcb=OFF \
-		-DQT_FEATURE_egl=OFF -DQT_FEATURE_fontconfig=OFF \
+		-DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF \
+		-DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_X11=OFF -DGLFW_BUILD_WAYLAND=OFF \
 		> /dev/null
-	cmake --build "$BUILD/qtbase" > /dev/null
-	cmake --install "$BUILD/qtbase" > /dev/null
+	cmake --build "$BUILD/glfw" > /dev/null && \
+		cmake --install "$BUILD/glfw" > /dev/null
 fi
 
 # --- Vulkan headers + loader ----------------------------------------------------
@@ -167,88 +152,6 @@ if [ ! -x "$DEP_PREFIX/bin/glslangValidator" ]; then
 		cmake --install "$BUILD/glslang" > /dev/null
 fi
 
-# --- minimal xcb / wayland headers (COMPILE VALIDATION ONLY) ----------------------
-# The real headers live on freedesktop.org / in distro packages, which are not
-# reachable from the restricted environment this script was written for. The
-# game only needs the ABI-stable opaque types (xcb_connection_t, xcb_window_t,
-# wl_display, wl_surface) to compile the WSI surface code - the Vulkan WSI
-# entry points take them as opaque pointers and are resolved at run time.
-# On a real system install libxcb1-dev + libwayland-dev instead; if those
-# headers already exist, this section is skipped.
-if [ ! -f "$DEP_PREFIX/include/xcb/xcb.h" ]; then
-	say "Installing MINIMAL xcb.h shim (compile validation only - read the warning inside)"
-	mkdir -p "$DEP_PREFIX/include/xcb"
-	cat > "$DEP_PREFIX/include/xcb/xcb.h" <<'EOF'
-/*
- * MINIMAL SHIM HEADER - compile validation only.
- * Declares exactly the ABI-stable types consumed from
- * <vulkan/vulkan_xcb.h>. Real builds use the system libxcb headers
- * (libxcb1-dev / libxcb-devel). DO NOT build a real application against
- * this file.
- */
-#ifndef XCB_SANDBOX_MINIMAL_XCB_H
-#define XCB_SANDBOX_MINIMAL_XCB_H
-
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct xcb_connection_t xcb_connection_t;
-typedef uint32_t xcb_window_t;
-typedef uint32_t xcb_visualid_t;
-typedef uint32_t xcb_timestamp_t;
-typedef uint32_t xcb_keycode_t;
-typedef uint32_t xcb_button_t;
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* XCB_SANDBOX_MINIMAL_XCB_H */
-EOF
-fi
-
-if [ ! -f "$DEP_PREFIX/include/wayland-client-core.h" ]; then
-	say "Installing MINIMAL wayland-client-core.h shim (compile validation only - read the warning inside)"
-	cat > "$DEP_PREFIX/include/wayland-client-core.h" <<'EOF'
-/*
- * MINIMAL SHIM HEADER - compile validation only.
- * Declares the ABI-stable opaque types from the real header; the Vulkan
- * WSI entry points only consume the wl_display and wl_surface handles as
- * opaque pointers. Real builds use the system Wayland headers
- * (libwayland-dev / wayland-devel). DO NOT build a real application
- * against this file.
- */
-#ifndef WAYLAND_CLIENT_CORE_SANDBOX_MINIMAL_H
-#define WAYLAND_CLIENT_CORE_SANDBOX_MINIMAL_H
-
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-struct wl_display;
-struct wl_event_queue;
-struct wl_proxy;
-struct wl_interface;
-struct wl_surface;
-struct wl_callback;
-struct wl_compositor;
-
-struct wl_display *wl_display_connect(const char *name);
-void wl_display_disconnect(struct wl_display *display);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* WAYLAND_CLIENT_CORE_SANDBOX_MINIMAL_H */
-EOF
-fi
-
 # --- done ------------------------------------------------------------------------
 say "Toolchain ready under $PREFIX"
 cat <<EOF
@@ -257,12 +160,13 @@ Configure and build the game:
 
   export PATH="$PREFIX/venv/bin:$PREFIX/prefix/bin:\$PATH"
   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \\
-        -DCMAKE_PREFIX_PATH="$QT_PREFIX;$DEP_PREFIX"
+        -DCMAKE_PREFIX_PATH="$PREFIX/prefix" -DVV_GLFW_NULL_ONLY=ON
   cmake --build build
 
 Headless smoke test (no GPU/display in restricted sandboxes - the game must
-fail gracefully with the Vulkan error dialog, not crash):
+create its window, resolve the platform and fail with a clear message
+instead of crashing):
 
-  QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH="$QT_PREFIX/lib:$DEP_PREFIX/lib" \\
+  VV_PLATFORM=null LD_LIBRARY_PATH="$PREFIX/prefix/lib" \\
       timeout 5 ./build/release/bin/game
 EOF

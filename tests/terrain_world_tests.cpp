@@ -1,21 +1,34 @@
-// Pure-logic tests for the terrain/world modules. No Qt, no Vulkan: this
-// suite also runs in restricted sandboxes where the game itself cannot.
+// Pure-logic tests for the terrain/world modules - plus, since the windowing
+// library replaced Qt (pass 43), the input bindings and the image decoder,
+// which are pure functions over plain data. No window is opened here and no
+// Vulkan device is touched: this suite also runs in restricted sandboxes
+// where the game itself cannot.
 //
 // Run via ctest or directly: ./build/release/bin/voxel_tests
+
+#include <GLFW/glfw3.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "core/InputBindings.hpp"
+#include "render/ImageDecode.hpp"
 #include "terrain/FarField.hpp"
-#include "vulkan/StreamPriority.hpp"
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
+#include "vulkan/StreamPriority.hpp"
 #include "voxel/Chunk.hpp"
+#include "voxel/SdfBox.hpp"
+#include "voxel/SdfField.hpp"
+#include "voxel/SdfHandover.hpp"
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
@@ -2005,8 +2018,818 @@ void testSunShadowMarch() {
 	}
 	check(mismatches == 0, "shadow march: column DDA matches dense sampling");
 	check(lit > 400 && shadowed > 400,
-				"shadow march: both outcomes well exercised");
+			"shadow march: both outcomes well exercised");
 	std::printf("shadow march: %d lit / %d shadowed agree\n", lit, shadowed);
+}
+
+
+// ---------------------------------------------------------------------------
+// SDF soft shadow: CPU mirror of the shader's shadowPenumbra +
+// sunRayEscapesSdf (the VV_SDF_SHADOWS=1 path). Same traversal as the exact
+// march mirror, with the Quilez penumbra estimate sampled at every cleared
+// column (iquilezles.org/articles/rmshadows/).
+// ---------------------------------------------------------------------------
+
+// Mirror of the shader's shadowPenumbra: the plain Quilez estimate k*h/t.
+// h is the distance from the sample to the closest relevant surface (a
+// column's top plane), t the distance marched so far. Returns the
+// visibility factor to fold into the min (1.0 = no darkening). The
+// Aaltonen two-sphere refinement was removed from the shader (ill-
+// conditioned where the distance grows; it projected a hard "clamped edge"
+// stripe sampled per DDA column) - see the shader comment.
+double shadowPenumbraMirror(double h, double t) {
+	const double k = 8.0;  // = the shader's kShadowSharpness
+	return std::clamp(k * h / std::max(t, 1e-4), 0.0, 1.0);
+}
+
+// Mirror of the shader's sunRayEscapesSdf: the exact march's ascending
+// column DDA + height-bound walk + coarse far cells (same occlusion
+// events), fractional visibility from per-column penumbra samples.
+double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
+		const double dir[3], double startT = 0.0, double startVisibility = 1.0) {
+	if (dir[1] <= 0.05) {
+		return startVisibility;
+	}
+	const double EPS = 1e-6;
+	int stepX = (dir[0] > 0.0) ? 1 : -1;
+	int stepZ = (dir[2] > 0.0) ? 1 : -1;
+	double tMaxX = 1e30, tMaxZ = 1e30, dX = 1e30, dZ = 1e30;
+	int colX = int(std::floor(o[0]));
+	int colZ = int(std::floor(o[2]));
+	if (std::abs(dir[0]) > EPS) {
+		tMaxX = (double(colX + ((stepX > 0) ? 1 : 0)) - o[0]) / dir[0];
+		dX = std::abs(1.0 / dir[0]);
+	} else {
+		stepX = 0;
+	}
+	if (std::abs(dir[2]) > EPS) {
+		tMaxZ = (double(colZ + ((stepZ > 0) ? 1 : 0)) - o[2]) / dir[2];
+		dZ = std::abs(1.0 / dir[2]);
+	} else {
+		stepZ = 0;
+	}
+
+	// `startT` is how far the ray has already come from the shaded surface
+	// (the 3D SDF march hands over mid-flight, pass 40) and startVisibility
+	// what it has already accumulated; positions run off tLocal.
+	double visibility = startVisibility;
+	double tLocal = 0.0;
+	for (int i = 0; i < 256; ++i) {
+		const double sExit = std::min(tMaxX, tMaxZ);
+		const double y0 = o[1] + dir[1] * tLocal;
+		if (y0 >= w.maxTerr) {
+			return visibility;
+		}
+		const bool inNear = colX >= 0 && colX < w.near.wx && colZ >= 0 &&
+			colZ < w.near.wz;
+		if (inNear) {
+			const unsigned bound = w.near.boundAt(colX, colZ);
+			if (bound != 0xFFFFu) {
+				if (y0 >= double(bound)) {
+					const double h = y0 - double(bound);
+					visibility = std::min(
+							visibility,
+							shadowPenumbraMirror(h, startT + tLocal));
+				} else {
+					const double y1 = o[1] + dir[1] * sExit;
+					const int yTop = std::min(
+							int(std::floor(std::min(y1, double(bound) - 1.0))),
+							w.near.wh - 1);
+					bool solid = false;
+					for (int y = std::max(int(std::floor(y0)), 0);
+							y <= yTop; ++y) {
+						if (w.near.at(colX, y, colZ) != 0) {
+							solid = true;
+							break;
+						}
+					}
+					if (solid) {
+						return 0.0;  // opaque world (all test types opaque)
+					}
+					// Air all the way (overhang shaft): no relevant surface
+					// here, no estimate for this column.
+				}
+			}
+		} else {
+			const int fcX = int(std::floor((double(colX) + 0.5 - w.farOrigin) /
+				w.farCell));
+			const int fcZ = int(std::floor((double(colZ) + 0.5 - w.farOrigin) /
+				w.farCell));
+			const unsigned packed = w.farAt(fcX, fcZ);
+			const double h = double(packed & 0xFFFFu);
+			if (h > 0.0) {
+				if (y0 < h) {
+					return 0.0;
+				}
+				visibility = std::min(
+						visibility, shadowPenumbraMirror(y0 - h, startT + tLocal));
+			}
+		}
+		tLocal = sExit;
+		const bool takeX = tMaxX < tMaxZ;
+		tMaxX += takeX ? dX : 0.0;
+		tMaxZ += takeX ? 0.0 : dZ;
+		colX += takeX ? stepX : 0;
+		colZ += takeX ? 0 : stepZ;
+	}
+	return visibility;
+}
+
+// Mirror of the shader's sunRayEscapesSdf3d + its pass-40 hand-off: sphere
+// trace the ray through the (box-local) SDF, and when the march leaves the
+// field - or spends its step budget - continue in world space with the
+// whole-region 2.5D march, seeded with the distance travelled and the
+// visibility the field accumulated. `boxOrigin` is where the field's (0,0,0)
+// sits in world coordinates.
+double sdf3dHandoffMirror(const vv::voxel::SdfField& sdf,
+		const double boxOrigin[3], const ShadowWorld& w, const double o[3],
+		const double dir[3]) {
+	const float of[3] = {float(o[0] - boxOrigin[0]),
+			float(o[1] - boxOrigin[1]), float(o[2] - boxOrigin[2])};
+	const float df[3] = {float(dir[0]), float(dir[1]), float(dir[2])};
+	float exit[3] = {0.0f, 0.0f, 0.0f};
+	float exitT = 0.0f;
+	float vis = 1.0f;
+	if (!vv::voxel::sphereTracedShadowExits(sdf, of, df, exit, &exitT, &vis)) {
+		return double(vis);
+	}
+	const double exitWorld[3] = {boxOrigin[0] + double(exit[0]),
+			boxOrigin[1] + double(exit[1]), boxOrigin[2] + double(exit[2])};
+	return sunRayEscapesSdfMirror(w, exitWorld, dir, double(exitT), double(vis));
+}
+
+// SDF soft shadow: occlusion parity with the exact march (fully dark
+// wherever the exact march is blocked - same traversal, opaque world),
+// visibility range, the penumbra being a real minority (the old
+// clamp-to-zero pinned every grazing pixel to black), and the penumbra
+// shape against the known wall (hard shadow under the top, partial light
+// grazing it, lit well clear, monotonic toward the wall).
+void testSunShadowSdfMarch() {
+	ShadowWorld w = makeShadowWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int outOfRange = 0, leaked = 0, grazing = 0, shadowed = 0, total = 0;
+	for (int i = 0; i < 3000; ++i) {
+		double origin[3], n[3] = {0.0, 1.0, 0.0};
+		if (i % 3 == 0) {
+			// Surface point on near terrain (top face).
+			origin[0] = next01() * 64.0;
+			origin[2] = next01() * 64.0;
+			const unsigned bound =
+					w.near.boundAt(int(std::floor(origin[0])),
+							int(std::floor(origin[2])));
+			origin[1] = bound == 0xFFFFu ? 10.0 : double(bound);
+		} else if (i % 3 == 1) {
+			// Side face at the wall (normal -x).
+			origin[0] = 20.0;
+			origin[1] = next01() * 40.0;
+			origin[2] = next01() * 64.0;
+			n[0] = -1.0;
+			n[1] = 0.0;
+		} else {
+			// Point on far terrain (far hits shadow too).
+			origin[0] = -60.0 + next01() * 180.0;
+			origin[2] = -60.0 + next01() * 180.0;
+			const int fcX = int(std::floor(origin[0] + 64.0) / 4.0);
+			const int fcZ = int(std::floor(origin[2] + 64.0) / 4.0);
+			const unsigned packed =
+					w.farAt(fcX < 0 ? -1 : fcX, fcZ < 0 ? -1 : fcZ);
+			origin[1] = double(packed & 0xFFFFu);
+			if (origin[1] == 0.0) {
+				continue;
+			}
+		}
+		double o[3];
+		for (int a = 0; a < 3; ++a) {
+			o[a] = origin[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+		}
+		++total;
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const double soft = sunRayEscapesSdfMirror(w, o, sun);
+		if (soft < -1e-9 || soft > 1.0 + 1e-9) {
+			++outOfRange;
+		}
+		// Occlusion parity: wherever the exact march is blocked, the SDF
+		// march must be fully dark (same traversal, opaque test world).
+		if (!exactLit && soft > 1e-6) {
+			if (leaked <= 3) {
+				std::printf("FAIL sdf shadow %d at (%.2f,%.2f,%.2f): "
+						"exact shadowed, soft %.3f\n",
+						i, origin[0], origin[1], origin[2], soft);
+			}
+			++leaked;
+		}
+		if (!exactLit) {
+			++shadowed;
+		}
+		// Exact-lit but dark pixels are the penumbra (a grazing near-miss):
+		// they must exist (the feature) yet stay a clear minority (the old
+		// degenerate-triangle clamp turned nearly all of them into black).
+		if (exactLit && soft < 0.1) {
+			++grazing;
+		}
+	}
+	check(outOfRange == 0, "sdf shadow: visibility stays in [0, 1]");
+	check(leaked == 0,
+			"sdf shadow: fully dark wherever the exact march is occluded");
+	check(shadowed > 300, "sdf shadow: shadowed cases well exercised");
+	check(grazing > 5 && grazing < 1500,
+			"sdf shadow: penumbra pixels exist but are a minority");
+	std::printf("sdf shadow: %d shadowed, %d penumbral, %d lit of %d\n",
+			shadowed, grazing, total - shadowed - grazing, total);
+
+	// Penumbra shape against the known wall (column x=20, top at y=40, sun
+	// (0.5,1,0.5) rises 2 voxels per column of x): the ray from (x, 25, 10)
+	// reaches the wall at y ~= 25 + 2*(20-x), so x <= 12 grazes/clears the
+	// top (partial to full light) and x >= 13 hits the wall (hard shadow).
+	const double wallX[5] = {8.0, 10.0, 12.0, 13.0, 14.0};
+	double wallSoft[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+	for (int i = 0; i < 5; ++i) {
+		double o[3] = {wallX[i] + sun[0] * 1e-2,
+				25.0 + 1e-3 + sun[1] * 1e-2, 10.0 + sun[2] * 1e-2};
+		wallSoft[i] = sunRayEscapesSdfMirror(w, o, sun);
+	}
+	check(wallSoft[4] == 0.0 && wallSoft[3] == 0.0,
+			"sdf penumbra: hard shadow under the wall top");
+	check(wallSoft[0] > 0.9 && wallSoft[1] > 0.9,
+			"sdf penumbra: lit well clear of the wall top");
+	check(wallSoft[2] > 0.05 && wallSoft[2] < 0.9,
+			"sdf penumbra: partial light grazing the wall top");
+	for (int i = 1; i < 5; ++i) {
+		check(wallSoft[i] <= wallSoft[i - 1] + 1e-6,
+				"sdf penumbra: no lighter farther into the shadow");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 3D voxel SDF soft shadow (pass 37): a REAL 3D distance field (distance to
+// the nearest solid surface, via a two-pass chamfer EDT) sphere-traced with
+// k*h/t, cross-checked against the exact binary march. The point: h is now
+// the true 3D distance to the surface - vertical faces and overhangs
+// included - so the shadow edges running along steep casters get the same
+// continuous penumbra as the top edge. That is exactly what the 2.5D
+// top-plane path (sunRayEscapesSdfMirror) cannot do.
+// ---------------------------------------------------------------------------
+
+// A world with a MESA (a finite block: vertical faces on every side, top
+// y=40) and an OVERHANG (a floating slab with air beneath) on rolling ground.
+// No far field, so the SDF box and the exact march see identical geometry.
+ShadowWorld makeSdfTestWorld() {
+	ShadowWorld w;
+	w.near.wx = 64;
+	w.near.wz = 64;
+	w.near.wh = 48;
+	w.near.cells.assign(std::size_t(w.near.wx) * w.near.wh * w.near.wz, 0);
+	for (int z = 0; z < w.near.wz; ++z) {
+		for (int x = 0; x < w.near.wx; ++x) {
+			const double h = 16.0 + 5.0 * std::sin(x * 0.29) +
+				4.0 * std::cos(z * 0.21);
+			const int top = int(std::floor(h));
+			for (int y = 0; y <= top; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 1;
+			}
+		}
+	}
+	// MESA: x in [20,24), z in [12,44), solid from the ground to y=40.
+	for (int z = 12; z < 44; ++z)
+		for (int x = 20; x < 24; ++x)
+			for (int y = 0; y < 40; ++y)
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 2;
+	// OVERHANG: x in [44,52), z in [20,30), a slab at y in [30,34) with air
+	// beneath (the ground there is only ~16).
+	for (int z = 20; z < 30; ++z)
+		for (int x = 44; x < 52; ++x)
+			for (int y = 30; y < 34; ++y)
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 3;
+	w.near.recomputeHeights();
+	// No far field: the SDF box and the exact march see the same geometry.
+	w.farDim = 0;
+	w.farCells.clear();
+	return w;
+}
+
+// Does the ray actually cross a solid cell of the near voxel world? The
+// exact mirror's blocked verdict also fires where a ray merely skims a
+// column top in its height-field model, which the cell-accurate field march
+// (correctly) does not - such a column is not a usable leak oracle.
+bool nearSolidOnRay(const ShadowWorld& w, const double o[3],
+		const double dir[3]) {
+	for (double t = 0.0; t <= 200.0; t += 0.05) {
+		const int cx = int(std::floor(o[0] + dir[0] * t));
+		const int cy = int(std::floor(o[1] + dir[1] * t));
+		const int cz = int(std::floor(o[2] + dir[2] * t));
+		if (cx < 0 || cx >= w.near.wx || cz < 0 || cz >= w.near.wz || cy < 0 ||
+				cy >= w.near.wh) {
+			return false;  // left the near world: no cell can block further
+		}
+		if (w.near.at(cx, cy, cz) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Pass 40: the 6x6-chunk SDF box is not the world. Its whole point is to
+// soften the near shadows; casters OUTSIDE it still shadow the ray, so
+// sunRayEscapesSdf3d hands the ray to the 2.5D march at the boundary instead
+// of treating it as open space. Pins (1) the scenario - a caster outside the
+// box, where the field alone leaks full light, (2) no leak once the hand-off
+// continues the ray, and (3) that outside the field the composite is exactly
+// the 2.5D march.
+void testSdfBoxHandoff() {
+	ShadowWorld w = makeSdfTestWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	// A field over x in [0,16) only: the mesa (x in [20,24), the caster of
+	// every shadow over this ground) lies outside it, like the GPU's field
+	// (6x6 chunks around the camera) versus the whole near region.
+	const int bx = 16;
+	vv::voxel::SdfField sdf;
+	sdf.build(bx, w.near.wh, w.near.wz,
+			[&](int x, int y, int z) { return w.near.at(x, y, z) != 0; });
+	const double boxOrigin[3] = {0.0, 0.0, 0.0};
+
+	int shadowed = 0, lit = 0, leaksFieldOnly = 0, leaksHandoff = 0;
+	int darkened = 0;  // the continuation found occlusion the field missed
+	int judged = 0;    // shadowed columns a real cell blocks (usable oracle)
+	int unjudged = 0;  // shadowed only in the height-field model: skipped
+	for (int x = 6; x < 16; ++x) {
+		for (int z = 12; z < 44; z += 2) {
+			const unsigned bound = w.near.boundAt(x, z);
+			if (bound == 0xFFFFu) {
+				continue;
+			}
+			double p[3] = {double(x) + 0.5, double(bound), double(z) + 0.5};
+			double n[3] = {0.0, 1.0, 0.0};
+			double o[3];
+			for (int a = 0; a < 3; ++a) {
+				o[a] = p[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+			}
+			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+			const float df[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+			const double softFieldOnly =
+					double(vv::voxel::sphereTracedShadow(sdf, of, df));
+			const double softHandoff =
+					sdf3dHandoffMirror(sdf, boxOrigin, w, o, sun);
+			if (softHandoff < softFieldOnly - 1e-6) {
+				++darkened;
+			}
+			if (sunRayEscapesMirror(w, o, sun)) {
+				++lit;
+				continue;
+			}
+			++shadowed;
+			if (softFieldOnly > 0.5 + 1e-3) {
+				++leaksFieldOnly;
+			}
+			// Judge the leak only where voxels really block the ray; a
+			// height-field skim is a model disagreement, not a leak.
+			if (!nearSolidOnRay(w, o, sun)) {
+				++unjudged;
+				continue;
+			}
+			++judged;
+			if (softHandoff > 0.5 + 1e-3) {
+				++leaksHandoff;
+			}
+		}
+	}
+	check(shadowed > 20,
+			"sdf box hand-off: the caster-outside-the-box setup is exercised");
+	check(leaksFieldOnly > 0,
+			"sdf box hand-off: the field alone really leaks here (scenario valid)");
+	check(leaksHandoff == 0,
+			"sdf box hand-off: no light leak with the whole-region continuation");
+	check(judged > 10,
+			"sdf box hand-off: real cell blockers are exercised");
+	check(darkened > 0,
+			"sdf box hand-off: the continuation actually finds the casters");
+	// Outside the field the composite must reduce to the plain 2.5D march.
+	const double outside[3] = {40.5, 20.0, 20.5};
+	check(std::abs(sdf3dHandoffMirror(sdf, boxOrigin, w, outside, sun) -
+			sunRayEscapesSdfMirror(w, outside, sun)) < 1e-9,
+			"sdf box hand-off: outside the field it is exactly the 2.5D march");
+	std::printf("sdf box hand-off: %d shadowed / %d lit columns (%d judged, "
+			"%d height-field-only); leaks field only %d, with the hand-off %d; "
+			"%d darkened by it\n",
+			shadowed, lit, judged, unjudged, leaksFieldOnly, leaksHandoff,
+			darkened);
+}
+
+// Pass 42: the handover rules that keep the box uniform and the seed buffer
+// consistent - a box published next to another build's seeds shades a frame
+// out of a field describing different terrain, which is the owner's one-frame
+// "chunks go dark just before the SDF shadows come back" - and that make the
+// field follow the camera instead of waiting for the next region move.
+void testSdfHandoverPolicy() {
+	using vv::voxel::SdfHandover;
+
+	SdfHandover h;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: no build before a region move has been seen");
+	h.wantValid = true;  // the first region move completed
+	check(h.step() == SdfHandover::Step::Relaunch,
+			"sdf handover: the first complete region starts a build");
+
+	h.buildRunning = true;  // the build is on the worker
+	h.wantCenterX = 1;      // the camera crosses a chunk while it builds
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: a running build is waited for, never duplicated");
+	h.buildReady = true;
+	check(h.step() == SdfHandover::Step::JoinAndUpload,
+			"sdf handover: a finished build is picked up");
+
+	// The renderer joins and SUBMITS the copy (no wait); the box has to stay
+	// unpublished until that copy's fence signals.
+	h.buildRunning = false;
+	h.buildReady = false;
+	h.uploadInFlight = true;
+	h.copyComplete = false;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: the box is NOT published while the copy is in flight");
+	h.copyComplete = true;
+	check(h.step() == SdfHandover::Step::Publish,
+			"sdf handover: the box is published once the copy has landed");
+
+	// The copy must target the SPARE half: the live one has to keep holding
+	// exactly the seeds its published box describes for as long as a frame can
+	// still read them. After a publish they swap.
+	check(h.uploadHalf() == 1u,
+			"sdf handover: the copy targets the half no live box points at");
+	h.liveHalf = h.uploadHalf();
+	check(h.uploadHalf() == 0u,
+			"sdf handover: the halves alternate, so the live half is never the "
+			"one being filled");
+
+	// The renderer publishes (center 0) while the camera is already on chunk
+	// 1: the launch the running build swallowed must be retried, or the soft
+	// shadows stay a whole crossing behind the camera.
+	h.uploadInFlight = false;
+	h.copyComplete = false;
+	h.haveField = true;
+	h.activeCenterX = 0;
+	check(h.step() == SdfHandover::Step::Relaunch,
+			"sdf handover: a swallowed launch is retried once the pipeline is idle");
+
+	// That build lands too: the field now covers the camera, nothing to do.
+	h.buildRunning = false;
+	h.buildReady = false;
+	h.activeCenterX = 1;
+	h.wantCenterX = 1;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: a field that covers the camera is not rebuilt");
+	std::printf("sdf handover: box/seed pairing pinned either side of the copy "
+			"(spare half, payload before active); the field follows the "
+			"camera's chunk instead of waiting for the next region move\n");
+}
+
+void testSdfSoftShadow3d() {
+	ShadowWorld w = makeSdfTestWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	// Build the 3D SDF over the near box (distance to the nearest solid).
+	vv::voxel::SdfField sdf;
+	sdf.build(w.near.wx, w.near.wh, w.near.wz,
+		[&](int x, int y, int z) { return w.near.at(x, y, z) != 0; });
+
+	std::uint64_t rng = 0x51ed270b85e8ab9full;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+	auto originOf = [&](const double p[3], const double n[3], double o[3]) {
+		for (int a = 0; a < 3; ++a) {
+			o[a] = p[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+		}
+	};
+	auto soft3d = [&](const double o[3]) {
+		const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+		return vv::voxel::sphereTracedShadow(sdf, of, sf);
+	};
+
+	// (1) Occlusion parity + range over a mix of surface kinds. The critical
+	// invariant: wherever the exact (center-ray) march is blocked, the soft
+	// shadow is at most half-lit (the dark-side penumbra) - never fully lit
+	// (no light leak through a vertical face or an overhang).
+	int outOfRange = 0, leaked = 0, shadowed = 0, lit = 0, total = 0;
+	for (int i = 0; i < 2500; ++i) {
+		double p[3], n[3] = {0.0, 1.0, 0.0};
+		const int kind = i % 4;
+		if (kind == 0) {  // rolling ground top
+			p[0] = next01() * 64.0;
+			p[2] = next01() * 64.0;
+			const unsigned b = w.near.boundAt(int(std::floor(p[0])),
+				int(std::floor(p[2])));
+			p[1] = b == 0xFFFFu ? 10.0 : double(b);
+		} else if (kind == 1) {  // mesa -x vertical face (x=20)
+			p[0] = 20.0;
+			p[1] = 1.0 + next01() * 38.0;
+			p[2] = 12.0 + next01() * 32.0;
+			n[0] = -1.0; n[1] = 0.0; n[2] = 0.0;
+		} else if (kind == 2) {  // mesa top
+			p[0] = 20.0 + next01() * 4.0;
+			p[1] = 40.0;
+			p[2] = 12.0 + next01() * 32.0;
+		} else {  // under the overhang slab
+			p[0] = 44.0 + next01() * 8.0;
+			p[2] = 20.0 + next01() * 10.0;
+			const unsigned b = w.near.boundAt(int(std::floor(p[0])),
+				int(std::floor(p[2])));
+			p[1] = b == 0xFFFFu ? 10.0 : double(b);
+		}
+		double o[3];
+		originOf(p, n, o);
+		++total;
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const float soft = soft3d(o);
+		if (soft < -1e-9f || soft > 1.0f + 1e-9f) {
+			++outOfRange;
+		}
+		if (!exactLit && soft > 0.5 + 1e-3f) {
+			if (leaked <= 3) {
+				std::printf("FAIL sdf3d leak at (%.2f,%.2f,%.2f): exact "
+					"shadowed, soft %.3f\n", p[0], p[1], p[2], double(soft));
+			}
+			++leaked;
+		}
+		exactLit ? ++lit : ++shadowed;
+	}
+	check(outOfRange == 0, "sdf3d shadow: visibility stays in [0, 1]");
+	check(leaked == 0,
+		"sdf3d shadow: no light leak (at most half-lit where exact is dark)");
+	check(shadowed > 200 && lit > 200,
+		"sdf3d shadow: both outcomes well exercised");
+	std::printf("sdf3d shadow: %d shadowed, %d lit of %d; %d leaks, %d "
+		"out-of-range\n",
+		shadowed, lit, total, leaked, outOfRange);
+
+	// (2) The mesa's SIDE edge (the shadow boundary running along its west
+	// face, x=20) is a smooth ramp under the 3D SDF, not a hard 0->1 jump.
+	// Scan the GROUND SURFACE across that edge (x from 5 to 14 at z=28, on
+	// the actual ground top): the 3D SDF must transition lit<->shadowed over
+	// a few voxels (the side penumbra), and must not make a >0.7 jump between
+	// adjacent columns (a hard edge). The 2.5D top-plane path has no data for
+	// the vertical face and makes a hard jump here.
+	const double scanZ = 28.0;
+	int hardJumps = 0;
+	double prevSoft = 1.0;
+	bool seenShadow = false, seenLit = false;
+	for (int x = 5; x <= 14; ++x) {
+		const unsigned b = w.near.boundAt(x, 28);
+		double p[3] = {double(x) + 0.5, b == 0xFFFFu ? 10.0 : double(b),
+			(scanZ + 0.5)};
+		double n[3] = {0.0, 1.0, 0.0};
+		double o[3];
+		originOf(p, n, o);
+		const float soft = soft3d(o);
+		if (soft < 0.25) {
+			seenShadow = true;
+		}
+		if (soft > 0.75) {
+			seenLit = true;
+		}
+		if (std::abs(soft - prevSoft) > 0.7) {
+			++hardJumps;
+		}
+		prevSoft = soft;
+	}
+	check(seenShadow && seenLit,
+		"sdf3d side edge: scan crosses both shadow and light");
+	check(hardJumps == 0,
+		"sdf3d side edge: no hard 0->1 jump along the vertical-caster edge");
+
+	// (3) The overhang's UNDERSIDE: a point on the ground directly beneath
+	// the slab is in the slab's shadow (the exact march blocks it), and the
+	// 3D SDF keeps it at most half-lit (the 2.5D top-plane path sees only the
+	// column's top and can light it).
+	{
+		double p[3] = {48.0, 16.0, 25.0};  // under the slab (ground ~16)
+		double n[3] = {0.0, 1.0, 0.0};
+		double o[3];
+		originOf(p, n, o);
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const float soft = soft3d(o);
+		check(!exactLit, "sdf3d overhang: point under the slab is shadowed");
+		check(soft <= 0.5 + 1e-3f,
+			"sdf3d overhang: underside stays at most half-lit");
+	}
+}
+
+// ---------------------------------------------------------------------------
+
+// Pass 39: the SDF BOX BUILD (VV_SDF_SHADOWS=1). The renderer builds the
+// field from per-chunk voxel-type snapshots, so that walk MUST use the chunk
+// voxel layout (X + Y*sizeX + Z*sizeX*worldHeight - Chunk::index and the
+// shader's fetchVoxel). The bug pinned here: pass 38 indexed the snapshot with
+// a Z stride of chunkSizeX * chunkSizeZ (1024 with the default config, where
+// the chunks lay out 4096), i.e. the field was built from a scrambled
+// projection of the terrain - which rendered the whole region around the
+// camera fully shadowed. Both checks below fail against that indexing.
+void testSdfBoxBuild() {
+	using vv::voxel::Chunk;
+	using vv::voxel::ChunkCoord;
+	using vv::voxel::SdfBoxGeometry;
+	using vv::voxel::SdfField;
+
+	const int cx = 32, cz = 32, wh = 128;
+	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
+	vv::voxel::World world(tcfg, cx, wh, cz);
+	std::vector<const Chunk*> added;
+	std::vector<ChunkCoord> evicted;
+	world.ensureRegion(0, 0, 4, added, evicted);  // 9x9 chunks
+
+	// Dense region copy (the reference the box must agree with), built from
+	// the chunks' own voxel data - the REAL layout, not the box's walk.
+	const int regionBase = -4, regionChunks = 9;
+	const int rnx = regionChunks * cx, rnz = regionChunks * cz;
+	std::vector<std::uint8_t> region(std::size_t(rnx) * wh * rnz, 0);
+	for (int rcz = 0; rcz < regionChunks; ++rcz) {
+		for (int rcx = 0; rcx < regionChunks; ++rcx) {
+			const Chunk* c = world.findChunk(
+					ChunkCoord{regionBase + rcx, regionBase + rcz});
+			if (c == nullptr) {
+				continue;
+			}
+			// Copy row by row (the chunk's X rows are contiguous, the region's
+			// are rnx apart).
+			for (int lz = 0; lz < cz; ++lz) {
+				for (int y = 0; y < wh; ++y) {
+					const std::size_t src =
+							std::size_t(lz) * cx * wh + std::size_t(y) * cx;
+					const std::size_t dst = std::size_t(rcx * cx) +
+																	std::size_t(y) * rnx +
+																	std::size_t(rcz * cz + lz) * rnx * wh;
+					std::copy_n(c->voxelTypes().begin() + static_cast<std::ptrdiff_t>(src),
+											std::size_t(cx),
+											region.begin() + static_cast<std::ptrdiff_t>(dst));
+				}
+			}
+		}
+	}
+	auto regionSolid = [&](int x, int y, int z) {
+		if (y < 0 || y >= wh) {
+			return false;
+		}
+		const int rx = x - regionBase * cx;
+		const int rz = z - regionBase * cz;
+		if (rx < 0 || rx >= rnx || rz < 0 || rz >= rnz) {
+			return false;  // outside the generated region: air
+		}
+		return region[std::size_t(rx) + std::size_t(y) * rnx +
+									std::size_t(rz) * rnx * wh] != 0;
+	};
+
+	// The renderer's box: 6x6 whole chunks centered on chunk (0,0), full
+	// world height.
+	const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, 3, cx, cz, wh);
+	check(box.valid() && box.nx == 192 && box.ny == 128 && box.nz == 192 &&
+					box.originX == -96 && box.originZ == -96 && box.originY == 0,
+				"sdfBox: 6x6-chunk geometry, full world height");
+
+	// Snapshot the box's chunks exactly like launchSdfBuild does.
+	const std::size_t side = box.chunksPerSide;
+	std::vector<std::vector<std::uint8_t>> snapshots(side * side);
+	for (std::size_t i = 0; i < side * side; ++i) {
+		const int32_t ccx =
+				box.originX / cx + static_cast<int32_t>(i % side);
+		const int32_t ccz =
+				box.originZ / cz + static_cast<int32_t>(i / side);
+		if (const Chunk* c = world.findChunk(ChunkCoord{ccx, ccz})) {
+			snapshots[i] = c->voxelTypes();
+		}
+	}
+
+	SdfField sdf;
+	vv::voxel::buildSdfBoxField(box, snapshots, sdf);
+	check(sdf.nx() == int(box.nx) && sdf.ny() == int(box.ny) &&
+					sdf.nz() == int(box.nz),
+				"sdfBox: field dims match the box");
+
+	// (1) The field must describe EXACTLY the box's chunk voxels. The chamfer
+	// transform's zero-distance cells are the solid cells, so cellDistance()
+	// is 0 iff that voxel is solid in the chunk data - any stride mismatch
+	// (pass 38: 1024 instead of 4096) scrambles this on most of the box.
+	std::size_t mismatches = 0, solidCells = 0;
+	for (std::uint32_t z = 0; z < box.nz; ++z) {
+		for (std::uint32_t y = 0; y < box.ny; ++y) {
+			for (std::uint32_t x = 0; x < box.nx; ++x) {
+				const bool solid = regionSolid(box.originX + int(x),
+																			 box.originY + int(y),
+																			 box.originZ + int(z));
+				if (solid) {
+					++solidCells;
+				}
+				if ((sdf.cellDistance(int(x), int(y), int(z)) == 0.0f) != solid) {
+					++mismatches;
+				}
+			}
+		}
+	}
+	check(mismatches == 0,
+				"sdfBox: the field covers exactly the chunks' solid voxels");
+	check(solidCells > 1000000,
+				"sdfBox: the box really contains the terrain (sanity)");
+
+	// A chunk that is not installed (or has a foreign size) reads as air, so
+	// the build can never index out of bounds.
+	const std::vector<std::vector<std::uint8_t>> none;
+	check(!vv::voxel::sdfBoxCellSolid(box, none, 5, 5, 5),
+				"sdfBox: a missing chunk snapshot reads as air");
+	std::vector<std::vector<std::uint8_t>> shortSet(1,
+																								 std::vector<std::uint8_t>(4, 1));
+	check(!vv::voxel::sdfBoxCellSolid(box, shortSet, 5, 5, 5),
+				"sdfBox: a foreign-sized chunk snapshot reads as air");
+
+	// (2) The user-visible symptom: with a garbled field the ground around
+	// the camera rendered fully shadowed (every lit pixel black). Sample
+	// surface columns inside the box and compare the soft shadow against an
+	// exact binary march over the region.
+	const double len = std::sqrt(0.25 + 1.0 + 0.25);
+	const float sun[3] = {float(0.5 / len), float(1.0 / len),
+												float(0.5 / len)};
+	auto exactLit = [&](const float o[3]) {
+		for (float t = 0.0f; t < 400.0f; t += 0.25f) {
+			if (regionSolid(int(std::floor(o[0] + sun[0] * t)),
+											int(std::floor(o[1] + sun[1] * t)),
+											int(std::floor(o[2] + sun[2] * t)))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	std::uint64_t rng = 0x51ed270b85e8ab9full;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int total = 0, exactLitCount = 0, litKept = 0, leaks = 0, dark = 0;
+	double softSum = 0.0;
+	for (int i = 0; i < 400; ++i) {
+		const int wx = box.originX + 4 + int(next01() * double(box.nx - 8));
+		const int wz = box.originZ + 4 + int(next01() * double(box.nz - 8));
+		int top = -1;
+		for (int y = wh - 1; y >= 0; --y) {
+			if (regionSolid(wx, y, wz)) {
+				top = y;
+				break;
+			}
+		}
+		if (top < 1) {
+			continue;
+		}
+		float o[3] = {float(wx) + 0.5f + sun[0] * 1e-2f,
+									float(top + 1) + 1e-3f + sun[1] * 1e-2f,
+									float(wz) + 0.5f + sun[2] * 1e-2f};
+		const float ol[3] = {o[0] - float(box.originX),
+											 o[1] - float(box.originY),
+											 o[2] - float(box.originZ)};
+		const bool ex = exactLit(o);
+		const float soft = vv::voxel::sphereTracedShadow(sdf, ol, sun);
+		++total;
+		softSum += soft;
+		if (soft < 0.05f) {
+			++dark;
+		}
+		if (ex) {
+			++exactLitCount;
+			if (soft > 0.5f) {
+				++litKept;
+			}
+		} else if (soft > 0.5f + 1e-3f) {
+			++leaks;
+		}
+	}
+	check(total > 300, "sdfBox shadow: enough surface samples");
+	check(leaks == 0, "sdfBox shadow: no light leak on the real terrain");
+	// The regression: an unscrambled field keeps most lit ground lit. The
+	// pass-38 indexing left the whole box dark (0 of 400 here).
+	check(exactLitCount > 0 && litKept * 2 > exactLitCount,
+				"sdfBox shadow: lit ground stays lit (no whole-region shadowing)");
+	std::printf(
+			"sdfBox: %zu solid cells, %zu mismatches; %d samples, %d exactly "
+			"lit (%d kept lit), %d fully dark, mean soft %.3f\n",
+			solidCells, mismatches, total, exactLitCount, litKept, dark,
+			softSum / double(total > 0 ? total : 1));
 }
 
 }  // namespace
@@ -2243,6 +3066,302 @@ static void testVoxelTextures() {
 // stuck at the front forever while progressively worse top-ups were
 // generated first; the nearest in-frustum chunks came dead last.
 // ---------------------------------------------------------------------------
+// --- pass 43: the Qt-free input bindings -----------------------------------
+//
+// The key numbers below are the evdev scancodes GLFW reports on X11/Wayland
+// (Linux keycodes), i.e. what an X11/Wayland build sees for those physical
+// keys - the same ones defaultScancodes() uses there.
+void testKeyBindings() {
+	const std::vector<vv::core::Binding> bindings = vv::core::defaultBindings();
+	check(bindings.size() ==
+	          static_cast<std::size_t>(vv::core::Action::Count),
+	      "key bindings: every action has exactly one binding");
+	for (std::size_t i = 0; i < bindings.size(); ++i) {
+		for (std::size_t j = i + 1; j < bindings.size(); ++j) {
+			check(bindings[i].action != bindings[j].action,
+			      "key bindings: no action is bound twice");
+		}
+	}
+
+	const auto lookup = [&bindings](int key, int scancode) {
+		return vv::core::lookupAction(bindings, key, scancode);
+	};
+
+	// Linux evdev codes for the physical positions.
+	constexpr int kEvdevQ = 16, kEvdevW = 17, kEvdevA = 30, kEvdevS = 31,
+	              kEvdevD = 32, kEvdevZ = 44;
+
+	// The plain case: QWERTY, label and position agree.
+	check(lookup(GLFW_KEY_W, kEvdevW) == vv::core::Action::MoveForward,
+	      "key bindings: W moves forward");
+	check(lookup(GLFW_KEY_A, kEvdevA) == vv::core::Action::MoveLeft,
+	      "key bindings: A moves left");
+	check(lookup(GLFW_KEY_S, kEvdevS) == vv::core::Action::MoveBack,
+	      "key bindings: S moves back");
+	check(lookup(GLFW_KEY_D, kEvdevD) == vv::core::Action::MoveRight,
+	      "key bindings: D moves right");
+	check(lookup(GLFW_KEY_SPACE, 57) == vv::core::Action::MoveUp,
+	      "key bindings: space moves up");
+	check(lookup(GLFW_KEY_LEFT_CONTROL, 29) == vv::core::Action::MoveDown,
+	      "key bindings: left ctrl moves down");
+	check(lookup(GLFW_KEY_LEFT_SHIFT, 42) == vv::core::Action::SpeedBoost,
+	      "key bindings: left shift boosts");
+
+	// AZERTY (ZQSD): the physical position reports the other label. The
+	// position channel is what makes the camera move.
+	check(lookup(GLFW_KEY_Z, kEvdevW) == vv::core::Action::MoveForward,
+	      "key bindings: AZERTY's labelled Z on the W position moves forward");
+	check(lookup(GLFW_KEY_Q, kEvdevA) == vv::core::Action::MoveLeft,
+	      "key bindings: AZERTY's labelled Q on the A position moves left");
+	// ... and the label channel still answers, so a board where the layout
+	// moved the key keeps working through the letter.
+	check(lookup(GLFW_KEY_W, kEvdevZ) == vv::core::Action::MoveForward,
+	      "key bindings: the key labelled W moves forward wherever it sits");
+	check(lookup(GLFW_KEY_A, kEvdevQ) == vv::core::Action::MoveLeft,
+	      "key bindings: the key labelled A moves left wherever it sits");
+
+	// Nothing else moves: the offset letters, Escape (the pause key handled
+	// by the app loop) and the modifiers that are not bound.
+	check(lookup(GLFW_KEY_Q, kEvdevQ) == vv::core::Action::Count,
+	      "key bindings: Q on its own position is not bound");
+	check(lookup(GLFW_KEY_Z, kEvdevZ) == vv::core::Action::Count,
+	      "key bindings: Z on its own position is not bound (QWERTZ safe)");
+	check(lookup(GLFW_KEY_ESCAPE, 1) == vv::core::Action::Count,
+	      "key bindings: Escape is not a movement binding");
+	check(lookup(GLFW_KEY_RIGHT_CONTROL, 97) == vv::core::Action::Count,
+	      "key bindings: the right-side modifiers are not bound");
+
+	// A platform without scancodes (scancode -1 in the table) still works
+	// through the label, and does not accidentally match someone else's.
+	{
+		std::vector<vv::core::Binding> labelOnly;
+		labelOnly.push_back(
+		    {vv::core::Action::MoveForward, GLFW_KEY_W, -1});
+		check(vv::core::lookupAction(labelOnly, GLFW_KEY_W, 0) ==
+		          vv::core::Action::MoveForward,
+		      "key bindings: label-only platforms still move");
+		check(vv::core::lookupAction(labelOnly, GLFW_KEY_Z, kEvdevW) ==
+		          vv::core::Action::Count,
+		      "key bindings: an unbound label does not match a binding's "
+		      "position");
+	}
+
+	// The scancode table itself: every action has one (or deliberately -1)
+	// and the positions are the documented ones.
+	{
+		const vv::core::Scancodes codes = vv::core::defaultScancodes();
+		const vv::core::Scancodes labels = vv::core::defaultLabelKeys();
+		check(labels.of(vv::core::Action::MoveForward) == GLFW_KEY_W,
+		      "key bindings: the forward label is W");
+		check(labels.of(vv::core::Action::MoveUp) == GLFW_KEY_SPACE,
+		      "key bindings: the up label is space");
+#if defined(_WIN32) || defined(__APPLE__)
+		// Windows uses Set-1 make codes, macOS Carbon virtual key codes; only
+		// their existence is checked here (the exact values are platform
+		// data, and the Linux ones are exercised above).
+		bool haveScancodes = true;
+		for (int i = 0; i < static_cast<int>(vv::core::Action::Count); ++i) {
+			haveScancodes = haveScancodes && codes.values[i] >= 0;
+		}
+		check(haveScancodes,
+		      "key bindings: this platform provides a scancode per action");
+#else
+		check(codes.of(vv::core::Action::MoveForward) == kEvdevW,
+		      "key bindings: the forward scancode is evdev KEY_W");
+		check(codes.of(vv::core::Action::MoveLeft) == kEvdevA,
+		      "key bindings: the left scancode is evdev KEY_A");
+		check(codes.of(vv::core::Action::MoveBack) == kEvdevS,
+		      "key bindings: the back scancode is evdev KEY_S");
+		check(codes.of(vv::core::Action::MoveRight) == kEvdevD,
+		      "key bindings: the right scancode is evdev KEY_D");
+		check(codes.of(vv::core::Action::MoveUp) == 57,
+		      "key bindings: the up scancode is evdev KEY_SPACE");
+		check(codes.of(vv::core::Action::MoveDown) == 29,
+		      "key bindings: the down scancode is evdev KEY_LEFTCTRL");
+		check(codes.of(vv::core::Action::SpeedBoost) == 42,
+		      "key bindings: the boost scancode is evdev KEY_LEFTSHIFT");
+#endif
+	}
+
+	// Every action has a human-readable name (used by the startup log).
+	for (int i = 0; i < static_cast<int>(vv::core::Action::Count); ++i) {
+		const char* name =
+		    vv::core::actionName(static_cast<vv::core::Action>(i));
+		check(name != nullptr && name[0] != '\0' && name[0] != '?',
+		      "key bindings: every action has a name");
+	}
+
+	// The startup log is part of the contract ("what did it detect here?"),
+	// so exercise it with the same name provider the app passes.
+	std::printf(
+	    "key bindings: %zu actions, positions matched by scancode "
+	    "(AZERTY/QWERTZ safe), labels accepted on top\n",
+	    bindings.size());
+}
+
+// --- pass 43: the Qt-free image decoder ------------------------------------
+//
+// Builds a PNG byte for byte (uncompressed deflate blocks, CRC32 computed
+// here) so the test does not depend on the game's own art: the decoder must
+// reproduce the exact RGBA8 pixels, including a row that uses a PNG filter.
+void testImageDecode() {
+	namespace fs = std::filesystem;
+
+	const auto crc32Of = [](const std::vector<std::uint8_t>& data) {
+		std::uint32_t crc = 0xFFFFFFFFu;
+		for (const std::uint8_t byte : data) {
+			crc ^= byte;
+			for (int bit = 0; bit < 8; ++bit) {
+				crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1u) + 1u));
+			}
+		}
+		return crc ^ 0xFFFFFFFFu;
+	};
+
+	const auto appendBigEndian = [](std::vector<std::uint8_t>& out,
+	                                std::uint32_t value, int bytes) {
+		for (int shift = (bytes - 1) * 8; shift >= 0; shift -= 8) {
+			out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFFu));
+		}
+	};
+
+	const auto appendChunk = [&](std::vector<std::uint8_t>& out,
+	                             const char* type,
+	                             const std::vector<std::uint8_t>& payload) {
+		appendBigEndian(out, static_cast<std::uint32_t>(payload.size()), 4);
+		std::vector<std::uint8_t> crcInput;
+		for (int i = 0; i < 4; ++i) {
+			crcInput.push_back(static_cast<std::uint8_t>(type[i]));
+		}
+		crcInput.insert(crcInput.end(), payload.begin(), payload.end());
+		out.insert(out.end(), crcInput.begin(), crcInput.end());
+		appendBigEndian(out, crc32Of(crcInput), 4);
+	};
+
+	// 3x2 image, RGBA8. Row 0 uses filter None, row 1 filter Up (2), so the
+	// decoder has to undo a filter to get the pixels back.
+	const std::uint8_t rows[2][3][4] = {
+	    {{10, 20, 30, 255}, {40, 50, 60, 128}, {70, 80, 90, 0}},
+	    {{11, 21, 31, 255}, {41, 51, 61, 129}, {71, 81, 91, 1}}};
+	const std::uint32_t width = 3, height = 2;
+
+	// Raw scanlines after filtering (filter byte + payload).
+	std::vector<std::uint8_t> raw;
+	for (std::uint32_t y = 0; y < height; ++y) {
+		raw.push_back(y == 0 ? 0 : 2);  // None, Up
+		for (std::uint32_t x = 0; x < width; ++x) {
+			for (int c = 0; c < 4; ++c) {
+				std::uint8_t value = rows[y][x][c];
+				if (y == 1) {
+					value = static_cast<std::uint8_t>(value - rows[0][x][c]);
+				}
+				raw.push_back(value);
+			}
+		}
+	}
+
+	std::vector<std::uint8_t> zlib;
+	zlib.push_back(0x78);  // CMF: deflate, 32K window
+	zlib.push_back(0x01);  // FLG: no dictionary, fastest
+	// One stored (uncompressed) deflate block: BFINAL=1, BTYPE=00.
+	std::size_t offset = 0;
+	do {
+		const std::size_t remaining = raw.size() - offset;
+		const std::size_t block = std::min<std::size_t>(remaining, 0xFFFF);
+		zlib.push_back(offset + block >= raw.size() ? 1 : 0);
+		zlib.push_back(static_cast<std::uint8_t>(block & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>((block >> 8) & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>(~block & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>((~block >> 8) & 0xFF));
+		zlib.insert(zlib.end(), raw.begin() + static_cast<long>(offset),
+		            raw.begin() + static_cast<long>(offset + block));
+		offset += block;
+	} while (offset < raw.size());
+	// Adler-32 of the uncompressed data (zlib trailer).
+	{
+		std::uint32_t a = 1, b = 0;
+		for (const std::uint8_t byte : raw) {
+			a = (a + byte) % 65521u;
+			b = (b + a) % 65521u;
+		}
+		appendBigEndian(zlib, (b << 16) | a, 4);
+	}
+
+	std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A,
+	                                 '\n'};
+	{
+		std::vector<std::uint8_t> ihdr;
+		appendBigEndian(ihdr, width, 4);
+		appendBigEndian(ihdr, height, 4);
+		ihdr.push_back(8);  // bit depth
+		ihdr.push_back(6);  // color type: RGBA
+		ihdr.push_back(0);  // compression
+		ihdr.push_back(0);  // filter
+		ihdr.push_back(0);  // interlace
+		appendChunk(png, "IHDR", ihdr);
+	}
+	appendChunk(png, "IDAT", zlib);
+	appendChunk(png, "IEND", {});
+
+	const fs::path path =
+	    fs::temp_directory_path() / "vv_image_decode_test.png";
+	const fs::path badPath =
+	    fs::temp_directory_path() / "vv_image_decode_test_bad.png";
+	{
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		out.write(reinterpret_cast<const char*>(png.data()),
+		          static_cast<std::streamsize>(png.size()));
+	}
+	{
+		std::ofstream out(badPath, std::ios::binary | std::ios::trunc);
+		out.write("this is not a png", 17);
+	}
+
+	vv::voxel::VoxelTextureImage image;
+	std::string error;
+	const bool loaded = vv::render::loadImageFileRGBA(path.string(), image,
+	                                                 &error);
+	check(loaded, "image decode: a PNG written by this test decodes");
+	if (loaded) {
+		check(image.width == width && image.height == height,
+		      "image decode: the decoded size is the PNG size");
+		check(image.rgba.size() ==
+		          static_cast<std::size_t>(width) * height * 4u,
+		      "image decode: RGBA8 output is width*height*4 bytes");
+		bool pixelsExact = image.rgba.size() ==
+		                   static_cast<std::size_t>(width) * height * 4u;
+		for (std::uint32_t y = 0; y < height && pixelsExact; ++y) {
+			for (std::uint32_t x = 0; x < width && pixelsExact; ++x) {
+				for (int c = 0; c < 4; ++c) {
+					const std::size_t index =
+					    (static_cast<std::size_t>(y) * width + x) * 4u +
+					    static_cast<std::size_t>(c);
+					pixelsExact =
+					    image.rgba[index] == rows[y][x][c];
+				}
+			}
+		}
+		check(pixelsExact,
+		      "image decode: pixels come back exactly, filter undone");
+	}
+
+	vv::voxel::VoxelTextureImage missing;
+	check(!vv::render::loadImageFileRGBA((path.string() + ".nope").c_str(),
+	                                     missing, &error),
+	      "image decode: a missing file is reported, not decoded");
+	vv::voxel::VoxelTextureImage garbage;
+	check(!vv::render::loadImageFileRGBA(badPath.string(), garbage, &error),
+	      "image decode: a file that is not an image fails cleanly");
+
+	std::error_code ec;
+	fs::remove(path, ec);
+	fs::remove(badPath, ec);
+	std::printf(
+	    "image decode: %ux%u RGBA8 reproduced byte-exact (filters none+up), "
+	    "missing/garbage rejected\n",
+	    width, height);
+}
+
 void testStreamPriority() {
 	const float chunk = 32.0f;  // chunk world size (32 voxels x 1.0)
 	const float cx = 400.0f, cz = 400.0f;  // camera (world units)
@@ -2354,8 +3473,15 @@ int main() {
 	testFarPatchRegion();
 	testFarMarch();
 	testSunShadowMarch();
+	testSunShadowSdfMarch();
+	testSdfSoftShadow3d();
+	testSdfBoxBuild();
+	testSdfBoxHandoff();
+	testSdfHandoverPolicy();
 	testStreamPriority();
 	testVoxelTextures();
+	testKeyBindings();
+	testImageDecode();
 
 	if (g_failures == 0) {
 		std::printf("all tests passed\n");

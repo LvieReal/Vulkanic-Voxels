@@ -26,7 +26,8 @@ class SceneUniform final {
 
   // sceneFlags: x = termination-cause visualization (VV_DEBUG_TERM),
   // y = far-field fade-in alpha (first activation only; recenters do
-  // not fade - their cells are identical). Lands in SceneUBO.misc.y/z.
+  // not fade - their cells are identical), z = SDF-shadow experiment.
+  // These land in SceneUBO.misc.y/z/w respectively.
   void update(const vv::core::Camera& camera, float timeSeconds,
               const LightingConfig& lighting,
               const glm::vec4& sceneFlags = glm::vec4(0.0f));
