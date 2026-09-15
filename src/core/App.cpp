@@ -143,6 +143,15 @@ void App::syncRendererSize(std::uint32_t width, std::uint32_t height) {
 		// creation (see init), so there is nothing to chase here.
 		return;
 	}
+	if (m_window.minimized()) {
+		// A minimized window has no drawable size - Win32 reports 0x0 for it
+		// (clamped to 1x1 here) - and nothing is presented while it is down,
+		// so rebuilding the swapchain for that would be pure churn and would
+		// ask the driver for a degenerate one. The size callback fires again
+		// on restore, and the frame loop re-checks the size every frame, so
+		// the real size cannot be missed.
+		return;
+	}
 	if (width == m_rendererWidth && height == m_rendererHeight) {
 		return;
 	}

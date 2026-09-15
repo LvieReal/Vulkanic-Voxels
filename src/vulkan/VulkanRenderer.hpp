@@ -138,6 +138,9 @@ class VulkanRenderer final {
   // zero extent).
   uint32_t requestedWidth() const;
   uint32_t requestedHeight() const;
+  // True when the surface has no size to build a swapchain for (a minimized
+  // window on Win32 reports a currentExtent of (0, 0)).
+  bool surfaceHasNoSize() const;
 
   bool createVoxelWorldAndUpload(std::string& outError);
   // Generates/evicts chunks for the new region center, uploads new chunk
@@ -195,6 +198,9 @@ class VulkanRenderer final {
   // until the window was touched (pass 45).
   uint32_t m_requestedWidth = 0;
   uint32_t m_requestedHeight = 0;
+  // Set while the surface has no size and rebuilds are being deferred, so the
+  // note is printed once per episode instead of once per attempt.
+  bool m_swapchainRebuildDeferred = false;
   std::vector<VkImage> m_swapchainImages;
   std::vector<VkImageView> m_swapchainImageViews;
   std::vector<VkImageLayout> m_swapchainImageLayouts;

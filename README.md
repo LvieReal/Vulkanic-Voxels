@@ -108,6 +108,12 @@ window size on every frame, so the first frame is already the size the window
 really has (no stretched or mis-sized launch frame on X11 or Wayland, with or
 without an explicit resize afterwards).
 
+Minimizing the window does not touch the swapchain: a minimized window has no
+drawable size (Win32 reports `0x0`), so the rebuild is deferred until the window
+is back and the size the surface reports is never handed to the driver as-is
+(`[vulkan] swapchain rebuild deferred: the surface reports no size (window
+minimized)`).
+
 Debug runs enable the Khronos **validation layer**: `run_debug.bat` sets
 `VV_VALIDATION=1` before starting `build/debug/bin/game.exe` (any other run can
 do the same: `VV_VALIDATION=1 ./build/release/bin/game`). Validation messages

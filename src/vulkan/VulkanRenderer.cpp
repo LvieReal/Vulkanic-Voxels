@@ -1845,6 +1845,17 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height,
       utils::choosePresentMode(support.presentModes);
   const VkExtent2D extent =
       utils::chooseSwapExtent(support.capabilities, width, height);
+  if (extent.width == 0 || extent.height == 0) {
+    // vkCreateSwapchainKHR rejects a zero extent
+    // (VUID-VkSwapchainCreateInfoKHR-imageExtent-01689), and everything sized
+    // from the extent - the output buffer, its memory - would be created at
+    // size 0, which vkCreateBuffer and vkAllocateMemory reject.
+    outError = surfaceHasNoSize()
+                   ? "The window has no drawable size (minimized or hidden); "
+                     "there is nothing to create a swapchain for."
+                   : "Refusing to create a swapchain with a zero extent.";
+    return false;
+  }
 
   uint32_t imageCount = support.capabilities.minImageCount + 1;
   if (support.capabilities.maxImageCount > 0 &&
@@ -1969,10 +1980,36 @@ bool VulkanRenderer::recreateSwapchain(uint32_t width, uint32_t height,
     return true;
   }
 
+  // Ask the surface what size it has BEFORE tearing the current swapchain
+  // down. A minimized window has no size (Win32 reports (0, 0)), and there is
+  // nothing sensible to create for it: the app is not presenting while
+  // minimized, and the swapchain it already has is the one the window will
+  // need again when it comes back. Deferring here (rather than building a
+  // degenerate one) keeps the frame loop's invariant - either there is a
+  // swapchain that matches the window, or there is no frame to present.
+  if (surfaceHasNoSize()) {
+    if (!m_swapchainRebuildDeferred) {
+      m_swapchainRebuildDeferred = true;
+      std::fprintf(stderr,
+                   "[vulkan] swapchain rebuild deferred: the surface reports "
+                   "no size (window minimized)\n");
+    }
+    return true;
+  }
+  m_swapchainRebuildDeferred = false;
+
   vkDeviceWaitIdle(m_device);
   cleanupSwapchain();
 
   return createSwapchain(width, height, outError);
+}
+
+bool VulkanRenderer::surfaceHasNoSize() const {
+  const utils::SwapchainSupportDetails support =
+      utils::querySwapchainSupport(m_physicalDevice, m_surface);
+  const VkExtent2D extent = support.capabilities.currentExtent;
+  return extent.width != UINT32_MAX &&
+         (extent.width == 0 || extent.height == 0);
 }
 
 bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
@@ -2404,6 +2441,14 @@ void VulkanRenderer::cleanupSceneResources() {
 }
 
 bool VulkanRenderer::createStorageResources(std::string& outError) {
+  if (m_swapchainExtent.width == 0 || m_swapchainExtent.height == 0) {
+    // Defensive: a zero extent would size this buffer (and its memory) to zero,
+    // which vkCreateBuffer / vkAllocateMemory reject
+    // (VUID-VkBufferCreateInfo-size-00912,
+    // VUID-VkMemoryAllocateInfo-allocationSize-07897).
+    outError = "Cannot size the render targets from a zero swapchain extent.";
+    return false;
+  }
   const uint64_t elements = static_cast<uint64_t>(m_swapchainExtent.width) *
                             static_cast<uint64_t>(m_swapchainExtent.height);
   const VkDeviceSize bufferSize =

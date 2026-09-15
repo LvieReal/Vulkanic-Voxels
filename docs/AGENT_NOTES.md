@@ -1167,3 +1167,70 @@ new code - the fixes are structural (each message maps to the exact call site
 above) and the owner's debug run is the verification. Note that the app reaches
 `vkCreateInstance` only after a native window exists, so the null-platform smoke
 run cannot even exercise the VV_VALIDATION branch.
+
+## Pass 48: zero extents are never handed to the driver (minimize)
+
+OWNER (after pass 47, validation clean): "the only ones i just caught are 0
+extents, exactly when minimizing window. needs guards."
+
+```
+[vulkan] vkCreateSwapchainKHR(): pCreateInfo->imageExtent (width = 0, height = 0) is invalid.   (VUID ...-01689)
+[vulkan] vkCreateBuffer(): pCreateInfo->size is zero.                                           (VUID ...-00912)
+[vulkan] vkAllocateMemory(): pAllocateInfo->allocationSize is 0.                                (VUID ...-07897/07899)
+```
+
+ONE CAUSE, THREE MESSAGES. A minimized Win32 window has no client area, and the
+surface says so: `VkSurfaceCapabilitiesKHR::currentExtent` becomes `(0, 0)` -
+*while still not being the special `UINT32_MAX` value* that means "the app
+decides". `utils::chooseSwapExtent()` returned `currentExtent` verbatim in that
+case, so:
+
+* `vkCreateSwapchainKHR` was called with `imageExtent = 0x0` (01689);
+* `m_swapchainExtent` was set to that, and `createStorageResources()` sized the
+  compute output from `width * height` -> 0 bytes: `vkCreateBuffer` size 0
+  (00912) and the two `vkAllocateMemory` calls that follow it with
+  `allocationSize` 0 (07897, 07899).
+
+The trigger chain is GLFW's `WM_SIZE` for the minimize (client `0x0`) -> the
+framebuffer-size callback (clamped to 1x1 by GameWindow) -> `App::syncRendererSize`
+-> `VulkanRenderer::resize` -> recreate -> `chooseSwapExtent` -> `currentExtent`.
+
+FIX, four layers:
+
+* `utils::chooseSwapExtent()` treats a surface extent with a zero dimension as
+  "no current extent" and falls through to the app-chosen size, clamped into
+  `[minImageExtent, maxImageExtent]` and floored at 1 - the result is never
+  zero, and the `UINT32_MAX` path is unchanged.
+* `VulkanRenderer::recreateSwapchain()` asks the surface first
+  (`surfaceHasNoSize()`) and DEFERS the rebuild while the surface reports no
+  size: the current swapchain is kept, `vkDeviceWaitIdle`/cleanup are not even
+  reached, and a single note is printed per episode
+  (`[vulkan] swapchain rebuild deferred: the surface reports no size (window
+  minimized)`). Nothing is presented while minimized anyway (`canPresent()`),
+  and the window comes back at the same size, so the swapchain that is kept is
+  the one it needs.
+* `VulkanRenderer::createSwapchain()` refuses a zero extent with a message
+  that names the reason (`The window has no drawable size (minimized or
+  hidden)`), so the init path cannot fall through to the zero-sized buffers
+  either - and `createStorageResources()` has its own guard for the same
+  reason.
+* `App::syncRendererSize()` ignores size reports while the window is minimized,
+  so the 1x1 clamped size Win32 produces during the minimize never reaches the
+  renderer at all. The size callback fires again on restore and the frame loop
+  re-checks the size every frame, so the real size cannot be missed.
+
+VERIFIED IN THE SANDBOX. Release and Debug warning-free; ctest green in both
+(5.0 s / 24.0 s); `glslangValidator -V` exit 0; `VV_PLATFORM=null` smoke
+unchanged. The guard itself is exercised by a probe (not committed) that links
+the REAL `VulkanUtils.cpp` and drives `chooseSwapExtent` with the capability
+sets in question: normal Win32 surface (`currentExtent 1920x1009`) -> unchanged;
+minimized surface (`currentExtent 0x0`) with a 1x1 or 1920x1009 request -> the
+clamped request, never 0x0; minimized surface with `minImageExtent 8x8` -> 8x8;
+a 0x0 request -> 1x1; `UINT32_MAX` current extent -> clamped to
+`[min, max]` as before; a surface that reports `minImageExtent 0x0` -> the
+requested size, still non-zero. Probe verdict: PROBE OK, 9/9 cases. NOT PROVEN
+HERE: the real minimize on Win32 (no window manager, no ICD in the sandbox) -
+the deferred path needs a surface that reports no size, which cannot be
+simulated without a driver. Owner check: minimize/restore with the validation
+layer on stays silent, the window comes back at the size it left, and the
+"rebuild deferred" note appears once per minimize.
