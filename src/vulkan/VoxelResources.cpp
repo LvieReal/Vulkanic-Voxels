@@ -409,12 +409,20 @@ bool VoxelResources::createVoxelTextures(
 		return false;
 	}
 
+	// Stage masks are parameters, not constants: srcAccessMask must be
+	// supported by srcStageMask and dstAccessMask by dstStageMask
+	// (VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02819/02820). A fixed
+	// TOP_OF_PIPE -> TRANSFER pair is only right for the first transition
+	// below: the mip transitions have a transfer WRITE to flush, and the last
+	// one hands the image over to the compute stage.
 	auto imageBarrier = [&](std::uint32_t image, std::uint32_t baseMip,
 													std::uint32_t mipCount,
 													VkImageLayout oldLayout,
 													VkImageLayout newLayout,
 													VkAccessFlags srcAccess,
-													VkAccessFlags dstAccess) {
+													VkPipelineStageFlags srcStage,
+													VkAccessFlags dstAccess,
+													VkPipelineStageFlags dstStage) {
 		VkImageMemoryBarrier b{};
 		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 		b.srcAccessMask = srcAccess;
@@ -429,15 +437,16 @@ bool VoxelResources::createVoxelTextures(
 		b.subresourceRange.levelCount = mipCount;
 		b.subresourceRange.baseArrayLayer = 0;
 		b.subresourceRange.layerCount = 1;
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-												 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-												 nullptr, 1, &b);
+		vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr,
+											 1, &b);
 	};
 
 	for (std::uint32_t i = 0; i < count; ++i) {
 		imageBarrier(i, 0, mips[i], VK_IMAGE_LAYOUT_UNDEFINED,
 								 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-								 VK_ACCESS_TRANSFER_WRITE_BIT);
+								 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+								 VK_ACCESS_TRANSFER_WRITE_BIT,
+								 VK_PIPELINE_STAGE_TRANSFER_BIT);
 
 		VkBufferImageCopy region{};
 		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -455,7 +464,9 @@ bool VoxelResources::createVoxelTextures(
 			imageBarrier(i, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 									 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 									 VK_ACCESS_TRANSFER_WRITE_BIT,
-									 VK_ACCESS_TRANSFER_READ_BIT);
+									 VK_PIPELINE_STAGE_TRANSFER_BIT,
+									 VK_ACCESS_TRANSFER_READ_BIT,
+									 VK_PIPELINE_STAGE_TRANSFER_BIT);
 			const auto srcW = static_cast<std::int32_t>(
 					std::max<std::uint32_t>(all[i].width >> (m - 1), 1u));
 			const auto srcH = static_cast<std::int32_t>(
@@ -511,9 +522,11 @@ bool VoxelResources::createVoxelTextures(
 			imageBarrier(i, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 									 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 									 VK_ACCESS_TRANSFER_WRITE_BIT,
-									 VK_ACCESS_SHADER_READ_BIT);
-			// imageBarrier pipelines TOP_OF_PIPE -> TRANSFER; the final
-			// visibility to compute is guaranteed by the queue idle below.
+									 VK_PIPELINE_STAGE_TRANSFER_BIT,
+									 VK_ACCESS_SHADER_READ_BIT,
+									 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			// Submitted on its own and followed by a queue idle, so the compute
+			// stage is the one that reads the texture afterwards.
 		}
 	}
 
@@ -890,9 +903,13 @@ bool VoxelResources::uploadChunksStreaming(
 	const std::uint32_t idx = m_streamParity ^ 1u;
 	if (m_streamFencePending[idx]) {
 		vkWaitForFences(device, 1, &m_streamFence[idx], VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_streamFence[idx]);
 		m_streamFencePending[idx] = false;
 	}
+	// The fences are created SIGNALED so the first wait in a slot returns
+	// immediately, and a signaled fence must be reset before it is submitted
+	// again (VUID-vkQueueSubmit-fence-00063). Resetting here - rather than
+	// inside the pending branch - covers the first submit in each slot too.
+	vkResetFences(device, 1, &m_streamFence[idx]);
 
 	// Staging layout: [voxel bytes][heightmap words][block maxima].
 	const auto& types = upload.chunk->voxelTypes();
@@ -1026,10 +1043,11 @@ bool VoxelResources::ensureFarUploadResources(
 }
 
 void VoxelResources::waitPreviousFarUpload(VkDevice device) {
+	// Waits only: every submit resets its own fence (they are created
+	// SIGNALED - VUID-vkQueueSubmit-fence-00063), pending or not.
 	for (std::uint32_t k = 0; k < 2; ++k) {
 		if (m_farFencePending[k]) {
 			vkWaitForFences(device, 1, &m_farFence[k], VK_TRUE, UINT64_MAX);
-			vkResetFences(device, 1, &m_farFence[k]);
 			m_farFencePending[k] = false;
 		}
 	}
@@ -1084,6 +1102,7 @@ bool VoxelResources::uploadFarFieldHalf(
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &m_farCmd[idx];
+	vkResetFences(device, 1, &m_farFence[idx]);
 	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far field upload.";
@@ -1129,9 +1148,11 @@ bool VoxelResources::uploadFarFieldDelta(
 	const std::uint32_t idx = m_farParity ^ 1u;
 	if (m_farFencePending[idx]) {
 		vkWaitForFences(device, 1, &m_farFence[idx], VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_farFence[idx]);
 		m_farFencePending[idx] = false;
 	}
+	// See uploadChunksStreaming: the fence must be unsignaled for the submit,
+	// and it starts life signaled.
+	vkResetFences(device, 1, &m_farFence[idx]);
 
 	std::size_t src = 0;
 	auto* staging = static_cast<std::uint32_t*>(m_farStagingMapped[idx]);
@@ -1179,6 +1200,7 @@ bool VoxelResources::uploadFarFieldDelta(
 	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &m_farCmd[idx];
+	vkResetFences(device, 1, &m_farFence[idx]);
 	r = vkQueueSubmit(queue, 1, &submit, m_farFence[idx]);
 	if (r != VK_SUCCESS) {
 		outError = "Failed to submit far delta upload.";
@@ -1267,9 +1289,11 @@ bool VoxelResources::beginSdfUpload(
 	// not as a frame cost.
 	if (m_sdfFencePending) {
 		vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
-		vkResetFences(device, 1, &m_sdfFence);
 		m_sdfFencePending = false;
 	}
+	// Created SIGNALED (see uploadChunksStreaming): reset before every submit,
+	// not only for the submits that found it still pending.
+	vkResetFences(device, 1, &m_sdfFence);
 	std::memcpy(m_sdfStagingMapped, seeds.data(),
 				seeds.size() * sizeof(std::uint32_t));
 	VkResult r = vkResetCommandBuffer(m_sdfCmd, 0);

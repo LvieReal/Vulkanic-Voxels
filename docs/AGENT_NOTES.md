@@ -1093,3 +1093,77 @@ window, and the new log line says `maximized yes` with `content at` the work
 area origin. If the offset is still there, the new line says where the window
 is and whether Windows agrees it is maximized - and the "re-applying the
 placement" line says whether the safety net had to step in.
+
+## Pass 47: the validation layer is quiet (and on by default for debug runs)
+
+OWNER: "next thing to work on is vulkan validation messages fixing. and enable
+VV_VALIDATION through run_debug.bat by default." Five distinct messages, five
+distinct root causes; the fixes are all in the barrier/queue-submit plumbing.
+
+1. `pImageMemoryBarriers[0].srcAccessMask (VK_ACCESS_TRANSFER_WRITE_BIT) is not
+   supported by stage mask (VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)` (and its
+   `dstAccessMask ... SHADER_READ ... TRANSFER` twin), VUID 02819/02820.
+   `VoxelResources::createVoxelTextures` built its image transitions with a
+   hard-coded `TOP_OF_PIPE -> TRANSFER` pair while the caller passed access
+   masks for other stages: the mip chain transitions have a transfer WRITE to
+   flush (srcStage must be TRANSFER, not TOP_OF_PIPE) and the final transition
+   hands the image to the compute stage (dstStage must be COMPUTE_SHADER, not
+   TRANSFER). The stage masks are parameters of the lambda now - TOP_OF_PIPE
+   only for the layout-only first transition, TRANSFER for the mip barriers,
+   COMPUTE_SHADER for the final one.
+
+2. `pBufferMemoryBarriers[2] VkBuffer ... has a size of 0`, VUID 01188.
+   `preComputeBarriers[2]` (the compute output buffer, TRANSFER_READ ->
+   SHADER_WRITE) was the only barrier in that array whose `offset`/`size` were
+   left at the zero-initialized defaults, i.e. an empty range. It now says
+   `offset = 0; size = VK_WHOLE_SIZE;` like its four neighbours.
+
+3. `vkQueueSubmit(): (VkFence ...) submitted in SIGNALED state`, VUID 00063.
+   The upload fences are created with `VK_FENCE_CREATE_SIGNALED_BIT` (so the
+   first wait in a slot returns immediately) but were only reset *inside* the
+   `if (pending)` branch: the FIRST submit in each slot therefore went in on a
+   signaled fence - two stream slots at startup, and the same for the far and
+   SDF upload paths on the runs that use them. Every submit site now resets its
+   fence immediately before `vkQueueSubmit` (four sites: `uploadChunksStreaming`,
+   `uploadFarFieldHalf`, `uploadFarFieldDelta`, `beginSdfUpload`), and
+   `waitPreviousFarUpload()` waits only - resetting moved to the submit that
+   owns the fence. `vkResetFences` on an already-unsignaled fence is a no-op, so
+   the unconditional reset is safe in every path.
+
+4. `vkQueueSubmit(): pSubmits[0].pSignalSemaphores[0] ... is being signaled ...
+   but it may still be in use by VkSwapchainKHR ... Swapchain image N was
+   presented but was not re-acquired`, VUID 00067. The render-finished semaphore
+   was per frame in flight (`m_currentFrame`), but the present operation that
+   waits on it is not gated by the in-flight fence - presenting only guarantees
+   that an image is free when that image is acquired again. The semaphores are
+   now per SWAPCHAIN IMAGE (`m_renderFinishedSemaphores[imageIndex]`), created
+   by `createPresentSemaphores()` from `createSwapchain()` so the array always
+   matches the images in use (the old ones are destroyed rather than kept: a
+   present that returned OUT_OF_DATE/SUBOPTIMAL leaves its semaphore signaled
+   with nobody waiting on it, and a fresh frame must never signal a signaled
+   binary semaphore). The acquire semaphores stay per frame in flight - those
+   *are* gated by the in-flight fence. `cleanup()` now destroys the two
+   different-sized arrays in separate loops (the old single loop indexed the
+   present semaphores by the frame-in-flight count).
+
+5. Same class, not reported because it needs synchronization validation:
+   the acquire semaphore's `pWaitDstStageMask` was `COMPUTE_SHADER` only, while
+   the submission also transitions and writes the swapchain image in the
+   TRANSFER stage. It is `COMPUTE_SHADER | TRANSFER` now, so the acquire
+   actually orders every stage that touches the image it hands over.
+
+`run_debug.bat` sets `VV_VALIDATION=1` before launching
+`build/debug/bin/game.exe`, so the layer is on for debug runs by default (the
+app already switches it on when that variable is present, prints a note when the
+layer is missing and keeps going). README documents the variable for other runs.
+
+VERIFIED IN THE SANDBOX (deps /home/user/.cache/vv-deps): Release and Debug
+configure and build warning-free, ctest green in both (5.1 s / 23.2 s),
+`glslangValidator -V` exit 0, and the `VV_PLATFORM=null` smoke run is unchanged
+(two window lines + the geometry line, then the documented no-native-window exit
+1). NOT PROVEN HERE: the sandbox has no Vulkan ICD and no validation layer (only
+`share/vulkan/registry` in the prefix), so the layer cannot be *run* against the
+new code - the fixes are structural (each message maps to the exact call site
+above) and the owner's debug run is the verification. Note that the app reaches
+`vkCreateInstance` only after a native window exists, so the null-platform smoke
+run cannot even exercise the VV_VALIDATION branch.

@@ -168,6 +168,9 @@ class VulkanRenderer final {
   bool createCommandPool(std::string& outError);
   bool createCommandBuffers(std::string& outError);
   bool createSyncObjects(std::string& outError);
+  // (Re)creates one render-finished semaphore per swapchain image; called from
+  // createSwapchain so the array always matches the images in use.
+  bool createPresentSemaphores(std::string& outError);
 
   bool recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex,
                            std::string& outError);
@@ -212,6 +215,8 @@ class VulkanRenderer final {
   std::vector<VkCommandBuffer> m_commandBuffers;
 
   std::vector<VkSemaphore> m_imageAvailableSemaphores;
+  // Per swapchain image (see drawFrame), NOT per frame in flight: a present
+  // that still waits on one must not be reused with another image.
   std::vector<VkSemaphore> m_renderFinishedSemaphores;
   std::vector<VkFence> m_inFlightFences;
   uint32_t m_currentFrame = 0;

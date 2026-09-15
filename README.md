@@ -108,6 +108,12 @@ window size on every frame, so the first frame is already the size the window
 really has (no stretched or mis-sized launch frame on X11 or Wayland, with or
 without an explicit resize afterwards).
 
+Debug runs enable the Khronos **validation layer**: `run_debug.bat` sets
+`VV_VALIDATION=1` before starting `build/debug/bin/game.exe` (any other run can
+do the same: `VV_VALIDATION=1 ./build/release/bin/game`). Validation messages
+arrive on stderr with the `[vulkan]` prefix; when the layer is not installed the
+app says so and continues without it.
+
 A small pure-logic test suite (noise, terrain layering, chunked world, key
 bindings, the PNG decoder) builds alongside by default — run it with
 `ctest --test-dir build` (or disable with `-DVV_BUILD_TESTS=OFF`).

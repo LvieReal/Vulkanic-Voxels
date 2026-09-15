@@ -264,7 +264,11 @@ void VulkanRenderer::drawFrame() {
     return;
   }
 
-  VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+  // The acquire wait must cover every stage that touches the acquired image:
+  // the compute dispatch reads the voxel data, and the TRANSFER stage then
+  // transitions and writes the swapchain image itself.
+  VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT};
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submitInfo.waitSemaphoreCount = 1;
@@ -273,7 +277,14 @@ void VulkanRenderer::drawFrame() {
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &m_commandBuffers[m_currentFrame];
   submitInfo.signalSemaphoreCount = 1;
-  submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[m_currentFrame];
+  // The render-finished semaphore is per SWAPCHAIN IMAGE, not per frame in
+  // flight: the present operation that waits on it may still hold it when this
+  // frame slot comes around again, and presenting only guarantees that the
+  // image it presented is free again when that image is re-acquired. Indexing
+  // by the acquired image means the semaphore is reused exactly when the image
+  // it was presented with is handed back
+  // (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+  submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
 
   if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo,
                     m_inFlightFences[m_currentFrame]) != VK_SUCCESS) {
@@ -284,7 +295,7 @@ void VulkanRenderer::drawFrame() {
   VkPresentInfoKHR presentInfo{};
   presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   presentInfo.waitSemaphoreCount = 1;
-  presentInfo.pWaitSemaphores = &m_renderFinishedSemaphores[m_currentFrame];
+  presentInfo.pWaitSemaphores = &m_renderFinishedSemaphores[imageIndex];
   presentInfo.swapchainCount = 1;
   presentInfo.pSwapchains = &m_swapchain;
   presentInfo.pImageIndices = &imageIndex;
@@ -390,15 +401,21 @@ void VulkanRenderer::cleanup() {
     m_pipelineLayout = VK_NULL_HANDLE;
   }
 
-  for (size_t i = 0; i < m_imageAvailableSemaphores.size(); ++i) {
-    if (m_imageAvailableSemaphores[i]) {
-      vkDestroySemaphore(m_device, m_imageAvailableSemaphores[i], nullptr);
+  // Three separate loops: the present semaphores are per swapchain image, the
+  // other two are per frame in flight, so the array sizes differ.
+  for (auto semaphore : m_imageAvailableSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
     }
-    if (m_renderFinishedSemaphores[i]) {
-      vkDestroySemaphore(m_device, m_renderFinishedSemaphores[i], nullptr);
+  }
+  for (auto semaphore : m_renderFinishedSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
     }
-    if (m_inFlightFences[i]) {
-      vkDestroyFence(m_device, m_inFlightFences[i], nullptr);
+  }
+  for (auto fence : m_inFlightFences) {
+    if (fence != VK_NULL_HANDLE) {
+      vkDestroyFence(m_device, fence, nullptr);
     }
   }
   m_imageAvailableSemaphores.clear();
@@ -1909,6 +1926,9 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height,
     }
   }
 
+  if (!createPresentSemaphores(outError)) {
+    return false;
+  }
   if (!createStorageResources(outError) || !createDescriptorSet(outError) ||
       !createComputePipeline(outError)) {
     return false;
@@ -2767,9 +2787,37 @@ bool VulkanRenderer::createCommandBuffers(std::string& outError) {
   return true;
 }
 
+// One render-finished semaphore per swapchain image (see drawFrame). Called
+// from createSwapchain, so the array always matches the images of the swapchain
+// in use. The old semaphores are always destroyed instead of being kept when
+// the image count happens to match: a present that returned OUT_OF_DATE /
+// SUBOPTIMAL leaves its semaphore signaled with nothing left to wait on it, and
+// a fresh frame must never signal a signaled binary semaphore. (Presentation
+// only consumes the wait when it actually presents, and the recreate path has
+// already waited for device idle.)
+bool VulkanRenderer::createPresentSemaphores(std::string& outError) {
+  const std::size_t imageCount = m_swapchainImages.size();
+  for (auto semaphore : m_renderFinishedSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
+    }
+  }
+  m_renderFinishedSemaphores.assign(imageCount, VK_NULL_HANDLE);
+
+  VkSemaphoreCreateInfo semInfo{};
+  semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  for (std::size_t i = 0; i < imageCount; ++i) {
+    if (vkCreateSemaphore(m_device, &semInfo, nullptr,
+                          &m_renderFinishedSemaphores[i]) != VK_SUCCESS) {
+      outError = "Failed to create the present semaphores.";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool VulkanRenderer::createSyncObjects(std::string& outError) {
   m_imageAvailableSemaphores.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
-  m_renderFinishedSemaphores.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
   m_inFlightFences.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
 
   VkSemaphoreCreateInfo semInfo{};
@@ -2782,11 +2830,9 @@ bool VulkanRenderer::createSyncObjects(std::string& outError) {
   for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
     VkResult r1 = vkCreateSemaphore(m_device, &semInfo, nullptr,
                                     &m_imageAvailableSemaphores[i]);
-    VkResult r2 = vkCreateSemaphore(m_device, &semInfo, nullptr,
-                                    &m_renderFinishedSemaphores[i]);
-    VkResult r3 =
+    VkResult r2 =
         vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]);
-    if (r1 != VK_SUCCESS || r2 != VK_SUCCESS || r3 != VK_SUCCESS) {
+    if (r1 != VK_SUCCESS || r2 != VK_SUCCESS) {
       outError = "Failed to create synchronization objects.";
       return false;
     }
@@ -2830,6 +2876,11 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].buffer = m_outputBuffer;
+  // A barrier covers [offset, offset+size); the zero-initialized defaults mean
+  // an empty range, which vkCmdPipelineBarrier rejects
+  // (VUID-VkBufferMemoryBarrier-size-01188).
+  preComputeBarriers[2].offset = 0;
+  preComputeBarriers[2].size = VK_WHOLE_SIZE;
 
   // Chunk fade alphas: mapped-memory writes from updateWorld must be
   // visible to the compute stage before the dispatch.
