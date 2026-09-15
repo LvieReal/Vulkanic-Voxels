@@ -27,7 +27,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
+
+#include "voxel/VoxelTypes.hpp"
 
 namespace vv::voxel {
 
@@ -216,6 +219,43 @@ inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
         t += std::max(h * 0.7f, 0.05f);
     }
     return visibility;
+}
+
+// Per-voxel solid test for an SDF box assembled from chunk type snapshots
+// (the GPU shadow build in VulkanRenderer::launchSdfBuild uses this; the
+// parity test in tests/terrain_world_tests.cpp pins it).
+//
+// `snapshots` is row-major over the (2*half)^2 box chunks, index
+// cz*(2*half) + cx; an EMPTY snapshot is a missing chunk (reads as air).
+// (x, y, z) are box-local; x/csx and z/csz give the local chunk index
+// because the box is chunk-aligned.
+//
+// The chunk read MUST use the Chunk layout
+//     X + Y*sizeX + Z*sizeX*worldHeight      (see Chunk.hpp)
+// NOT Z*sizeX*chunkSizeZ: a chunk is worldHeight (128) tall, so the wrong
+// stride only ever sees the first ~4 z-slices and re-mixes them with a
+// period-4 alias. That corrupted field read solid almost everywhere - the
+// on-device "region fully shadowed" + banded shadow edges (pass-39 bug).
+inline bool sdfChunkSolidAt(const std::vector<std::vector<std::uint8_t>>& snapshots,
+                            int half, int csx, int csz, int worldHeight,
+                            int x, int y, int z) {
+    const int lcX = x / csx;
+    const int lcZ = z / csz;
+    if (lcX < 0 || lcX >= 2 * half || lcZ < 0 || lcZ >= 2 * half) {
+        return false;
+    }
+    const std::vector<std::uint8_t>& types =
+        snapshots[static_cast<std::size_t>(lcZ) * (2u * static_cast<unsigned>(half)) +
+                  static_cast<std::size_t>(lcX)];
+    if (types.empty()) {
+        return false;
+    }
+    const std::size_t i =
+        static_cast<std::size_t>(x - lcX * csx) +
+        static_cast<std::size_t>(y) * static_cast<std::size_t>(csx) +
+        static_cast<std::size_t>(z - lcZ * csz) *
+            static_cast<std::size_t>(csx) * static_cast<std::size_t>(worldHeight);
+    return types[i] != static_cast<std::uint8_t>(VoxelType::Air);
 }
 
 }  // namespace vv::voxel

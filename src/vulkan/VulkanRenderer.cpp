@@ -1216,31 +1216,16 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
       [snapshots = std::move(chunkSnapshots), nx, ny, nz, half, csx, csz, cy,
        boxX, boxZ, centerChunkX, centerChunkZ, this]() mutable {
         vv::voxel::SdfField sdf;
-        sdf.build(nx, ny, nz, [&snapshots, half, csx, csz](int x, int y,
-                                                           int z) {
-          // Box voxel -> (local chunk, chunk-local). The box origin chunk
-          // is (firstChunkX, firstChunkZ); the local chunk index is
-          // (x / csx, z / csz), clamped to the box.
-          const int32_t lcX = x / csx;
-          const int32_t lcZ = z / csz;
-          if (lcX < 0 || lcX >= 2 * half || lcZ < 0 || lcZ >= 2 * half) {
-            return false;
-          }
-          const std::vector<std::uint8_t>& types =
-              snapshots[lcZ * (2 * half) + lcX];
-          if (types.empty()) {
-            return false;  // chunk not installed: air (rare; the region is
-                           // complete when this build launches)
-          }
-          // Chunk layout X + Y*sizeX + Z*sizeX*sizeZ (see Chunk).
-          const std::size_t i =
-              static_cast<std::size_t>(x - lcX * csx) +
-              static_cast<std::size_t>(y) * static_cast<std::size_t>(csx) +
-              static_cast<std::size_t>(z - lcZ * csz) *
-                  static_cast<std::size_t>(csx) * static_cast<std::size_t>(csz);
-          return types[i] !=
-                 static_cast<std::uint8_t>(vv::voxel::VoxelType::Air);
-        });
+        // sdfChunkSolidAt (SdfField.hpp) owns the box->chunk mapping and the
+        // chunk layout X + Y*sizeX + Z*sizeX*worldHeight. The old inline
+        // version used a Z*sizeX*sizeZ stride, which scrambled the z-slices
+        // of every chunk and produced a near-solid garbage field (the
+        // on-device "region fully shadowed" + banded shadow edges).
+        sdf.build(nx, ny, nz,
+                  [&snapshots, half, csx, csz, cy](int x, int y, int z) {
+                    return vv::voxel::sdfChunkSolidAt(snapshots, half, csx, csz,
+                                                      cy, x, y, z);
+                  });
         // Pack the argmin seed per cell (box layout x + y*nx + z*nx*ny); a
         // cell with no solid in view (seed -1) gets 0xFFFFFFFF (the shader
         // skips it). This is the EXACT field the CPU test pins, so the GPU

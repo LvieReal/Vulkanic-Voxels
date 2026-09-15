@@ -520,3 +520,54 @@ continuous, matching the top-edge penumbra; the overhang underside stays at
 most half-lit; NO light leak (dark-side stays dark); the binary
 sunRayEscapes (VV_SDF_SHADOWS=0) is UNTOUCHED (bit-identical); the 2.5D
 fallback (before the first build lands) is unchanged.
+
+## Pass 39: SDF box chunk read used the wrong z-stride (owner's pass-38
+## "region fully shadowed" + "bands")
+
+ROOT CAUSE (found by CPU diagnostics on real generated terrain): the
+pass-38 SDF box build read each chunk snapshot with a
+`Z * sizeX * sizeZ` (= z*32*32) stride, but the Chunk layout is
+`X + Y*sizeX + Z*sizeX*worldHeight` (= z*32*128, see Chunk.hpp). The wrong
+stride only ever saw the first ~4 z-slices of every chunk and re-mixed them
+with a PERIOD-4 alias. Measured on a real mountain chunk: 976 of 1024
+columns had the wrong top (95% scrambled) - the uploaded field was a
+near-solid garbage field, so sun rays hit "solid" almost everywhere:
+- "the region is fully shadowed" = the scrambled field, not the terrain;
+- the "bands" on the shadow edge = the period-4 z-alias of the scramble
+  (the same comb reproduced by the CPU reference, which is why CPU and
+  on-device agreed on the artifact).
+
+FIX: the box->chunk read now lives in ONE place - vv::voxel::sdfChunkSolidAt
+(SdfField.hpp), which the renderer's build calls and the CPU test pins
+(previously the index math was inline in launchSdfBuild, untested). The
+shader is UNCHANGED (it reads the packed seeds, not the chunks).
+
+REAL-TERRAIN NUMBERS (fixed field, 6x6-chunk box at the mask peak,
+sun norm(0.5,1,0.5), CPU reference): exact-lit 7511 / umbra 1705 columns
+(only ~18% of surface columns are genuinely in shadow - the dark region was
+the bug); 0 leaks; lit side: 63% at >=0.75, 29% below 0.25 (the accepted
+pass-34 k*h/t grazing character, same as pass 34's look); hard shadow
+transitions occur only where a ray grazes rock within ~0.12-0.78 voxels
+(near-field casters - correct hard shadows), the wide far penumbra is
+smooth.
+
+WATCH ITEM (separate pass, only if visible on-device): 233/7511 (3.1%) of
+exact-lit sample columns render exactly 0.0 because the ray skims a solid
+corner within the 1e-3 hit threshold (the SDF "distance to solid cube"
+counts a 1mm corner graze as a hit while the true zero-thickness ray
+passes above it). Candidate fix: tighten the hit threshold (1e-3 -> 1e-4)
+in SdfField::sphereTracedShadow + the GLSL mirror (re-pins the CPU test
+counts). NOT included in this pass (one problem per pass).
+
+TEST: testSdfChunkAssemblyParity - a real mountain chunk assembled through
+sdfChunkSolidAt must reproduce the chunk's column tops exactly (the old
+stride fails this with ~95% of columns wrong) and the three missing
+quadrants must read as air. ctest green; glslangValidator green (no shader
+change); the game target builds.
+
+ACCEPTANCE (on-device, VV_SDF_SHADOWS=1): the previously "fully shadowed"
+region is now mostly LIT with a genuine soft shadow where the mountains
+cast (expect ~a fifth of the surface in real umbra on dense terrain); the
+banding on the shadow edge is GONE; the soft side-edge look the owner
+confirmed in pass 38 is unchanged; no light leaks; pass-34 fallback and
+the binary path untouched.

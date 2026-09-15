@@ -2415,6 +2415,86 @@ void testSdfSoftShadow3d() {
 	}
 }
 
+// Pass 39 regression: the SDF box assembled from chunk snapshots must
+// reproduce the chunk geometry. The GPU build (launchSdfBuild) reads each
+// snapshot with the Chunk layout X + Y*sizeX + Z*sizeX*worldHeight; the
+// pass-38 bug used a Z*sizeX*chunkSizeZ stride, which only saw the first
+// few z-slices re-mixed with a period-4 alias - a near-solid garbage field
+// that rendered on-device as "the region fully shadowed" + banded shadow
+// edges. Pinned through vv::voxel::sdfChunkSolidAt (the shared predicate
+// the renderer now calls, so the formula has one owner).
+void testSdfChunkAssemblyParity() {
+	using vv::terrain::TerrainGenerator;
+	using vv::terrain::TerrainConfig;
+	const TerrainGenerator gen(TerrainConfig{});
+	// A dense mountain chunk: the mask peak on a 32-aligned grid.
+	float bestMask = 0.0f;
+	std::int32_t bx = 0, bz = 0;
+	for (std::int32_t z = -256; z <= 256; z += 32)
+		for (std::int32_t x = -256; x <= 256; x += 32) {
+			const float m = gen.mountainMaskF(float(x), float(z));
+			if (m > bestMask) {
+				bestMask = m;
+				bx = x;
+				bz = z;
+			}
+		}
+	std::vector<std::uint8_t> types;
+	gen.generateChunkVoxels(bx, bz, 32, 32, 128, types);
+
+	// 2x2-chunk box (half = 1); only the (1,1) chunk is installed, the
+	// other three read as air (missing).
+	std::vector<std::vector<std::uint8_t>> snaps(4);
+	snaps[1 * 2 + 1] = types;
+	constexpr int kN = 64;  // 2 chunks * 32
+	constexpr int kH = 128;
+
+	// Column tops straight from the chunk (declared layout: ground truth).
+	auto chunkTop = [&](int x, int z) {
+		for (int y = kH - 1; y >= 0; --y)
+			if (types[std::size_t(x) + std::size_t(y) * 32 +
+					 std::size_t(z) * 32 * 128] !=
+				static_cast<std::uint8_t>(vv::voxel::VoxelType::Air))
+				return y;
+		return -1;
+	};
+	// Column tops through the box predicate (the renderer's read).
+	auto boxTop = [&](int x, int z) {
+		for (int y = kH - 1; y >= 0; --y)
+			if (vv::voxel::sdfChunkSolidAt(snaps, 1, 32, 32, kH, x, y, z))
+				return y;
+		return -1;
+	};
+	int mismatched = 0;
+	int minTop = kH, maxTop = -1;
+	for (int z = 32; z < kN; ++z)
+		for (int x = 32; x < kN; ++x) {
+			const int c = chunkTop(x - 32, z - 32);
+			const int b = boxTop(x, z);
+			if (c != b)
+				++mismatched;
+			if (c >= 0) {
+				minTop = std::min(minTop, c);
+				maxTop = std::max(maxTop, c);
+			}
+		}
+	check(mismatched == 0,
+		  "sdf assembly: box column tops must equal the chunk's (z-stride)");
+	check(maxTop >= 60,
+		  "sdf assembly: the mountain chunk has tall columns to cover");
+	// The three missing quadrants must stay air (the chunk mapping).
+	int foreign = 0;
+	for (int z = 0; z < kN; z += 2)
+		for (int x = 0; x < kN; x += 2) {
+			if (x >= 32 && z >= 32)
+				continue;
+			for (int y = 0; y < kH; y += 4)
+				if (vv::voxel::sdfChunkSolidAt(snaps, 1, 32, 32, kH, x, y, z))
+					++foreign;
+		}
+	check(foreign == 0, "sdf assembly: missing chunks read as air");
+}
+
 }  // namespace
 }  // namespace
 
@@ -2762,6 +2842,7 @@ int main() {
 	testSunShadowMarch();
 	testSunShadowSdfMarch();
 	testSdfSoftShadow3d();
+	testSdfChunkAssemblyParity();
 	testStreamPriority();
 	testVoxelTextures();
 
