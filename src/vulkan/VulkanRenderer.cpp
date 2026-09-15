@@ -17,6 +17,7 @@
 #include "render/VoxelTextureFiles.hpp"
 #include "vulkan/StreamPriority.hpp"
 #include "vulkan/VulkanUtils.hpp"
+#include "voxel/SdfField.hpp"
 #include "voxel/VoxelTypes.hpp"
 
 namespace vv::vulkan {
@@ -329,6 +330,13 @@ void VulkanRenderer::cleanup() {
   }
   m_farBuildRunning = false;
   m_farPendingReady = false;
+  // Join the 3D voxel SDF builder thread (pass 38): it reads the world
+  // chunks (owned by m_world, destroyed below) and fills m_sdfPending.
+  if (m_sdfThread.joinable()) {
+    m_sdfThread.join();
+  }
+  m_sdfBuildRunning = false;
+  m_sdfPendingReady = false;
 
   if (m_device) {
     vkDeviceWaitIdle(m_device);
@@ -468,6 +476,11 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
                        std::chrono::steady_clock::now() - t0)
                        .count();
   }
+
+  // 3D voxel SDF (pass 38): join + upload a finished background build (a
+  // sub-millisecond fence-scoped copy once per region change; a no-op
+  // atomic load every other frame).
+  ensureSdfField();
 
   // Chunk fade-in alphas (binding 7): age every tracked slot, finalize
   // finished fades, publish the whole (tiny) array via mapped memory.
@@ -996,6 +1009,11 @@ void VulkanRenderer::finishRegionMove() {
   m_regionCenter = m_streamTarget;
   m_streamActive = false;
 
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): the region is complete and
+  // fully published, so the world chunks under the camera-centered box are
+  // installed - launch the background build. The old field keeps rendering
+  // until the new one uploads (ensureSdfField), so there is no gap.
+  launchSdfBuild(m_streamTarget.x, m_streamTarget.z);
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1148,6 +1166,149 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
     if (needsRebuild) {
       launchFarFieldBuild(centerChunkX, centerChunkZ);
     }
+  }
+}
+
+void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
+                                    int32_t centerChunkZ) {
+  if (m_sdfBuildRunning.load() || !m_sdfShadows || !m_world) {
+    return;
+  }
+  m_sdfPendingReady = false;
+  m_sdfBuildRunning = true;
+
+  const auto& cfg = m_voxelConfig;
+  const int32_t chunkX = static_cast<int32_t>(cfg.chunkSizeX);
+  const int32_t chunkZ = static_cast<int32_t>(cfg.chunkSizeZ);
+  const int32_t half =
+      static_cast<int32_t>(vv::vulkan::VoxelResources::kSdfHalfChunks);
+  const int32_t nx = 2 * half * chunkX;
+  const int32_t ny = static_cast<int32_t>(cfg.worldHeight);
+  const int32_t nz = 2 * half * chunkZ;
+  const int32_t boxX = (centerChunkX - half) * chunkX;
+  const int32_t boxZ = (centerChunkZ - half) * chunkZ;
+  // The box covers whole chunks [center-half, center+half-1] on X/Z:
+  // snapshot their voxel types HERE, on the render thread (the only thread
+  // that mutates the world chunk map - install/evict), so the worker's
+  // per-voxel solid test is a plain array read with no map access (and no
+  // race with a concurrent install/evict). Missing chunks read as air.
+  const int32_t firstChunkX = centerChunkX - half;
+  const int32_t firstChunkZ = centerChunkZ - half;
+  const int32_t csx = chunkX;
+  const int32_t csz = chunkZ;
+  const int32_t cy = static_cast<int32_t>(cfg.worldHeight);
+  std::vector<std::vector<std::uint8_t>> chunkSnapshots;
+  chunkSnapshots.resize(2u * half * 2u * half);
+  for (int32_t cz = 0; cz < 2 * half; ++cz) {
+    for (int32_t cx = 0; cx < 2 * half; ++cx) {
+      if (const vv::voxel::Chunk* c = m_world->findChunk(
+              vv::voxel::ChunkCoord{firstChunkX + cx, firstChunkZ + cz})) {
+        chunkSnapshots[static_cast<std::size_t>(cz) * (2u * half) +
+                       static_cast<std::size_t>(cx)] =
+            c->voxelTypes();  // copy (the chunk may be evicted after)
+      }
+    }
+  }
+
+  // The thread reads the SNAPSHOT (its own copy) and writes m_sdfPending,
+  // which the main thread touches only after m_sdfPendingReady flips.
+  m_sdfThread = std::thread(
+      [snapshots = std::move(chunkSnapshots), nx, ny, nz, half, csx, csz, cy,
+       boxX, boxZ, centerChunkX, centerChunkZ, this]() mutable {
+        vv::voxel::SdfField sdf;
+        sdf.build(nx, ny, nz, [&snapshots, half, csx, csz](int x, int y,
+                                                           int z) {
+          // Box voxel -> (local chunk, chunk-local). The box origin chunk
+          // is (firstChunkX, firstChunkZ); the local chunk index is
+          // (x / csx, z / csz), clamped to the box.
+          const int32_t lcX = x / csx;
+          const int32_t lcZ = z / csz;
+          if (lcX < 0 || lcX >= 2 * half || lcZ < 0 || lcZ >= 2 * half) {
+            return false;
+          }
+          const std::vector<std::uint8_t>& types =
+              snapshots[lcZ * (2 * half) + lcX];
+          if (types.empty()) {
+            return false;  // chunk not installed: air (rare; the region is
+                           // complete when this build launches)
+          }
+          // Chunk layout X + Y*sizeX + Z*sizeX*sizeZ (see Chunk).
+          const std::size_t i =
+              static_cast<std::size_t>(x - lcX * csx) +
+              static_cast<std::size_t>(y) * static_cast<std::size_t>(csx) +
+              static_cast<std::size_t>(z - lcZ * csz) *
+                  static_cast<std::size_t>(csx) * static_cast<std::size_t>(csz);
+          return types[i] !=
+                 static_cast<std::uint8_t>(vv::voxel::VoxelType::Air);
+        });
+        // Pack the argmin seed per cell (box layout x + y*nx + z*nx*ny); a
+        // cell with no solid in view (seed -1) gets 0xFFFFFFFF (the shader
+        // skips it). This is the EXACT field the CPU test pins, so the GPU
+        // sphere trace is a byte-for-byte parity of SdfField.
+        const std::vector<int>& raw = sdf.seeds();
+        m_sdfPending.seeds.resize(raw.size());
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+          m_sdfPending.seeds[i] = raw[i] < 0 ? 0xFFFFFFFFu
+                                             : static_cast<std::uint32_t>(raw[i]);
+        }
+        m_sdfPending.boxX = boxX;
+        m_sdfPending.boxY = 0;
+        m_sdfPending.boxZ = boxZ;
+        m_sdfPending.nx = static_cast<std::uint32_t>(nx);
+        m_sdfPending.ny = static_cast<std::uint32_t>(ny);
+        m_sdfPending.nz = static_cast<std::uint32_t>(nz);
+        m_sdfPending.centerChunkX = centerChunkX;
+        m_sdfPending.centerChunkZ = centerChunkZ;
+        m_sdfPendingReady.store(true, std::memory_order_release);
+      });
+}
+
+void VulkanRenderer::ensureSdfField() {
+  if (!m_sdfShadows || !m_world) {
+    return;
+  }
+  // A finished build is waiting: join, upload, publish the box uniform.
+  if (m_sdfBuildRunning.load() && m_sdfPendingReady.load()) {
+    if (m_sdfThread.joinable()) {
+      m_sdfThread.join();
+    }
+    m_sdfBuildRunning = false;
+
+    const auto& cfg = m_voxelConfig;
+    const uint32_t nx = static_cast<uint32_t>(
+        2u * vv::vulkan::VoxelResources::kSdfHalfChunks * cfg.chunkSizeX);
+    const uint32_t ny = static_cast<uint32_t>(cfg.worldHeight);
+    const uint32_t nz = static_cast<uint32_t>(
+        2u * vv::vulkan::VoxelResources::kSdfHalfChunks * cfg.chunkSizeZ);
+    if (m_sdfPending.nx == nx && m_sdfPending.ny == ny &&
+        m_sdfPending.nz == nz &&
+        m_sdfPending.seeds.size() ==
+            static_cast<std::size_t>(nx) * ny * nz) {
+      std::string uploadError;
+      if (!m_voxelResources.uploadSdf(m_device, m_physicalDevice, m_commandPool,
+                                      m_graphicsQueue, m_sdfPending.seeds,
+                                      m_sdfPending.boxX, m_sdfPending.boxY,
+                                      m_sdfPending.boxZ, nx, ny, nz,
+                                      uploadError)) {
+        std::fprintf(stderr, "[vulkan] SDF upload failed: %s\n",
+                     uploadError.c_str());
+      } else {
+        // Publish the box geometry AFTER the copy has landed (the upload
+        // waited its fence), so a frame that sees active=1 always sees the
+        // matching field.
+        m_voxelResources.writeSdfBox(m_sdfPending.boxX, m_sdfPending.boxY,
+                                     m_sdfPending.boxZ, nx, ny, nz, true);
+        std::fprintf(stderr,
+                     "[vulkan] 3D voxel SDF active: %ux%ux%u cells at (%d,0,%d)\n",
+                     nx, ny, nz, m_sdfPending.boxX, m_sdfPending.boxZ);
+      }
+    } else {
+      std::fprintf(stderr,
+                   "[vulkan] SDF build rejected (dims %ux%ux%u vs %ux%ux%u)\n",
+                   m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz, nx, ny,
+                   nz);
+    }
+    m_sdfPendingReady = false;
   }
 }
 
@@ -1793,15 +1954,30 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   blockHeightBinding.descriptorCount = 1;
   blockHeightBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): the argmin-seed storage
+  // buffer (binding 12) + the box geometry uniform (binding 13). Always
+  // bound (the buffers always exist); the shader only reads them when the
+  // box uniform's active flag is set.
+  VkDescriptorSetLayoutBinding sdfBufferBinding{};
+  sdfBufferBinding.binding = 12;
+  sdfBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  sdfBufferBinding.descriptorCount = 1;
+  sdfBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutBinding sdfBoxBinding{};
+  sdfBoxBinding.binding = 13;
+  sdfBoxBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  sdfBoxBinding.descriptorCount = 1;
+  sdfBoxBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
       textureArrayBinding, textureSamplerBinding, texInfoBinding,
-      blockHeightBinding};
+      blockHeightBinding, sdfBufferBinding, sdfBoxBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 12;
+  info.bindingCount = 14;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -2191,12 +2367,13 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 9;  // voxel atlas, output, chunk table,
-                                    // palette, column heights, far LOD,
-                                    // chunk fade, texture info table,
-                                    // block max heights (pass 30)
+  poolSizes[0].descriptorCount = 10;  // voxel atlas, output, chunk table,
+                                     // palette, column heights, far LOD,
+                                     // chunk fade, texture info table,
+                                     // block max heights (pass 30),
+                                     // 3D voxel SDF (pass 38)
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  poolSizes[1].descriptorCount = 1;
+  poolSizes[1].descriptorCount = 2;  // scene + SDF box (pass 38)
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   poolSizes[2].descriptorCount =
       vv::voxel::kMaxVoxelTextures;  // bindless texture array capacity
@@ -2265,7 +2442,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[12] = {};
+  VkWriteDescriptorSet writes[14] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2382,7 +2559,31 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[11].pBufferInfo = &blockHeightInfo;
 
-  vkUpdateDescriptorSets(m_device, 12, writes, 0, nullptr);
+  // 3D voxel SDF (pass 38; bindings 12 + 13). Always bound (the buffers
+  // always exist); the shader reads them only when the box uniform's
+  // active flag is set.
+  VkDescriptorBufferInfo sdfInfo{};
+  sdfInfo.buffer = m_voxelResources.sdfBuffer();
+  sdfInfo.offset = 0;
+  sdfInfo.range = VK_WHOLE_SIZE;
+  writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[12].dstSet = m_descriptorSet;
+  writes[12].dstBinding = 12;
+  writes[12].descriptorCount = 1;
+  writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[12].pBufferInfo = &sdfInfo;
+  VkDescriptorBufferInfo sdfBoxInfo{};
+  sdfBoxInfo.buffer = m_voxelResources.sdfBoxBuffer();
+  sdfBoxInfo.offset = 0;
+  sdfBoxInfo.range = 2u * 16u;  // ivec4 box + uvec4 dims
+  writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[13].dstSet = m_descriptorSet;
+  writes[13].dstBinding = 13;
+  writes[13].descriptorCount = 1;
+  writes[13].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  writes[13].pBufferInfo = &sdfBoxInfo;
+
+  vkUpdateDescriptorSets(m_device, 14, writes, 0, nullptr);
   return true;
 }
 
@@ -2515,7 +2716,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     return false;
   }
 
-  VkBufferMemoryBarrier preComputeBarriers[4] = {};
+  VkBufferMemoryBarrier preComputeBarriers[5] = {};
   preComputeBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
   preComputeBarriers[0].srcAccessMask = 0;
   preComputeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2552,11 +2753,24 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[3].offset = 0;
   preComputeBarriers[3].size = VK_WHOLE_SIZE;
 
+  // SDF box geometry (pass 38; binding 13): mapped-memory writes from the
+  // SDF upload must be visible to the compute stage before the dispatch.
+  // (The SDF storage buffer itself (binding 12) needs no barrier - its
+  // upload is fence-scoped and lands before the frame starts.)
+  preComputeBarriers[4].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[4].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  preComputeBarriers[4].dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+  preComputeBarriers[4].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[4].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[4].buffer = m_voxelResources.sdfBoxBuffer();
+  preComputeBarriers[4].offset = 0;
+  preComputeBarriers[4].size = VK_WHOLE_SIZE;
+
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                            VK_PIPELINE_STAGE_TRANSFER_BIT |
                            VK_PIPELINE_STAGE_HOST_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 4,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 5,
                        preComputeBarriers, 0, nullptr);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);

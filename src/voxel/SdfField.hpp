@@ -104,6 +104,13 @@ public:
     int ny() const { return ny_; }
     int nz() const { return nz_; }
 
+    // The per-cell argmin seed (nearest solid cell index, -1 = no solid in
+    // view) in box layout x + y*nx + z*nx*ny. The GPU stores this (as u32,
+    // 0xFFFFFFFF for the -1 case) and converts each seed to its cell to
+    // compute the exact L2 distance to that solid CUBE - so the CPU and GPU
+    // build the identical field (parity).
+    const std::vector<int>& seeds() const { return seed_; }
+
     // Distance from the cell (x, y, z) to the nearest solid surface, in
     // voxel units (the chamfer field minus the half-voxel). 0 inside solid,
     // ~0.5 face-adjacent, growing with distance. Large outside the field.

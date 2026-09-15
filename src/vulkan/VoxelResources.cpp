@@ -120,13 +120,62 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 		const VkDeviceSize farBytes =
 				static_cast<VkDeviceSize>(farDim) * farDim * 4u * kFarHalves;
 		if (!utils::createBuffer(device, physicalDevice, farBytes,
-															VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-																	VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-															VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-															m_farBuffer, m_farMemory, outError)) {
+								VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+								VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+								VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+								m_farBuffer, m_farMemory, outError)) {
 			cleanup(device);
 			return false;
 		}
+	}
+
+	// 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1; binding 12 + 13): the
+	// argmin-seed storage buffer (one u32 per SDF-box cell) + the box
+	// geometry uniform. Always created (like the far buffer) so the
+	// bindings are valid; the shader only reads them when the box
+	// uniform's active flag is set (VV_SDF_SHADOWS=1 AND a field uploaded).
+	// Box = 2*kSdfHalfChunks chunks on X/Z, full world height on Y.
+	{
+		const std::uint64_t sdfNx =
+				2u * kSdfHalfChunks * static_cast<std::uint64_t>(config.chunkSizeX);
+		const std::uint64_t sdfNy =
+				static_cast<std::uint64_t>(config.worldHeight);
+		const std::uint64_t sdfNz =
+				2u * kSdfHalfChunks * static_cast<std::uint64_t>(config.chunkSizeZ);
+		m_sdfCells = sdfNx * sdfNy * sdfNz;
+		const VkDeviceSize sdfBytes =
+				static_cast<VkDeviceSize>(m_sdfCells) * 4u;
+		if (!utils::createBuffer(device, physicalDevice, sdfBytes,
+								VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+								VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+								VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+								m_sdfBuffer, m_sdfMemory, outError)) {
+			cleanup(device);
+			return false;
+		}
+		// Box-geometry uniform (binding 13): ivec4 box + uvec4 dims (32
+		// bytes). HOST_VISIBLE + COHERENT: written from mapped memory.
+		// Starts INACTIVE (box.w = -1) so the shader uses the 2.5D
+		// fallback until a field is uploaded.
+		const VkDeviceSize sdfBoxBytes = 2u * 16u;
+		if (!utils::createBuffer(device, physicalDevice, sdfBoxBytes,
+								VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+								VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+								VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+								m_sdfBoxBuffer, m_sdfBoxMemory, outError)) {
+			cleanup(device);
+			return false;
+		}
+		VkResult sbr = vkMapMemory(device, m_sdfBoxMemory, 0, VK_WHOLE_SIZE, 0,
+								 &m_mappedSdfBox);
+		if (sbr != VK_SUCCESS || m_mappedSdfBox == nullptr) {
+			outError = "Failed to map the SDF box uniform.";
+			cleanup(device);
+			return false;
+		}
+		std::memset(m_mappedSdfBox, 0, static_cast<std::size_t>(sdfBoxBytes));
+		std::int32_t* boxI = static_cast<std::int32_t*>(m_mappedSdfBox);
+		boxI[3] = -1;  // box.w = inactive
 	}
 
 	// Triple-buffered (kTableHalves, see header): region swaps write the
@@ -1138,6 +1187,144 @@ bool VoxelResources::uploadFarFieldDelta(
 	return true;
 }
 
+bool VoxelResources::ensureSdfUploadResources(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		std::string& outError) {
+	if (m_sdfStaging != VK_NULL_HANDLE) {
+		return true;
+	}
+	const VkDeviceSize bytes =
+			static_cast<VkDeviceSize>(m_sdfCells) * 4u;
+	if (bytes == 0) {
+		outError = "SDF buffer is not sized on this resource set.";
+		return false;
+	}
+	if (!utils::createBuffer(device, physicalDevice, bytes,
+							VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+							VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+							VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+							m_sdfStaging, m_sdfStagingMemory, outError)) {
+		return false;
+	}
+	VkResult r = vkMapMemory(device, m_sdfStagingMemory, 0, VK_WHOLE_SIZE, 0,
+							 &m_sdfStagingMapped);
+	if (r != VK_SUCCESS || m_sdfStagingMapped == nullptr) {
+		outError = "Failed to map SDF staging memory.";
+		return false;
+	}
+	VkCommandBufferAllocateInfo alloc{};
+	alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	alloc.commandPool = commandPool;
+	alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc.commandBufferCount = 1;
+	r = vkAllocateCommandBuffers(device, &alloc, &m_sdfCmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to allocate SDF upload command buffer.";
+		return false;
+	}
+	VkFenceCreateInfo fence{};
+	fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+	r = vkCreateFence(device, &fence, nullptr, &m_sdfFence);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to create SDF upload fence.";
+		return false;
+	}
+	m_sdfCommandPool = commandPool;
+	return true;
+}
+
+bool VoxelResources::uploadSdf(
+		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
+		VkQueue queue, const std::vector<std::uint32_t>& seeds,
+		std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
+		std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
+		std::string& outError) {
+	(void)boxX; (void)boxY; (void)boxZ; (void)nx; (void)ny; (void)nz;
+	if (m_sdfBuffer == VK_NULL_HANDLE) {
+		outError = "SDF buffer is not enabled on this resource set.";
+		return false;
+	}
+	if (seeds.size() != m_sdfCells) {
+		outError = "SDF size does not match the SDF buffer.";
+		return false;
+	}
+	if (!ensureSdfUploadResources(device, physicalDevice, commandPool,
+								 outError)) {
+		return false;
+	}
+	// Wait for the previous SDF copy (one build old - always retired by the
+	// time the next region build completes).
+	if (m_sdfFencePending) {
+		vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
+		vkResetFences(device, 1, &m_sdfFence);
+		m_sdfFencePending = false;
+	}
+	std::memcpy(m_sdfStagingMapped, seeds.data(),
+				seeds.size() * sizeof(std::uint32_t));
+	VkResult r = vkResetCommandBuffer(m_sdfCmd, 0);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to reset SDF upload command buffer.";
+		return false;
+	}
+	VkCommandBufferBeginInfo begin{};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	r = vkBeginCommandBuffer(m_sdfCmd, &begin);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to begin SDF upload command buffer.";
+		return false;
+	}
+	VkBufferCopy region{};
+	region.srcOffset = 0;
+	region.dstOffset = 0;
+	region.size = static_cast<VkDeviceSize>(seeds.size()) * 4u;
+	vkCmdCopyBuffer(m_sdfCmd, m_sdfStaging, m_sdfBuffer, 1, &region);
+	r = vkEndCommandBuffer(m_sdfCmd);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to end SDF upload command buffer.";
+		return false;
+	}
+	VkSubmitInfo submit{};
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &m_sdfCmd;
+	r = vkQueueSubmit(queue, 1, &submit, m_sdfFence);
+	if (r != VK_SUCCESS) {
+		outError = "Failed to submit SDF upload.";
+		return false;
+	}
+	// Wait for THIS copy so the caller can publish the box uniform
+	// immediately (a frame reading the field must not race the copy).
+	vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
+	vkResetFences(device, 1, &m_sdfFence);
+	return true;
+}
+
+void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
+		std::int32_t boxZ, std::uint32_t nx, std::uint32_t ny,
+		std::uint32_t nz, bool active) {
+	if (m_mappedSdfBox == nullptr) {
+		return;
+	}
+	std::uint32_t* w = static_cast<std::uint32_t*>(m_mappedSdfBox);
+	w[0] = static_cast<std::uint32_t>(boxX);
+	w[1] = static_cast<std::uint32_t>(boxY);
+	w[2] = static_cast<std::uint32_t>(boxZ);
+	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
+	w[4] = active ? nx : 0u;
+	w[5] = active ? ny : 0u;
+	w[6] = active ? nz : 0u;
+	w[7] = active ? 1u : 0u;
+}
+
+void VoxelResources::clearSdfBox() {
+	if (m_mappedSdfBox == nullptr) {
+		return;
+	}
+	writeSdfBox(0, 0, 0, 0, 0, 0, false);
+}
+
 bool VoxelResources::writeChunkTable(
 		const std::vector<std::uint32_t>& slotPerCell, std::uint32_t half) {
 	if (slotPerCell.size() != m_tableElements || m_mappedTable == nullptr ||
@@ -1280,6 +1467,47 @@ void VoxelResources::cleanup(VkDevice device) {
 	if (m_farMemory != VK_NULL_HANDLE) {
 		vkFreeMemory(device, m_farMemory, nullptr);
 		m_farMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfStaging != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfStaging, nullptr);
+		m_sdfStaging = VK_NULL_HANDLE;
+	}
+	if (m_sdfStagingMemory != VK_NULL_HANDLE) {
+		if (m_sdfStagingMapped != nullptr) {
+			vkUnmapMemory(device, m_sdfStagingMemory);
+			m_sdfStagingMapped = nullptr;
+		}
+		vkFreeMemory(device, m_sdfStagingMemory, nullptr);
+		m_sdfStagingMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfCmd != VK_NULL_HANDLE && m_sdfCommandPool != VK_NULL_HANDLE) {
+		vkFreeCommandBuffers(device, m_sdfCommandPool, 1, &m_sdfCmd);
+		m_sdfCmd = VK_NULL_HANDLE;
+	}
+	m_sdfCommandPool = VK_NULL_HANDLE;
+	if (m_sdfFence != VK_NULL_HANDLE) {
+		vkDestroyFence(device, m_sdfFence, nullptr);
+		m_sdfFence = VK_NULL_HANDLE;
+	}
+	if (m_sdfBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfBuffer, nullptr);
+		m_sdfBuffer = VK_NULL_HANDLE;
+	}
+	if (m_sdfMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(device, m_sdfMemory, nullptr);
+		m_sdfMemory = VK_NULL_HANDLE;
+	}
+	if (m_sdfBoxBuffer != VK_NULL_HANDLE) {
+		vkDestroyBuffer(device, m_sdfBoxBuffer, nullptr);
+		m_sdfBoxBuffer = VK_NULL_HANDLE;
+	}
+	if (m_sdfBoxMemory != VK_NULL_HANDLE) {
+		if (m_mappedSdfBox != nullptr) {
+			vkUnmapMemory(device, m_sdfBoxMemory);
+			m_mappedSdfBox = nullptr;
+		}
+		vkFreeMemory(device, m_sdfBoxMemory, nullptr);
+		m_sdfBoxMemory = VK_NULL_HANDLE;
 	}
 	if (m_paletteBuffer != VK_NULL_HANDLE) {
 		vkDestroyBuffer(device, m_paletteBuffer, nullptr);

@@ -118,6 +118,28 @@ layout(set = 0, binding = 11) readonly buffer BlockHeights {
     uint data[];
 } blockHeights;
 
+// 3D voxel SDF (pass 38, the VV_SDF_SHADOWS=1 rewrite): the NEAREST SOLID
+// CELL (argmin seed) for every cell of a camera-centered box, from a
+// two-pass chamfer distance transform built on the CPU
+// (vv::voxel::SdfField) and uploaded as one u32 per cell,
+// x + y*sdfDim.x + z*sdfDim.x*sdfDim.y layout (0xFFFFFFFF = no solid in the
+// box's view). The shader converts the seed to its cell and takes the L2
+// distance to that solid CUBE (exactly 0 inside the solid, >0 in air) - the
+// proper 3D SDF, so the sphere trace below softens the shadow edges running
+// along vertical/steep casters (the 2.5D top-plane model has no data for a
+// side face). Rebuilt on a background thread per region change; the box
+// geometry is published via the SdfBox uniform (binding 13) because the
+// async build can lag the camera by a chunk.
+layout(set = 0, binding = 12) readonly buffer SdfField {
+    uint seed[];
+} sdfField;
+
+layout(std140, set = 0, binding = 13) uniform SdfBox {
+    ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
+    uvec4 dims;   // xyz = box size in cells (== sdfDim), w = 0 when no SDF
+} sdfBox;
+
+
 // The far field is double-buffered; farParams.y selects the half (see
 // the table comment above - same swap-without-waits scheme).
 uint farBase()
@@ -579,15 +601,106 @@ float shadowPenumbra(float h, float t)
     return clamp(kShadowSharpness * h / max(t, 1e-4), 0.0, 1.0);
 }
 
-// SDF soft shadow ray (VV_SDF_SHADOWS=1). The TRAVERSAL is the exact
-// march's ascending column DDA + height-bound cell walk + coarse far cells -
-// the same occlusion events as sunRayEscapes, so nothing the binary march
-// shadows can leak, and the 256-column budget matches it (the old
-// sphere-traced variant stepped by the "SDF" value, crawled at ~0.04
-// voxels/step near surfaces, and burned its 128-step budget within ~50
-// voxels). Softness comes from shadowPenumbra, sampled at every column the
-// ray clears, from the distance to that column's top plane. Returns
-// fractional visibility (1.0 = fully lit, 0.0 = fully shadowed).
+// ---- 3D voxel SDF soft shadow (pass 38, the experimental rewrite) -------
+// The proper 3D voxel SDF: a two-pass chamfer distance transform (built on
+// the CPU, vv::voxel::SdfField, uploaded per region change) gives the
+// NEAREST SOLID CELL (argmin seed) for every cell of a camera-centered box.
+// The SDF at a point is the exact L2 distance to the nearest solid CUBE -
+// 0 inside the solid, >0 in air. Unlike the 2.5D top-plane model below, a
+// side face (a vertical cliff) HAS data, so the sphere trace softens the
+// shadow edges running along vertical/steep casters. sdfBox.box.xyz is the
+// box origin in world voxels (w < 0 = no field yet); sdfBox.dims is the box
+// size in cells (w == 0 when no field). sdfField.seed is one u32 per cell
+// (x + y*nx + z*nx*ny), 0xFFFFFFFF = no solid in the box's view.
+float sdfCubeDistance(vec3 p, vec3 v)
+{
+    // L2 distance from p to the solid cube [v, v+1)^3 (box-local voxels).
+    vec3 d = max(max(v - p, p - (v + 1.0)), 0.0);
+    return length(d);
+}
+
+// Distance to the nearest solid cube at a WORLD-VOXEL point: min over the
+// 3x3x3 seed cells around the point (mirrors SdfField::sample exactly).
+// Large outside the box = open space, nothing left to block the sun.
+float sampleSdf3d(vec3 p)
+{
+    if (sdfBox.box.w < 0)
+        return 1e30;
+    vec3 local = p - vec3(sdfBox.box.xyz);
+    ivec3 c = ivec3(floor(local));
+    if (c.x < 0 || c.x >= int(sdfBox.dims.x) ||
+        c.y < 0 || c.y >= int(sdfBox.dims.y) ||
+        c.z < 0 || c.z >= int(sdfBox.dims.z))
+        return 1e30;
+    uint nx = sdfBox.dims.x;
+    uint ny = sdfBox.dims.y;
+    uint nz = sdfBox.dims.z;
+    float best = 1e30;
+    for (int dz = -1; dz <= 1; ++dz) {
+        int zc = c.z + dz;
+        if (zc < 0 || zc >= int(nz)) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            int yc = c.y + dy;
+            if (yc < 0 || yc >= int(ny)) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int xc = c.x + dx;
+                if (xc < 0 || xc >= int(nx)) continue;
+                uint s = sdfField.seed[uint(xc) + uint(yc) * nx +
+                                       uint(zc) * nx * ny];
+                if (s == 0xFFFFFFFFu) continue;
+                vec3 v = vec3(float(s % nx),
+                              float((s / nx) % ny),
+                              float(s / (nx * ny)));
+                best = min(best, sdfCubeDistance(local, v));
+            }
+        }
+    }
+    return best;
+}
+
+// Sphere-traced soft shadow through the 3D SDF (iquilezles rmshadows with a
+// proper SDF; mirrors SdfField::sphereTracedShadow). March the sun ray,
+// step conservatively by the SDF (0.7x so the chamfer over-estimate can
+// never skip a surface), fold k*h/t into the running min. h is the true 3D
+// distance to the solid surface, so every shadow edge shares one continuous
+// penumbra. Leaving the box = open space (the box covers the near surface;
+// casters that reach the sun are within it). Returns fractional visibility.
+float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
+{
+    if (sdfBox.box.w < 0)
+        return 1.0;  // no field yet: fully lit
+    float visibility = 1.0;
+    float t = 0.0;
+    for (int i = 0; i < 160; ++i) {
+        vec3 p = origin + sunV * t;
+        if (p.x < float(sdfBox.box.x) ||
+            p.x >= float(sdfBox.box.x + sdfBox.dims.x) ||
+            p.y < float(sdfBox.box.y) ||
+            p.y >= float(sdfBox.box.y + sdfBox.dims.y) ||
+            p.z < float(sdfBox.box.z) ||
+            p.z >= float(sdfBox.box.z + sdfBox.dims.z))
+            break;  // left the field: open space
+        float h = sampleSdf3d(p);
+        if (h < 1e-3)
+            return 0.0;  // hit the surface: fully shadowed from here
+        visibility = min(visibility, shadowPenumbra(h, t));
+        t += max(h * 0.7, 0.05);
+    }
+    return visibility;
+}
+
+// SDF soft shadow ray (VV_SDF_SHADOWS=1), the 2.5D top-plane penumbra
+// (pass 34) - kept as the fallback when no 3D SDF field is uploaded yet
+// (the first region before the background build lands, and every frame the
+// field is still building). The TRAVERSAL is the exact march's ascending
+// column DDA + height-bound cell walk + coarse far cells - the same
+// occlusion events as sunRayEscapes, so nothing the binary march shadows
+// can leak, and the 256-column budget matches it (the old sphere-traced
+// variant stepped by the "SDF" value, crawled at ~0.04 voxels/step near
+// surfaces, and burned its 128-step budget within ~50 voxels). Softness
+// comes from shadowPenumbra, sampled at every column the ray clears, from
+// the distance to that column's top plane. Returns fractional visibility
+// (1.0 = fully lit, 0.0 = fully shadowed).
 float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 {
     if (sunV.y <= 0.05) {
@@ -736,6 +849,12 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     // self-shadow acne; the hit face's outward cell is air by construction.
     const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
     if (scene.misc.w > 0.5) {
+        // Pass 38: the proper 3D voxel SDF sphere trace when a field is
+        // uploaded (sdfBox.box.w >= 0). The 2.5D top-plane penumbra is the
+        // fallback until the background build lands (and if it ever stalls).
+        if (sdfBox.box.w >= 0) {
+            return sunRayEscapesSdf3d(origin, sunV);
+        }
         return sunRayEscapesSdf(origin, sunV);
     }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;

@@ -61,6 +61,16 @@ class VulkanRenderer final {
   void ensureFarField(int32_t centerChunkX, int32_t centerChunkZ);
   void launchFarFieldBuild(int32_t centerChunkX, int32_t centerChunkZ);
 
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): a background build of the
+  // nearest-solid-cell field over a camera-centered box (built on the CPU
+  // with vv::voxel::SdfField, the same reference the CPU test pins).
+  // launchSdfBuild is called when a region move completes (the world
+  // chunks under the box are then installed); ensureSdfField (called from
+  // updateWorld) joins a finished build and uploads it, publishing the box
+  // uniform the shader reads.
+  void ensureSdfField();
+  void launchSdfBuild(int32_t centerChunkX, int32_t centerChunkZ);
+
   // Incremental region streaming. Generation runs on a WORKER thread
   // (pass 13): the render thread only installs finished chunks and uploads
   // them (sub-millisecond) - generation (~2.8 ms/chunk, up to 4/frame at
@@ -311,6 +321,26 @@ class VulkanRenderer final {
   std::vector<float> m_slotFadeScratch;
   bool m_farEverActivated = false;
   std::chrono::steady_clock::time_point m_farFadeStart{};
+
+  // --- 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1; background build) ---
+  // The builder thread only touches m_sdfPending (sole ownership until
+  // m_sdfPendingReady flips to true) and reads the world chunks under the
+  // box (installed by the time the build launches); the main thread joins
+  // it in cleanup() before the world is destroyed, and uploads the field
+  // in ensureSdfField.
+  std::thread m_sdfThread;
+  std::atomic<bool> m_sdfBuildRunning{false};
+  std::atomic<bool> m_sdfPendingReady{false};
+  struct SdfBuild {
+    std::vector<std::uint32_t> seeds;  // argmin seed per cell (box layout)
+    std::int32_t boxX = 0;  // box origin in world voxels
+    std::int32_t boxY = 0;
+    std::int32_t boxZ = 0;
+    std::uint32_t nx = 0, ny = 0, nz = 0;  // box size in cells
+    std::int32_t centerChunkX = 0;  // the build's center (stale check)
+    std::int32_t centerChunkZ = 0;
+  };
+  SdfBuild m_sdfPending;
 
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;

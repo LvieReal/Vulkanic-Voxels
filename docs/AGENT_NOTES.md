@@ -465,3 +465,58 @@ NEXT (pass 38): GPU port - build the same 3D SDF on the GPU (3D texture,
 or in-register) and run the same sphere trace in the SDF branch of
 sunShadow; the CPU binary is the parity source. Keep soft <= 0.5 wherever
 the exact march is dark; do NOT add a lighter lit-side penumbra term.
+
+## Pass 38: GPU port of the 3D voxel SDF soft shadow
+
+STATUS: implemented and committed (owner verifies on-device). The same 3D
+voxel SDF as pass 37 now builds on the CPU (a BACKGROUND thread, the same
+reference the CPU test pins) and uploads to the GPU, and the SAME sphere
+trace runs in the SDF branch of sunShadow (VV_SDF_SHADOWS=1).
+
+DESIGN (mirrors the far-LOD field's background build + fence-scoped upload):
+- SDF BOX: a camera-centered box, 2*kSdfHalfChunks (6) chunks on X/Z x the
+  full world height (128) = 192x128x192 = 4.7M cells. kSdfHalfChunks is a
+  constant in VoxelResources.hpp (bump it to grow the box). The box covers
+  the near surface where the side edges are visible; leaving the box = open
+  space (casters that reach the sun are within it).
+- BUILD (background thread, launchSdfBuild in VulkanRenderer.cpp): called
+  from finishRegionMove (the region is complete, so the world chunks under
+  the box are installed). It SNAPSHOTS the 36 chunks' voxel types on the
+  render thread (the only thread that mutates the world chunk map - the
+  worker would race it), then a background thread runs vv::voxel::SdfField
+  (the pass-37 CPU reference, chamfer EDT + argmin seed) over the snapshot.
+  The nearest-solid-cell seed per cell (0xFFFFFFFF = no solid in view) is
+  the uploaded field - the EXACT field the CPU test pins, so the GPU sphere
+  trace is a byte-for-byte parity of SdfField.
+- UPLOAD (ensureSdfField, called from updateWorld every frame): joins a
+  finished build, uploads the seeds (fence-scoped copy, ~19 MB) and PUBLISHES
+  the box geometry (origin in world voxels + dims) via a small host-visible
+  uniform (binding 13) AFTER the copy lands - so a frame that sees active=1
+  always sees the matching field. The box uniform is written on the render
+  thread, so it gets a host-write -> shader-read barrier (like the fade
+  buffer); the SDF storage buffer (binding 12) needs none (its upload is
+  fence-scoped).
+- SHADER (pixels_rgba.comp): binding 12 = the seed storage buffer, binding
+  13 = the SdfBox uniform (box.xyz origin in world voxels + w active flag,
+  dims.xyz cells). sampleSdf3d(p) mirrors SdfField::sample exactly (min over
+  the 3x3x3 seed cells of the L2 distance to each seed's solid CUBE - 0
+  inside the solid); sunRayEscapesSdf3d mirrors SdfField::sphereTracedShadow
+  exactly (160 steps, step max(0.7h, 0.05), fold k*h/t, h < 1e-3 -> hit,
+  leaving the box -> open space). sunShadow dispatches to sunRayEscapesSdf3d
+  when sdfBox.box.w >= 0, else the pass-34 2.5D top-plane penumbra
+  (sunRayEscapesSdf) - the fallback until the first build lands.
+
+COST: the build is ~70-350 ms on the BACKGROUND thread (amortized over the
+region lifetime; competes with the generation workers). The upload is a
+~10-30 ms hitch ONCE per region change (the 19 MB copy; the region change
+is already a hitch). The per-frame cost is one atomic load (the no-op
+ensureSdfField check) + the sphere trace in the SDF branch (27 seed reads +
+27 cube distances per sample, 160 steps - the same budget the 2.5D path
+already pays per column).
+
+ACCEPTANCE (on-device, VV_SDF_SHADOWS=1): the shadow edges running along
+vertical/steep casters (the pass-34 hard side edges) are now SOFT and
+continuous, matching the top-edge penumbra; the overhang underside stays at
+most half-lit; NO light leak (dark-side stays dark); the binary
+sunRayEscapes (VV_SDF_SHADOWS=0) is UNTOUCHED (bit-identical); the 2.5D
+fallback (before the first build lands) is unchanged.

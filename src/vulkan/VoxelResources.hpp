@@ -111,6 +111,40 @@ class VoxelResources final {
 													const std::vector<std::uint32_t>& cells,
 													std::uint32_t half, std::string& outError);
 
+	// 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): one device-local storage
+	// buffer holding the nearest-solid-cell (argmin seed) for every cell of
+	// a camera-centered box (one u32 per cell, x + y*nx + z*nx*ny,
+	// 0xFFFFFFFF = no solid in the box's view), built on the CPU by
+	// vv::voxel::SdfField on a background thread and uploaded here. The
+	// box geometry (origin in world voxels + dims in cells) is published
+	// via a small host-visible uniform (binding 13) with writeSdfBox -
+	// the async build can lag the camera, so the shader must NOT derive
+	// the box from the current region. The SDF buffer is SDF-HALVES
+	// buffered like the far field: the writer targets the inactive half,
+	// the renderer flips a uniform half index (in the box uniform's w,
+	// repurposed to -1/0/1 when no field is active).
+	// The SDF box is 2*kSdfHalfChunks chunks wide on each axis (6x6) and
+	// the full world height tall; its cell dims are
+	// (2*kSdfHalfChunks*chunkSizeX, worldHeight, 2*kSdfHalfChunks*chunkSizeZ).
+	static constexpr std::uint32_t kSdfHalfChunks = 3;  // box = 2*kSdfHalfChunks chunks
+	// Uploads a complete SDF (the argmin seed per cell) into the buffer.
+	// Staging + fence (no device/queue waits); waits for its own copy to
+	// land before returning, so the caller can publish the box uniform
+	// immediately. `boxX/boxY/boxZ` are the box origin in world voxels,
+	// `nx/ny/nz` the box size in cells (== kSdfCells).
+	bool uploadSdf(VkDevice device, VkPhysicalDevice physicalDevice,
+			VkCommandPool commandPool, VkQueue queue,
+			const std::vector<std::uint32_t>& seeds,
+			std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
+			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
+			std::string& outError);
+	// Publishes the SDF box geometry (binding 13): box.xyz = origin in
+	// world voxels, box.w = 1 when active / -1 when no field; dims.xyz =
+	// box size in cells, dims.w = 0 when no field. Plain mapped write.
+	void writeSdfBox(std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
+			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool active);
+	void clearSdfBox();
+
 	// Async partial upload into the given half: cellRuns are (cellOffset,
 	// count) ranges whose values are concatenated in `values` (in run
 	// order). Fence-scoped (the next far upload waits it); returns without
@@ -160,6 +194,10 @@ class VoxelResources final {
 	VkSampler voxelSampler() const { return m_voxelSampler; }
 	VkBuffer farBuffer() const { return m_farBuffer; }
 	VkBuffer paletteBuffer() const { return m_paletteBuffer; }
+	// 3D voxel SDF (pass 38): the argmin-seed storage buffer (binding 12)
+	// and the box-geometry uniform (binding 13).
+	VkBuffer sdfBuffer() const { return m_sdfBuffer; }
+	VkBuffer sdfBoxBuffer() const { return m_sdfBoxBuffer; }
 
 	std::uint32_t slotCount() const { return m_slotCount; }
 	std::uint64_t slotByteStride() const { return m_slotByteStride; }
@@ -204,6 +242,29 @@ class VoxelResources final {
 	VkDeviceMemory m_farMemory = VK_NULL_HANDLE;
 	std::uint64_t m_farCellsPerHalf = 0;  // far dim * far dim
 
+	// --- 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1) ---
+	// The argmin-seed storage buffer (binding 12): one u32 per SDF-box
+	// cell, 0xFFFFFFFF = no solid in the box's view. Single buffer (the
+	// upload fence scopes its write; the box uniform's active flag gates
+	// reads, so no half-ping-pong is needed).
+	VkBuffer m_sdfBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_sdfMemory = VK_NULL_HANDLE;
+	std::uint64_t m_sdfCells = 0;  // nx * ny * nz
+	// The box-geometry uniform (binding 13): ivec4 box (xyz origin in
+	// world voxels, w = 1 active / -1 inactive) + uvec4 dims (xyz cells,
+	// w = 0 inactive). Host-visible, written from mapped memory.
+	VkBuffer m_sdfBoxBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_sdfBoxMemory = VK_NULL_HANDLE;
+	void* m_mappedSdfBox = nullptr;
+	// SDF upload path (staging + cmd + fence), like the far/stream paths.
+	VkBuffer m_sdfStaging = VK_NULL_HANDLE;
+	VkDeviceMemory m_sdfStagingMemory = VK_NULL_HANDLE;
+	void* m_sdfStagingMapped = nullptr;
+	VkCommandPool m_sdfCommandPool = VK_NULL_HANDLE;
+	VkCommandBuffer m_sdfCmd = VK_NULL_HANDLE;
+	VkFence m_sdfFence = VK_NULL_HANDLE;
+	bool m_sdfFencePending = false;
+
 	// --- Far upload path (double-buffered: staging + cmd + fence x2) ---
 	// Each upload uses the slot NOT used by the previous one, so the wait
 	// before writing targets a submit TWO uploads old - always retired.
@@ -220,10 +281,14 @@ class VoxelResources final {
 	std::uint32_t m_farParity = 0;
 
 	bool ensureFarUploadResources(VkDevice device,
-																VkPhysicalDevice physicalDevice,
-																VkCommandPool commandPool,
-																std::string& outError);
+								VkPhysicalDevice physicalDevice,
+								VkCommandPool commandPool,
+								std::string& outError);
 	void waitPreviousFarUpload(VkDevice device);
+	bool ensureSdfUploadResources(VkDevice device,
+								VkPhysicalDevice physicalDevice,
+								VkCommandPool commandPool,
+								std::string& outError);
 
 	VkBuffer m_paletteBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_paletteMemory = VK_NULL_HANDLE;
