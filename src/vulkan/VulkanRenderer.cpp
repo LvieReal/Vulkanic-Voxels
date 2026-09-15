@@ -17,6 +17,7 @@
 #include "render/VoxelTextureFiles.hpp"
 #include "vulkan/StreamPriority.hpp"
 #include "vulkan/VulkanUtils.hpp"
+#include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
 #include "voxel/VoxelTypes.hpp"
 
@@ -1174,37 +1175,41 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
   if (m_sdfBuildRunning.load() || !m_sdfShadows || !m_world) {
     return;
   }
+
+  const auto& cfg = m_voxelConfig;
+  // Box geometry + the voxel -> chunk mapping live in voxel/SdfBox.hpp so the
+  // CPU test can pin them against the real Chunk layout (pass 39: the box was
+  // indexed with the wrong Z stride, which garbled the whole field).
+  const vv::voxel::SdfBoxGeometry box = vv::voxel::SdfBoxGeometry::centeredOn(
+      centerChunkX, centerChunkZ, vv::vulkan::VoxelResources::kSdfHalfChunks,
+      cfg.chunkSizeX, cfg.chunkSizeZ, cfg.worldHeight);
+  if (!box.valid()) {
+    std::fprintf(stderr,
+                 "[vulkan] SDF build skipped: bad box geometry (%ux%ux%u, "
+                 "chunks %u at %ux%u)\n",
+                 box.nx, box.ny, box.nz, box.chunksPerSide, box.chunkSizeX,
+                 box.chunkSizeZ);
+    return;
+  }
   m_sdfPendingReady = false;
   m_sdfBuildRunning = true;
 
-  const auto& cfg = m_voxelConfig;
-  const int32_t chunkX = static_cast<int32_t>(cfg.chunkSizeX);
-  const int32_t chunkZ = static_cast<int32_t>(cfg.chunkSizeZ);
-  const int32_t half =
-      static_cast<int32_t>(vv::vulkan::VoxelResources::kSdfHalfChunks);
-  const int32_t nx = 2 * half * chunkX;
-  const int32_t ny = static_cast<int32_t>(cfg.worldHeight);
-  const int32_t nz = 2 * half * chunkZ;
-  const int32_t boxX = (centerChunkX - half) * chunkX;
-  const int32_t boxZ = (centerChunkZ - half) * chunkZ;
+  const std::uint32_t side = box.chunksPerSide;
+  const int32_t firstChunkX = centerChunkX - static_cast<int32_t>(side / 2u);
+  const int32_t firstChunkZ = centerChunkZ - static_cast<int32_t>(side / 2u);
   // The box covers whole chunks [center-half, center+half-1] on X/Z:
   // snapshot their voxel types HERE, on the render thread (the only thread
   // that mutates the world chunk map - install/evict), so the worker's
   // per-voxel solid test is a plain array read with no map access (and no
   // race with a concurrent install/evict). Missing chunks read as air.
-  const int32_t firstChunkX = centerChunkX - half;
-  const int32_t firstChunkZ = centerChunkZ - half;
-  const int32_t csx = chunkX;
-  const int32_t csz = chunkZ;
-  const int32_t cy = static_cast<int32_t>(cfg.worldHeight);
   std::vector<std::vector<std::uint8_t>> chunkSnapshots;
-  chunkSnapshots.resize(2u * half * 2u * half);
-  for (int32_t cz = 0; cz < 2 * half; ++cz) {
-    for (int32_t cx = 0; cx < 2 * half; ++cx) {
+  chunkSnapshots.resize(static_cast<std::size_t>(side) * side);
+  for (std::uint32_t cz = 0; cz < side; ++cz) {
+    for (std::uint32_t cx = 0; cx < side; ++cx) {
       if (const vv::voxel::Chunk* c = m_world->findChunk(
-              vv::voxel::ChunkCoord{firstChunkX + cx, firstChunkZ + cz})) {
-        chunkSnapshots[static_cast<std::size_t>(cz) * (2u * half) +
-                       static_cast<std::size_t>(cx)] =
+              vv::voxel::ChunkCoord{firstChunkX + static_cast<int32_t>(cx),
+                                    firstChunkZ + static_cast<int32_t>(cz)})) {
+        chunkSnapshots[static_cast<std::size_t>(cz) * side + cx] =
             c->voxelTypes();  // copy (the chunk may be evicted after)
       }
     }
@@ -1213,34 +1218,10 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
   // The thread reads the SNAPSHOT (its own copy) and writes m_sdfPending,
   // which the main thread touches only after m_sdfPendingReady flips.
   m_sdfThread = std::thread(
-      [snapshots = std::move(chunkSnapshots), nx, ny, nz, half, csx, csz, cy,
-       boxX, boxZ, centerChunkX, centerChunkZ, this]() mutable {
+      [snapshots = std::move(chunkSnapshots), box, centerChunkX, centerChunkZ,
+       this]() mutable {
         vv::voxel::SdfField sdf;
-        sdf.build(nx, ny, nz, [&snapshots, half, csx, csz](int x, int y,
-                                                           int z) {
-          // Box voxel -> (local chunk, chunk-local). The box origin chunk
-          // is (firstChunkX, firstChunkZ); the local chunk index is
-          // (x / csx, z / csz), clamped to the box.
-          const int32_t lcX = x / csx;
-          const int32_t lcZ = z / csz;
-          if (lcX < 0 || lcX >= 2 * half || lcZ < 0 || lcZ >= 2 * half) {
-            return false;
-          }
-          const std::vector<std::uint8_t>& types =
-              snapshots[lcZ * (2 * half) + lcX];
-          if (types.empty()) {
-            return false;  // chunk not installed: air (rare; the region is
-                           // complete when this build launches)
-          }
-          // Chunk layout X + Y*sizeX + Z*sizeX*sizeZ (see Chunk).
-          const std::size_t i =
-              static_cast<std::size_t>(x - lcX * csx) +
-              static_cast<std::size_t>(y) * static_cast<std::size_t>(csx) +
-              static_cast<std::size_t>(z - lcZ * csz) *
-                  static_cast<std::size_t>(csx) * static_cast<std::size_t>(csz);
-          return types[i] !=
-                 static_cast<std::uint8_t>(vv::voxel::VoxelType::Air);
-        });
+        vv::voxel::buildSdfBoxField(box, snapshots, sdf);
         // Pack the argmin seed per cell (box layout x + y*nx + z*nx*ny); a
         // cell with no solid in view (seed -1) gets 0xFFFFFFFF (the shader
         // skips it). This is the EXACT field the CPU test pins, so the GPU
@@ -1251,12 +1232,12 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
           m_sdfPending.seeds[i] = raw[i] < 0 ? 0xFFFFFFFFu
                                              : static_cast<std::uint32_t>(raw[i]);
         }
-        m_sdfPending.boxX = boxX;
-        m_sdfPending.boxY = 0;
-        m_sdfPending.boxZ = boxZ;
-        m_sdfPending.nx = static_cast<std::uint32_t>(nx);
-        m_sdfPending.ny = static_cast<std::uint32_t>(ny);
-        m_sdfPending.nz = static_cast<std::uint32_t>(nz);
+        m_sdfPending.boxX = box.originX;
+        m_sdfPending.boxY = box.originY;
+        m_sdfPending.boxZ = box.originZ;
+        m_sdfPending.nx = box.nx;
+        m_sdfPending.ny = box.ny;
+        m_sdfPending.nz = box.nz;
         m_sdfPending.centerChunkX = centerChunkX;
         m_sdfPending.centerChunkZ = centerChunkZ;
         m_sdfPendingReady.store(true, std::memory_order_release);
@@ -1274,12 +1255,16 @@ void VulkanRenderer::ensureSdfField() {
     }
     m_sdfBuildRunning = false;
 
+    // Same geometry the build used - a build from another config (or a
+    // half-installed world) can never publish a mismatched field.
     const auto& cfg = m_voxelConfig;
-    const uint32_t nx = static_cast<uint32_t>(
-        2u * vv::vulkan::VoxelResources::kSdfHalfChunks * cfg.chunkSizeX);
-    const uint32_t ny = static_cast<uint32_t>(cfg.worldHeight);
-    const uint32_t nz = static_cast<uint32_t>(
-        2u * vv::vulkan::VoxelResources::kSdfHalfChunks * cfg.chunkSizeZ);
+    const vv::voxel::SdfBoxGeometry box = vv::voxel::SdfBoxGeometry::centeredOn(
+        m_sdfPending.centerChunkX, m_sdfPending.centerChunkZ,
+        vv::vulkan::VoxelResources::kSdfHalfChunks, cfg.chunkSizeX,
+        cfg.chunkSizeZ, cfg.worldHeight);
+    const uint32_t nx = box.nx;
+    const uint32_t ny = box.ny;
+    const uint32_t nz = box.nz;
     if (m_sdfPending.nx == nx && m_sdfPending.ny == ny &&
         m_sdfPending.nz == nz &&
         m_sdfPending.seeds.size() ==
@@ -1299,8 +1284,11 @@ void VulkanRenderer::ensureSdfField() {
         m_voxelResources.writeSdfBox(m_sdfPending.boxX, m_sdfPending.boxY,
                                      m_sdfPending.boxZ, nx, ny, nz, true);
         std::fprintf(stderr,
-                     "[vulkan] 3D voxel SDF active: %ux%ux%u cells at (%d,0,%d)\n",
-                     nx, ny, nz, m_sdfPending.boxX, m_sdfPending.boxZ);
+                     "[vulkan] 3D voxel SDF active: %ux%ux%u cells at "
+                     "(%d,%d,%d) (%u x %u chunks of %ux%ux%u)\n",
+                     nx, ny, nz, m_sdfPending.boxX, m_sdfPending.boxY,
+                     m_sdfPending.boxZ, box.chunksPerSide, box.chunksPerSide,
+                     box.chunkSizeX, box.worldHeight, box.chunkSizeZ);
       }
     } else {
       std::fprintf(stderr,

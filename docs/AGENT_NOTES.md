@@ -76,8 +76,13 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   kShadowSharpness in the shader tunes the sun's angular size / softness.
   Pass 37 adds a real 3D voxel SDF (src/voxel/SdfField.hpp) validated on the
   CPU (testSdfSoftShadow3d) so the penumbra is soft on the vertical/side
-  edges too; the GPU port (3D SDF texture + the same sphere trace) is
-  pass 38).
+  edges too; pass 38 ports it to the GPU (argmin-seed storage buffer +
+  sphere trace), pass 39 fixes the box build (wrong chunk Z stride -> the
+  whole region around the camera was fully shadowed).
+  Current state = pass 39: the 3D voxel SDF sphere trace (CPU reference in
+  src/voxel/SdfField.hpp, box build + chunk-layout walk in
+  src/voxel/SdfBox.hpp, GPU mirror in pixels_rgba.comp), 2.5D k*h/t as the
+  fallback until the first box lands.
   Exact binary shadows remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
   future foliage can attenuate and be marched through instead of
@@ -520,3 +525,76 @@ continuous, matching the top-edge penumbra; the overhang underside stays at
 most half-lit; NO light leak (dark-side stays dark); the binary
 sunRayEscapes (VV_SDF_SHADOWS=0) is UNTOUCHED (bit-identical); the 2.5D
 fallback (before the first build lands) is unchanged.
+
+## Pass 39: FIX - the SDF box was built from scrambled voxels
+
+OWNER REPORT (VV_SDF_SHADOWS=1): "the region around camera is currently fully
+shadowed. leftmost edge shows some kind of shadow though, which looks correct
+but has bands."
+
+ROOT CAUSE: the box build's chunk-layout walk used the WRONG Z STRIDE. The
+renderer indexed each box voxel into its chunk snapshot as
+
+    x + y*chunkSizeX + z*chunkSizeX*chunkSizeZ      (pass 38, WRONG)
+
+while the chunk layout (Chunk::index, the terrain generator's fill, and the
+shader's fetchVoxel) is
+
+    x + y*sizeX + z*sizeX*worldHeight               (the sync contract)
+
+With the default config (chunkSizeX/Z = 32, worldHeight = 128) that is a
+1024-word stride where the chunks lay out 4096: the SDF was built from a
+SCRAMBLED projection of the terrain, not the terrain. Only the box's z slices
+with local z == 0 (a 32-voxel-periodic set of 1-voxel-thick slices) happened to
+be indexed correctly - which is exactly why a few shadow shapes "looked
+correct" while everything around them banded.
+
+MEASURED (probe + test, real terrain seed 1337, the renderer's 6x6-chunk box):
+- pass-38 stride: 2,068,241 of 4,718,592 box cells disagree with the chunk
+  voxels they claim to describe, and the 400 sampled ground points render
+  400/400 FULLY SHADOWED (mean soft visibility 0.000) although the exact
+  binary march calls 350 of them lit -> the owner's screenshot.
+- fixed stride: 0 cell mismatches; of the 400 samples 350 are exactly lit
+  (274 stay > 0.5 lit; 58 fall fully into the k*h/t penumbra - the documented
+  over-darkening of LIT penumbra pixels the owner chose over the pass-35/36
+  "bright spots"), the 50 exactly-dark ones are all dark, 0 light leaks,
+  mean soft 0.695.
+
+FIX (one problem, one pass):
+- The box geometry + the snapshot -> field walk moved out of the renderer into
+  src/voxel/SdfBox.hpp (SdfBoxGeometry::centeredOn, sdfBoxCellSolid,
+  buildSdfBoxField), where the voxel -> chunk mapping uses the REAL layout
+  (x + y*chunkSizeX + z*chunkSizeX*worldHeight) and out-of-range/foreign-sized
+  snapshots read as air. VulkanRenderer::launchSdfBuild and ensureSdfField now
+  use the same SdfBoxGeometry for the constants they have to agree on (dims,
+  origin, chunk order), plus a validity guard.
+- The shader is NOT touched: sampleSdf3d/sunRayEscapesSdf3d already mirror
+  SdfField and take box-local coordinates correctly (world - box.xyz), and the
+  seed/box-uniform contract is unchanged.
+- New CPU test testSdfBoxBuild pins the walk: (1) the field's zero-distance
+  cells must be EXACTLY the chunks' solid voxels (the pass-38 stride gives
+  2.07M mismatches -> FAIL), and (2) on real terrain most exactly-lit ground
+  must stay lit with no light leak (the pass-38 stride gave 0 of 400 -> FAIL).
+
+WHY THE PASS-38 CPU TEST DID NOT CATCH IT: testSdfSoftShadow3d builds its SDF
+straight from its own cell array (no snapshot, no chunk strides), so it never
+exercised the box build's index math; the new test drives the real snapshot
+path (and would have failed on the old code - verified by re-running it).
+
+ALSO MEASURED, NOT CHANGED (parked):
+- BANDING is not a property of the march: on a clean vertical caster the
+  sphere trace's penumbra is smooth (max adjacent step 0.079 over 0.25 voxels,
+  against the 64-ray sun-disc truth's 0.078). The bands in the report were the
+  scrambled field's 32-voxel periodicity.
+- BOX COVERAGE: the shader still treats "left the box" as open space, and the
+  box (6x6 chunks = 192 voxels) is much smaller than the visible region (25x25
+  chunks), so a caster outside the box cannot shadow a point inside it. At the
+  game's sun (elevation 54.7 deg) a ray that clears the terrain inside the box
+  has already risen above every possible caster before it exits: 0 of the 977
+  shadowed ground columns sampled in the box had their blocker outside the box
+  footprint, and 0 trace leaks were found - so the box size is currently
+  sufficient. It would NOT be for a much lower sun (no day/night cycle today).
+  If a shadow cutoff is ever seen at the box faces, the fix is to hand the
+  march over to the 2.5D column traversal on leaving the box (thread t0 and
+  the accumulated visibility into sunRayEscapesSdf) instead of breaking.
+

@@ -16,6 +16,7 @@
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
+#include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
@@ -2415,6 +2416,206 @@ void testSdfSoftShadow3d() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+
+// Pass 39: the SDF BOX BUILD (VV_SDF_SHADOWS=1). The renderer builds the
+// field from per-chunk voxel-type snapshots, so that walk MUST use the chunk
+// voxel layout (X + Y*sizeX + Z*sizeX*worldHeight - Chunk::index and the
+// shader's fetchVoxel). The bug pinned here: pass 38 indexed the snapshot with
+// a Z stride of chunkSizeX * chunkSizeZ (1024 with the default config, where
+// the chunks lay out 4096), i.e. the field was built from a scrambled
+// projection of the terrain - which rendered the whole region around the
+// camera fully shadowed. Both checks below fail against that indexing.
+void testSdfBoxBuild() {
+	using vv::voxel::Chunk;
+	using vv::voxel::ChunkCoord;
+	using vv::voxel::SdfBoxGeometry;
+	using vv::voxel::SdfField;
+
+	const int cx = 32, cz = 32, wh = 128;
+	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
+	vv::voxel::World world(tcfg, cx, wh, cz);
+	std::vector<const Chunk*> added;
+	std::vector<ChunkCoord> evicted;
+	world.ensureRegion(0, 0, 4, added, evicted);  // 9x9 chunks
+
+	// Dense region copy (the reference the box must agree with), built from
+	// the chunks' own voxel data - the REAL layout, not the box's walk.
+	const int regionBase = -4, regionChunks = 9;
+	const int rnx = regionChunks * cx, rnz = regionChunks * cz;
+	std::vector<std::uint8_t> region(std::size_t(rnx) * wh * rnz, 0);
+	for (int rcz = 0; rcz < regionChunks; ++rcz) {
+		for (int rcx = 0; rcx < regionChunks; ++rcx) {
+			const Chunk* c = world.findChunk(
+					ChunkCoord{regionBase + rcx, regionBase + rcz});
+			if (c == nullptr) {
+				continue;
+			}
+			// Copy row by row (the chunk's X rows are contiguous, the region's
+			// are rnx apart).
+			for (int lz = 0; lz < cz; ++lz) {
+				for (int y = 0; y < wh; ++y) {
+					const std::size_t src =
+							std::size_t(lz) * cx * wh + std::size_t(y) * cx;
+					const std::size_t dst = std::size_t(rcx * cx) +
+																	std::size_t(y) * rnx +
+																	std::size_t(rcz * cz + lz) * rnx * wh;
+					std::copy_n(c->voxelTypes().begin() + static_cast<std::ptrdiff_t>(src),
+											std::size_t(cx),
+											region.begin() + static_cast<std::ptrdiff_t>(dst));
+				}
+			}
+		}
+	}
+	auto regionSolid = [&](int x, int y, int z) {
+		if (y < 0 || y >= wh) {
+			return false;
+		}
+		const int rx = x - regionBase * cx;
+		const int rz = z - regionBase * cz;
+		if (rx < 0 || rx >= rnx || rz < 0 || rz >= rnz) {
+			return false;  // outside the generated region: air
+		}
+		return region[std::size_t(rx) + std::size_t(y) * rnx +
+									std::size_t(rz) * rnx * wh] != 0;
+	};
+
+	// The renderer's box: 6x6 whole chunks centered on chunk (0,0), full
+	// world height.
+	const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, 3, cx, cz, wh);
+	check(box.valid() && box.nx == 192 && box.ny == 128 && box.nz == 192 &&
+					box.originX == -96 && box.originZ == -96 && box.originY == 0,
+				"sdfBox: 6x6-chunk geometry, full world height");
+
+	// Snapshot the box's chunks exactly like launchSdfBuild does.
+	const std::size_t side = box.chunksPerSide;
+	std::vector<std::vector<std::uint8_t>> snapshots(side * side);
+	for (std::size_t i = 0; i < side * side; ++i) {
+		const int32_t ccx =
+				box.originX / cx + static_cast<int32_t>(i % side);
+		const int32_t ccz =
+				box.originZ / cz + static_cast<int32_t>(i / side);
+		if (const Chunk* c = world.findChunk(ChunkCoord{ccx, ccz})) {
+			snapshots[i] = c->voxelTypes();
+		}
+	}
+
+	SdfField sdf;
+	vv::voxel::buildSdfBoxField(box, snapshots, sdf);
+	check(sdf.nx() == int(box.nx) && sdf.ny() == int(box.ny) &&
+					sdf.nz() == int(box.nz),
+				"sdfBox: field dims match the box");
+
+	// (1) The field must describe EXACTLY the box's chunk voxels. The chamfer
+	// transform's zero-distance cells are the solid cells, so cellDistance()
+	// is 0 iff that voxel is solid in the chunk data - any stride mismatch
+	// (pass 38: 1024 instead of 4096) scrambles this on most of the box.
+	std::size_t mismatches = 0, solidCells = 0;
+	for (std::uint32_t z = 0; z < box.nz; ++z) {
+		for (std::uint32_t y = 0; y < box.ny; ++y) {
+			for (std::uint32_t x = 0; x < box.nx; ++x) {
+				const bool solid = regionSolid(box.originX + int(x),
+																			 box.originY + int(y),
+																			 box.originZ + int(z));
+				if (solid) {
+					++solidCells;
+				}
+				if ((sdf.cellDistance(int(x), int(y), int(z)) == 0.0f) != solid) {
+					++mismatches;
+				}
+			}
+		}
+	}
+	check(mismatches == 0,
+				"sdfBox: the field covers exactly the chunks' solid voxels");
+	check(solidCells > 1000000,
+				"sdfBox: the box really contains the terrain (sanity)");
+
+	// A chunk that is not installed (or has a foreign size) reads as air, so
+	// the build can never index out of bounds.
+	const std::vector<std::vector<std::uint8_t>> none;
+	check(!vv::voxel::sdfBoxCellSolid(box, none, 5, 5, 5),
+				"sdfBox: a missing chunk snapshot reads as air");
+	std::vector<std::vector<std::uint8_t>> shortSet(1,
+																								 std::vector<std::uint8_t>(4, 1));
+	check(!vv::voxel::sdfBoxCellSolid(box, shortSet, 5, 5, 5),
+				"sdfBox: a foreign-sized chunk snapshot reads as air");
+
+	// (2) The user-visible symptom: with a garbled field the ground around
+	// the camera rendered fully shadowed (every lit pixel black). Sample
+	// surface columns inside the box and compare the soft shadow against an
+	// exact binary march over the region.
+	const double len = std::sqrt(0.25 + 1.0 + 0.25);
+	const float sun[3] = {float(0.5 / len), float(1.0 / len),
+												float(0.5 / len)};
+	auto exactLit = [&](const float o[3]) {
+		for (float t = 0.0f; t < 400.0f; t += 0.25f) {
+			if (regionSolid(int(std::floor(o[0] + sun[0] * t)),
+											int(std::floor(o[1] + sun[1] * t)),
+											int(std::floor(o[2] + sun[2] * t)))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	std::uint64_t rng = 0x51ed270b85e8ab9full;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+
+	int total = 0, exactLitCount = 0, litKept = 0, leaks = 0, dark = 0;
+	double softSum = 0.0;
+	for (int i = 0; i < 400; ++i) {
+		const int wx = box.originX + 4 + int(next01() * double(box.nx - 8));
+		const int wz = box.originZ + 4 + int(next01() * double(box.nz - 8));
+		int top = -1;
+		for (int y = wh - 1; y >= 0; --y) {
+			if (regionSolid(wx, y, wz)) {
+				top = y;
+				break;
+			}
+		}
+		if (top < 1) {
+			continue;
+		}
+		float o[3] = {float(wx) + 0.5f + sun[0] * 1e-2f,
+									float(top + 1) + 1e-3f + sun[1] * 1e-2f,
+									float(wz) + 0.5f + sun[2] * 1e-2f};
+		const float ol[3] = {o[0] - float(box.originX),
+											 o[1] - float(box.originY),
+											 o[2] - float(box.originZ)};
+		const bool ex = exactLit(o);
+		const float soft = vv::voxel::sphereTracedShadow(sdf, ol, sun);
+		++total;
+		softSum += soft;
+		if (soft < 0.05f) {
+			++dark;
+		}
+		if (ex) {
+			++exactLitCount;
+			if (soft > 0.5f) {
+				++litKept;
+			}
+		} else if (soft > 0.5f + 1e-3f) {
+			++leaks;
+		}
+	}
+	check(total > 300, "sdfBox shadow: enough surface samples");
+	check(leaks == 0, "sdfBox shadow: no light leak on the real terrain");
+	// The regression: an unscrambled field keeps most lit ground lit. The
+	// pass-38 indexing left the whole box dark (0 of 400 here).
+	check(exactLitCount > 0 && litKept * 2 > exactLitCount,
+				"sdfBox shadow: lit ground stays lit (no whole-region shadowing)");
+	std::printf(
+			"sdfBox: %zu solid cells, %zu mismatches; %d samples, %d exactly "
+			"lit (%d kept lit), %d fully dark, mean soft %.3f\n",
+			solidCells, mismatches, total, exactLitCount, litKept, dark,
+			softSum / double(total > 0 ? total : 1));
+}
+
 }  // namespace
 }  // namespace
 
@@ -2762,6 +2963,7 @@ int main() {
 	testSunShadowMarch();
 	testSunShadowSdfMarch();
 	testSdfSoftShadow3d();
+	testSdfBoxBuild();
 	testStreamPriority();
 	testVoxelTextures();
 

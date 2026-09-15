@@ -185,13 +185,33 @@ private:
 // (conservatively scaled, so an approximate SDF can never skip a surface),
 // and fold k*h/t into the running min. h is the 3D distance to the nearest
 // solid surface, so every shadow edge shares the same continuous penumbra.
-// o/d are in voxel units; d must be a unit vector with d.y > ~0 (the sun is
-// up). Returns visibility in [0, 1].
-inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
-                                const float d[3], float sharpness = 8.0f,
-                                int steps = 160) {
+// o/d are in voxel units (field-local); d must be a unit vector with
+// d.y > ~0 (the sun is up).
+//
+// This variant reports where the march STOPPED when it leaves the field (or
+// spends `steps`) without hitting anything: outExit/outExitT/outVisibility
+// (all optional) receive the exit point, the distance travelled and the
+// accumulated visibility, and the return value is true - the caller MUST
+// continue the ray with a wider traversal. On the GPU the field covers only
+// the 6x6 chunks around the camera, so leaving it is NOT open space: the
+// shader hands the ray to its whole-region 2.5D march (see
+// sunRayEscapesSdf3d, pass 40). Returns false when the field resolved the
+// ray itself (a hit, a low sun, or the march never left it): outVisibility
+// is then the final answer.
+inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
+                                    const float d[3], float outExit[3],
+                                    float* outExitT, float* outVisibility,
+                                    float sharpness = 8.0f, int steps = 160) {
+    if (outExitT != nullptr) {
+        *outExitT = 0.0f;
+    }
     if (d[1] <= 0.05f) {
-        return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
+        // Low/sunset sun: no cheap ascend bound, skip (the shader's hand-off
+        // traversal applies the same rule to startVisibility).
+        if (outVisibility != nullptr) {
+            *outVisibility = 1.0f;
+        }
+        return false;
     }
     float visibility = 1.0f;
     float t = 0.0f;
@@ -199,14 +219,28 @@ inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
         const float px = o[0] + d[0] * t;
         const float py = o[1] + d[1] * t;
         const float pz = o[2] + d[2] * t;
-        // Left the field: open space, nothing left to block the sun.
+        // Left the field: report where, so the caller can keep marching.
         if (px < 0.0f || px >= float(sdf.nx()) || py < 0.0f ||
             py >= float(sdf.ny()) || pz < 0.0f || pz >= float(sdf.nz())) {
-            break;
+            if (outExit != nullptr) {
+                outExit[0] = px;
+                outExit[1] = py;
+                outExit[2] = pz;
+            }
+            if (outExitT != nullptr) {
+                *outExitT = t;
+            }
+            if (outVisibility != nullptr) {
+                *outVisibility = visibility;
+            }
+            return true;
         }
         const float h = sdf.sample(px, py, pz);
         if (h < 1e-3f) {
-            return 0.0f;  // hit the surface: fully shadowed from here
+            if (outVisibility != nullptr) {
+                *outVisibility = 0.0f;  // hit the surface: fully shadowed
+            }
+            return false;
         }
         visibility = std::min(
             visibility,
@@ -215,6 +249,33 @@ inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
         // surface the chamfer field slightly over-estimates.
         t += std::max(h * 0.7f, 0.05f);
     }
+    // Budget spent inside the field: the shader hands the rest over as well.
+    if (outExit != nullptr) {
+        outExit[0] = o[0] + d[0] * t;
+        outExit[1] = o[1] + d[1] * t;
+        outExit[2] = o[2] + d[2] * t;
+    }
+    if (outExitT != nullptr) {
+        *outExitT = t;
+    }
+    if (outVisibility != nullptr) {
+        *outVisibility = visibility;
+    }
+    return true;
+}
+
+// The march alone, treating "left the field" as open space - the pre-pass-40
+// shader behavior, kept for the field-only tests (the field must agree with
+// the voxels it was built from) and probes. Returns visibility in [0, 1].
+inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
+                                const float d[3], float sharpness = 8.0f,
+                                int steps = 160) {
+    if (d[1] <= 0.05f) {
+        return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
+    }
+    float visibility = 1.0f;
+    sphereTracedShadowExits(sdf, o, d, nullptr, nullptr, &visibility,
+                            sharpness, steps);
     return visibility;
 }
 

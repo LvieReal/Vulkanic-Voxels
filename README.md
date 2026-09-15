@@ -82,10 +82,15 @@ alongside by default — run it with `ctest --test-dir build` (or disable with
 The full-detail terrain region is the default. Set `VV_FAR_LOD=1` to enable
 the optional coarse terrain field beyond it; without that variable LOD is off,
 so no far-field build or seam ring is generated. Set `VV_SDF_SHADOWS=1` to try
-the SDF soft-shadow marcher: the exact shadow ray's traversal with the plain
-Quilez `k*h/t` penumbra estimate (soft edges, `kShadowSharpness` in the shader
-tunes softness). Exact binary sun shadows remain the default reference;
-`VV_SHADOW_SHARP=1` explicitly selects them.
+the SDF soft-shadow marcher: a 3D voxel SDF of the near terrain (a
+camera-centered 6x6-chunk box over the full world height, rebuilt on a
+background thread on every region change) is sphere-traced toward the sun with
+the plain Quilez `k*h/t` penumbra estimate, so shadow edges are soft on
+vertical / side casters too and not just on flat tops (`kShadowSharpness` in
+the shader tunes the softness). Only the box is
+field-aware - a shadow ray that leaves it is treated as open space - and until
+the first box lands the 2.5D top-plane penumbra runs instead. Exact binary sun shadows remain the default
+reference; `VV_SHADOW_SHARP=1` explicitly selects them.
 
 Both the X11 (XCB) and Wayland surface backends are compiled in when their
 headers are found; the correct one is picked at run time from the Qt platform.
