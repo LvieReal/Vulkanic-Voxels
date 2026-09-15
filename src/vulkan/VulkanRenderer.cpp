@@ -1582,7 +1582,7 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
   appInfo.apiVersion = requestedApiVersion;
 
   // Platform-delegated: the WSI extensions matching the native window kind
-  // (VK_KHR_win32_surface / VK_KHR_xcb_surface / VK_KHR_wayland_surface /
+  // (VK_KHR_win32_surface / VK_KHR_xlib_surface / VK_KHR_wayland_surface /
   // VK_MVK_macos_surface), always preceded by VK_KHR_surface.
   std::vector<const char*> extensions =
       vv::platform::requiredVulkanInstanceExtensions(info.nativeWindow);

@@ -30,7 +30,7 @@ class VulkanRenderer final {
  public:
   struct InitInfo {
     // Platform-agnostic description of the native window to render into.
-    // See vv::platform::NativeWindow and QtNativeWindowResolver.
+    // See vv::platform::NativeWindow and platform/GlfwNativeWindow.
     vv::platform::NativeWindow nativeWindow;
     uint32_t width = 0;
     uint32_t height = 0;

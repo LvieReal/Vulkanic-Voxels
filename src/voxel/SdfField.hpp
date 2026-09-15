@@ -18,7 +18,7 @@
 // and overhangs included, not just a column's top plane - EVERY shadow edge
 // (top, side, vertical) gets the same continuous penumbra.
 //
-// This file is the CPU reference implementation (no Qt, no Vulkan): the GPU
+// This file is the CPU reference implementation (no windowing, no Vulkan): the GPU
 // builds the same field and traces the same march (pass 38) and the CPU
 // sphere-traced shadow must agree with it (pinned by the parity test in
 // tests/terrain_world_tests.cpp).

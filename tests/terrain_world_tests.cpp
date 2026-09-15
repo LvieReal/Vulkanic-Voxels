@@ -1,20 +1,30 @@
-// Pure-logic tests for the terrain/world modules. No Qt, no Vulkan: this
-// suite also runs in restricted sandboxes where the game itself cannot.
+// Pure-logic tests for the terrain/world modules - plus, since the windowing
+// library replaced Qt (pass 43), the input bindings and the image decoder,
+// which are pure functions over plain data. No window is opened here and no
+// Vulkan device is touched: this suite also runs in restricted sandboxes
+// where the game itself cannot.
 //
 // Run via ctest or directly: ./build/release/bin/voxel_tests
+
+#include <GLFW/glfw3.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "core/InputBindings.hpp"
+#include "render/ImageDecode.hpp"
 #include "terrain/FarField.hpp"
-#include "vulkan/StreamPriority.hpp"
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
+#include "vulkan/StreamPriority.hpp"
 #include "voxel/Chunk.hpp"
 #include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
@@ -3056,6 +3066,302 @@ static void testVoxelTextures() {
 // stuck at the front forever while progressively worse top-ups were
 // generated first; the nearest in-frustum chunks came dead last.
 // ---------------------------------------------------------------------------
+// --- pass 43: the Qt-free input bindings -----------------------------------
+//
+// The key numbers below are the evdev scancodes GLFW reports on X11/Wayland
+// (Linux keycodes), i.e. what an X11/Wayland build sees for those physical
+// keys - the same ones defaultScancodes() uses there.
+void testKeyBindings() {
+	const std::vector<vv::core::Binding> bindings = vv::core::defaultBindings();
+	check(bindings.size() ==
+	          static_cast<std::size_t>(vv::core::Action::Count),
+	      "key bindings: every action has exactly one binding");
+	for (std::size_t i = 0; i < bindings.size(); ++i) {
+		for (std::size_t j = i + 1; j < bindings.size(); ++j) {
+			check(bindings[i].action != bindings[j].action,
+			      "key bindings: no action is bound twice");
+		}
+	}
+
+	const auto lookup = [&bindings](int key, int scancode) {
+		return vv::core::lookupAction(bindings, key, scancode);
+	};
+
+	// Linux evdev codes for the physical positions.
+	constexpr int kEvdevQ = 16, kEvdevW = 17, kEvdevA = 30, kEvdevS = 31,
+	              kEvdevD = 32, kEvdevZ = 44;
+
+	// The plain case: QWERTY, label and position agree.
+	check(lookup(GLFW_KEY_W, kEvdevW) == vv::core::Action::MoveForward,
+	      "key bindings: W moves forward");
+	check(lookup(GLFW_KEY_A, kEvdevA) == vv::core::Action::MoveLeft,
+	      "key bindings: A moves left");
+	check(lookup(GLFW_KEY_S, kEvdevS) == vv::core::Action::MoveBack,
+	      "key bindings: S moves back");
+	check(lookup(GLFW_KEY_D, kEvdevD) == vv::core::Action::MoveRight,
+	      "key bindings: D moves right");
+	check(lookup(GLFW_KEY_SPACE, 57) == vv::core::Action::MoveUp,
+	      "key bindings: space moves up");
+	check(lookup(GLFW_KEY_LEFT_CONTROL, 29) == vv::core::Action::MoveDown,
+	      "key bindings: left ctrl moves down");
+	check(lookup(GLFW_KEY_LEFT_SHIFT, 42) == vv::core::Action::SpeedBoost,
+	      "key bindings: left shift boosts");
+
+	// AZERTY (ZQSD): the physical position reports the other label. The
+	// position channel is what makes the camera move.
+	check(lookup(GLFW_KEY_Z, kEvdevW) == vv::core::Action::MoveForward,
+	      "key bindings: AZERTY's labelled Z on the W position moves forward");
+	check(lookup(GLFW_KEY_Q, kEvdevA) == vv::core::Action::MoveLeft,
+	      "key bindings: AZERTY's labelled Q on the A position moves left");
+	// ... and the label channel still answers, so a board where the layout
+	// moved the key keeps working through the letter.
+	check(lookup(GLFW_KEY_W, kEvdevZ) == vv::core::Action::MoveForward,
+	      "key bindings: the key labelled W moves forward wherever it sits");
+	check(lookup(GLFW_KEY_A, kEvdevQ) == vv::core::Action::MoveLeft,
+	      "key bindings: the key labelled A moves left wherever it sits");
+
+	// Nothing else moves: the offset letters, Escape (the pause key handled
+	// by the app loop) and the modifiers that are not bound.
+	check(lookup(GLFW_KEY_Q, kEvdevQ) == vv::core::Action::Count,
+	      "key bindings: Q on its own position is not bound");
+	check(lookup(GLFW_KEY_Z, kEvdevZ) == vv::core::Action::Count,
+	      "key bindings: Z on its own position is not bound (QWERTZ safe)");
+	check(lookup(GLFW_KEY_ESCAPE, 1) == vv::core::Action::Count,
+	      "key bindings: Escape is not a movement binding");
+	check(lookup(GLFW_KEY_RIGHT_CONTROL, 97) == vv::core::Action::Count,
+	      "key bindings: the right-side modifiers are not bound");
+
+	// A platform without scancodes (scancode -1 in the table) still works
+	// through the label, and does not accidentally match someone else's.
+	{
+		std::vector<vv::core::Binding> labelOnly;
+		labelOnly.push_back(
+		    {vv::core::Action::MoveForward, GLFW_KEY_W, -1});
+		check(vv::core::lookupAction(labelOnly, GLFW_KEY_W, 0) ==
+		          vv::core::Action::MoveForward,
+		      "key bindings: label-only platforms still move");
+		check(vv::core::lookupAction(labelOnly, GLFW_KEY_Z, kEvdevW) ==
+		          vv::core::Action::Count,
+		      "key bindings: an unbound label does not match a binding's "
+		      "position");
+	}
+
+	// The scancode table itself: every action has one (or deliberately -1)
+	// and the positions are the documented ones.
+	{
+		const vv::core::Scancodes codes = vv::core::defaultScancodes();
+		const vv::core::Scancodes labels = vv::core::defaultLabelKeys();
+		check(labels.of(vv::core::Action::MoveForward) == GLFW_KEY_W,
+		      "key bindings: the forward label is W");
+		check(labels.of(vv::core::Action::MoveUp) == GLFW_KEY_SPACE,
+		      "key bindings: the up label is space");
+#if defined(_WIN32) || defined(__APPLE__)
+		// Windows uses Set-1 make codes, macOS Carbon virtual key codes; only
+		// their existence is checked here (the exact values are platform
+		// data, and the Linux ones are exercised above).
+		bool haveScancodes = true;
+		for (int i = 0; i < static_cast<int>(vv::core::Action::Count); ++i) {
+			haveScancodes = haveScancodes && codes.values[i] >= 0;
+		}
+		check(haveScancodes,
+		      "key bindings: this platform provides a scancode per action");
+#else
+		check(codes.of(vv::core::Action::MoveForward) == kEvdevW,
+		      "key bindings: the forward scancode is evdev KEY_W");
+		check(codes.of(vv::core::Action::MoveLeft) == kEvdevA,
+		      "key bindings: the left scancode is evdev KEY_A");
+		check(codes.of(vv::core::Action::MoveBack) == kEvdevS,
+		      "key bindings: the back scancode is evdev KEY_S");
+		check(codes.of(vv::core::Action::MoveRight) == kEvdevD,
+		      "key bindings: the right scancode is evdev KEY_D");
+		check(codes.of(vv::core::Action::MoveUp) == 57,
+		      "key bindings: the up scancode is evdev KEY_SPACE");
+		check(codes.of(vv::core::Action::MoveDown) == 29,
+		      "key bindings: the down scancode is evdev KEY_LEFTCTRL");
+		check(codes.of(vv::core::Action::SpeedBoost) == 42,
+		      "key bindings: the boost scancode is evdev KEY_LEFTSHIFT");
+#endif
+	}
+
+	// Every action has a human-readable name (used by the startup log).
+	for (int i = 0; i < static_cast<int>(vv::core::Action::Count); ++i) {
+		const char* name =
+		    vv::core::actionName(static_cast<vv::core::Action>(i));
+		check(name != nullptr && name[0] != '\0' && name[0] != '?',
+		      "key bindings: every action has a name");
+	}
+
+	// The startup log is part of the contract ("what did it detect here?"),
+	// so exercise it with the same name provider the app passes.
+	std::printf(
+	    "key bindings: %zu actions, positions matched by scancode "
+	    "(AZERTY/QWERTZ safe), labels accepted on top\n",
+	    bindings.size());
+}
+
+// --- pass 43: the Qt-free image decoder ------------------------------------
+//
+// Builds a PNG byte for byte (uncompressed deflate blocks, CRC32 computed
+// here) so the test does not depend on the game's own art: the decoder must
+// reproduce the exact RGBA8 pixels, including a row that uses a PNG filter.
+void testImageDecode() {
+	namespace fs = std::filesystem;
+
+	const auto crc32Of = [](const std::vector<std::uint8_t>& data) {
+		std::uint32_t crc = 0xFFFFFFFFu;
+		for (const std::uint8_t byte : data) {
+			crc ^= byte;
+			for (int bit = 0; bit < 8; ++bit) {
+				crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1u) + 1u));
+			}
+		}
+		return crc ^ 0xFFFFFFFFu;
+	};
+
+	const auto appendBigEndian = [](std::vector<std::uint8_t>& out,
+	                                std::uint32_t value, int bytes) {
+		for (int shift = (bytes - 1) * 8; shift >= 0; shift -= 8) {
+			out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFFu));
+		}
+	};
+
+	const auto appendChunk = [&](std::vector<std::uint8_t>& out,
+	                             const char* type,
+	                             const std::vector<std::uint8_t>& payload) {
+		appendBigEndian(out, static_cast<std::uint32_t>(payload.size()), 4);
+		std::vector<std::uint8_t> crcInput;
+		for (int i = 0; i < 4; ++i) {
+			crcInput.push_back(static_cast<std::uint8_t>(type[i]));
+		}
+		crcInput.insert(crcInput.end(), payload.begin(), payload.end());
+		out.insert(out.end(), crcInput.begin(), crcInput.end());
+		appendBigEndian(out, crc32Of(crcInput), 4);
+	};
+
+	// 3x2 image, RGBA8. Row 0 uses filter None, row 1 filter Up (2), so the
+	// decoder has to undo a filter to get the pixels back.
+	const std::uint8_t rows[2][3][4] = {
+	    {{10, 20, 30, 255}, {40, 50, 60, 128}, {70, 80, 90, 0}},
+	    {{11, 21, 31, 255}, {41, 51, 61, 129}, {71, 81, 91, 1}}};
+	const std::uint32_t width = 3, height = 2;
+
+	// Raw scanlines after filtering (filter byte + payload).
+	std::vector<std::uint8_t> raw;
+	for (std::uint32_t y = 0; y < height; ++y) {
+		raw.push_back(y == 0 ? 0 : 2);  // None, Up
+		for (std::uint32_t x = 0; x < width; ++x) {
+			for (int c = 0; c < 4; ++c) {
+				std::uint8_t value = rows[y][x][c];
+				if (y == 1) {
+					value = static_cast<std::uint8_t>(value - rows[0][x][c]);
+				}
+				raw.push_back(value);
+			}
+		}
+	}
+
+	std::vector<std::uint8_t> zlib;
+	zlib.push_back(0x78);  // CMF: deflate, 32K window
+	zlib.push_back(0x01);  // FLG: no dictionary, fastest
+	// One stored (uncompressed) deflate block: BFINAL=1, BTYPE=00.
+	std::size_t offset = 0;
+	do {
+		const std::size_t remaining = raw.size() - offset;
+		const std::size_t block = std::min<std::size_t>(remaining, 0xFFFF);
+		zlib.push_back(offset + block >= raw.size() ? 1 : 0);
+		zlib.push_back(static_cast<std::uint8_t>(block & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>((block >> 8) & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>(~block & 0xFF));
+		zlib.push_back(static_cast<std::uint8_t>((~block >> 8) & 0xFF));
+		zlib.insert(zlib.end(), raw.begin() + static_cast<long>(offset),
+		            raw.begin() + static_cast<long>(offset + block));
+		offset += block;
+	} while (offset < raw.size());
+	// Adler-32 of the uncompressed data (zlib trailer).
+	{
+		std::uint32_t a = 1, b = 0;
+		for (const std::uint8_t byte : raw) {
+			a = (a + byte) % 65521u;
+			b = (b + a) % 65521u;
+		}
+		appendBigEndian(zlib, (b << 16) | a, 4);
+	}
+
+	std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A,
+	                                 '\n'};
+	{
+		std::vector<std::uint8_t> ihdr;
+		appendBigEndian(ihdr, width, 4);
+		appendBigEndian(ihdr, height, 4);
+		ihdr.push_back(8);  // bit depth
+		ihdr.push_back(6);  // color type: RGBA
+		ihdr.push_back(0);  // compression
+		ihdr.push_back(0);  // filter
+		ihdr.push_back(0);  // interlace
+		appendChunk(png, "IHDR", ihdr);
+	}
+	appendChunk(png, "IDAT", zlib);
+	appendChunk(png, "IEND", {});
+
+	const fs::path path =
+	    fs::temp_directory_path() / "vv_image_decode_test.png";
+	const fs::path badPath =
+	    fs::temp_directory_path() / "vv_image_decode_test_bad.png";
+	{
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		out.write(reinterpret_cast<const char*>(png.data()),
+		          static_cast<std::streamsize>(png.size()));
+	}
+	{
+		std::ofstream out(badPath, std::ios::binary | std::ios::trunc);
+		out.write("this is not a png", 17);
+	}
+
+	vv::voxel::VoxelTextureImage image;
+	std::string error;
+	const bool loaded = vv::render::loadImageFileRGBA(path.string(), image,
+	                                                 &error);
+	check(loaded, "image decode: a PNG written by this test decodes");
+	if (loaded) {
+		check(image.width == width && image.height == height,
+		      "image decode: the decoded size is the PNG size");
+		check(image.rgba.size() ==
+		          static_cast<std::size_t>(width) * height * 4u,
+		      "image decode: RGBA8 output is width*height*4 bytes");
+		bool pixelsExact = image.rgba.size() ==
+		                   static_cast<std::size_t>(width) * height * 4u;
+		for (std::uint32_t y = 0; y < height && pixelsExact; ++y) {
+			for (std::uint32_t x = 0; x < width && pixelsExact; ++x) {
+				for (int c = 0; c < 4; ++c) {
+					const std::size_t index =
+					    (static_cast<std::size_t>(y) * width + x) * 4u +
+					    static_cast<std::size_t>(c);
+					pixelsExact =
+					    image.rgba[index] == rows[y][x][c];
+				}
+			}
+		}
+		check(pixelsExact,
+		      "image decode: pixels come back exactly, filter undone");
+	}
+
+	vv::voxel::VoxelTextureImage missing;
+	check(!vv::render::loadImageFileRGBA((path.string() + ".nope").c_str(),
+	                                     missing, &error),
+	      "image decode: a missing file is reported, not decoded");
+	vv::voxel::VoxelTextureImage garbage;
+	check(!vv::render::loadImageFileRGBA(badPath.string(), garbage, &error),
+	      "image decode: a file that is not an image fails cleanly");
+
+	std::error_code ec;
+	fs::remove(path, ec);
+	fs::remove(badPath, ec);
+	std::printf(
+	    "image decode: %ux%u RGBA8 reproduced byte-exact (filters none+up), "
+	    "missing/garbage rejected\n",
+	    width, height);
+}
+
 void testStreamPriority() {
 	const float chunk = 32.0f;  // chunk world size (32 voxels x 1.0)
 	const float cx = 400.0f, cz = 400.0f;  // camera (world units)
@@ -3174,6 +3480,8 @@ int main() {
 	testSdfHandoverPolicy();
 	testStreamPriority();
 	testVoxelTextures();
+	testKeyBindings();
+	testImageDecode();
 
 	if (g_failures == 0) {
 		std::printf("all tests passed\n");

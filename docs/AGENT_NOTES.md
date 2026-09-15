@@ -753,3 +753,103 @@ resources/shaders/pixels_rgba.comp exits 0, the offscreen smoke run exits
 cleanly, and the suite prints the new
 `sdf handover: box/seed pairing pinned either side of the copy ...` line.
 On-device rendering is the owner's gate.
+
+## Pass 43: Qt out, GLFW in - the window is not a toolkit's job
+
+OWNER: "the goal now is, swap qt to glfw completely, eliminate qt dependency."
+Reasons given: Qt is a heavy build for what this uses, it does not do
+cross-platform keyboard-layout key detection, and it carries Linux quirks.
+Decisions taken with the owner before the work: GLFW comes from the system
+(GitHub only as the pinned fallback), `stb_image.h` replaces QImage for the
+texture PNGs, init failures print to stderr and exit non-zero instead of a
+QMessageBox, and the movement keys are bound by physical position with the
+layout key accepted on top.
+
+WHAT WENT AWAY: `src/ui/` (AppWindow, VulkanWidget), main.cpp's QApplication,
+QtNativeWindowResolver, every `#include <Q...>`, AUTOMOC/AUTORCC/AUTOUIC, the
+Qt6 find_package, the QPA private-header probing (including the "install
+libQt6GuiPrivate or use XWayland" story), and `qt_generate_deploy_app_script` -
+a package is now just the executable, the SPIR-V and the optional textures.
+
+THE HOST, in one place. `vv::core::GameWindow` owns the OS window (GLFW init,
+hints, size in PHYSICAL pixels, mouse-lock, raw callbacks) and `vv::core::App`
+owns everything else: the renderer, the camera, the frame loop and the input
+state. The Qt version had three objects (AppWindow, VulkanWidget, QTimer) doing
+that, a `paintEngine()` override to keep the toolkit off the surface, an event
+filter just to defer a mouse grab until the window was exposed, and a 0 ms
+QTimer as the frame clock. The loop is now explicit: wait for events (so an
+unsynced frame loop does not starve the compositor), skip the frame while
+iconified, tick, present.
+
+PLATFORM HANDLES come from GLFW's own accessors rather than from the toolkit:
+`glfwGetWin32Window` (+ GWLP_HINSTANCE for the HINSTANCE), `glfwGetX11Display`
+/ `glfwGetX11Window`, `glfwGetWaylandDisplay` / `glfwGetWaylandWindow`, and
+`glfwGetCocoaView`. Two consequences:
+
+* The X11 Vulkan surface is now created with VK_KHR_xlib_surface from the
+  Display*/Window pair (pass 42 used XCB with the Qt QPA connection). GLFW
+  exposes the Xlib connection, and libX11-xcb would have been one more
+  dependency for nothing. `NativeWindowKind::Xcb` became `::X11`.
+* Which backends exist is a property of the GLFW library, so the CMake side
+  sets VV_WINDOW_BACKEND_X11 / _WAYLAND from how GLFW was built and the code
+  compiles only what can exist (plus clear errors for the ones that cannot).
+  `-DVV_GLFW_NULL_ONLY=ON` builds GLFW's null backend: that is how the sandbox
+  (no X11/Wayland headers, no display) compiles, links and runs everything up
+  to "unsupported platform", which is exactly the message it should print.
+  `VV_PLATFORM=null` selects that platform explicitly - the null backend is
+  never auto-selected, and it is the headless smoke test the toolchain script
+  ends with.
+
+INPUT: the keyboard problem the owner named. A key event now carries the
+layout key AND the physical scancode, and `vv::core::InputBindings` matches
+either (position first, label second): WASD therefore keeps working on AZERTY
+(ZQSD), QWERTZ and Dvorak, where the labels move but the positions do not. The
+scancode table is per platform - evdev on X11/Wayland, Set-1 make codes on
+Windows, Carbon virtual key codes on macOS - and it is unit tested
+(testKeyBindings), including the AZERTY/QWERTZ cases, the "unbound label does
+not match someone else's position" case and the label-only fallback for
+platforms without scancodes. The startup log prints one line per action with
+the key number, the layout name `glfwGetKeyName` reports and the scancode: a
+"the keyboard behaves differently here" report now carries the numbers.
+
+MOUSE: GLFW_CURSOR_DISABLED replaces the Qt mouse grab. GLFW hides the cursor
+and reports it at the window centre, so the camera reads relative deltas (the
+first sample after a lock is dropped, not treated as motion), losing focus
+drops the lock and the held keys, Escape releases the cursor and pauses, a left
+click re-locks.
+
+TEXTURES: `src/render/ImageDecode.cpp` is the one translation unit that
+instantiates `third_party/stb_image.h` (STBI_ONLY_PNG - the loader only ever
+asks for .png - and STBI_NO_STDIO, so the file is read through std::ifstream
+and non-ASCII paths keep working on Windows). testImageDecode writes a PNG byte
+by byte in the test (uncompressed deflate, CRC32 and Adler-32 computed there,
+one row using the Up filter) and pins the decoded RGBA8 exactly, plus the
+missing-file and not-an-image failures.
+
+ERRORS: no toolkit dialog exists any more. A failure prints `[vv] fatal: ...`
+on stderr and exits 1; the device-lost path prints the renderer's message once,
+releases the mouse, pauses and keeps the (empty) window open so the message can
+be read. Device-lost used to be a modal QMessageBox.
+
+VERIFIED IN THE SANDBOX: build/release and build/debug configure and build
+warning-free with GLFW 3.5.1 built null-only (`-DVV_GLFW_NULL_ONLY=ON`), ctest
+green, and the headless run
+
+  VV_PLATFORM=null LD_LIBRARY_PATH=... timeout 20 ./build/release/bin/game
+
+creates the window, prints the detected platform and size, resolves the native
+handles, fails with the documented message and exits 1 without crashing. The
+test suite prints the two new lines:
+
+  key bindings: 7 actions, positions matched by scancode (AZERTY/QWERTZ safe),
+  labels accepted on top
+  image decode: 3x2 RGBA8 reproduced byte-exact (filters none+up),
+  missing/garbage rejected
+
+NOT PROVEN HERE: the sandbox has no GPU, no X server and no Wayland compositor,
+so the X11 (Xlib) and Wayland surface paths, the Win32/macOS ones, real
+keyboard scancodes and the GLFW window behaviour itself are reasoned from
+GLFW's documented semantics and built, not run. The owner's gates: a real
+window appears on the target machine (X11 and Wayland), the WASD keys work on
+the owner's layout, the mouse lock behaves (Escape, alt-tab, click to resume),
+and `VV_SDF_SHADOWS=1` still looks as it did in pass 42.

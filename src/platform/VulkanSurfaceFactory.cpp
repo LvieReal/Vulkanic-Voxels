@@ -1,17 +1,18 @@
 #include "platform/VulkanSurfaceFactory.hpp"
 
 // Platform WSI headers. Exactly one backend is active on Windows/macOS; on
-// Linux both XCB (X11) and Wayland are compiled in when their headers were
-// found at configure time (VV_HAVE_XCB / VV_HAVE_WAYLAND), and the right one
-// is selected at run time from the NativeWindow kind.
+// Linux the X11 (Xlib) and Wayland backends are compiled in when GLFW was
+// built with them (VV_WINDOW_BACKEND_X11 / _WAYLAND, set from what GLFW can
+// do - see cmake/GameTarget.cmake), and the right one is selected at run time
+// from the NativeWindow kind reported by GLFW.
 //
 // Note: the Vulkan platform headers only declare the surface create-info
-// structs; the native windowing headers must be included first.
-#ifndef VV_HAVE_XCB
-#define VV_HAVE_XCB 0
+// structs; the windowing-system headers must be included first.
+#ifndef VV_WINDOW_BACKEND_X11
+#define VV_WINDOW_BACKEND_X11 0
 #endif
-#ifndef VV_HAVE_WAYLAND
-#define VV_HAVE_WAYLAND 0
+#ifndef VV_WINDOW_BACKEND_WAYLAND
+#define VV_WINDOW_BACKEND_WAYLAND 0
 #endif
 
 #if defined(_WIN32)
@@ -27,12 +28,14 @@
 #elif defined(__APPLE__)
 #include <vulkan/vulkan_macos.h>
 #else
-#if VV_HAVE_XCB
-#include <xcb/xcb.h>
-#include <vulkan/vulkan_xcb.h>
+#if VV_WINDOW_BACKEND_X11
+#include <X11/Xlib.h>
+
+#include <vulkan/vulkan_xlib.h>
 #endif
-#if VV_HAVE_WAYLAND
+#if VV_WINDOW_BACKEND_WAYLAND
 #include <wayland-client-core.h>
+
 #include <vulkan/vulkan_wayland.h>
 #endif
 #endif
@@ -42,8 +45,8 @@ namespace vv::platform {
 namespace {
 
 // WSI extension names for every backend. The Vulkan platform headers define
-// *_EXTENSION_NAME macros only for the platform they belong to, so literal
-// strings (which are fixed by the Vulkan spec) are used for backends whose
+// the *_EXTENSION_NAME macros only for the platform they belong to, so
+// literal strings (fixed by the Vulkan spec) are used for backends whose
 // headers are not compiled in. This lets the extension list be built on every
 // platform; a backend whose header is missing simply fails at surface
 // creation with a clear message.
@@ -54,14 +57,14 @@ constexpr const char* const kWin32SurfaceExtension =
 constexpr const char* const kWin32SurfaceExtension = "VK_KHR_win32_surface";
 #endif
 
-#if VV_HAVE_XCB
-constexpr const char* const kXcbSurfaceExtension =
-		VK_KHR_XCB_SURFACE_EXTENSION_NAME;
+#if VV_WINDOW_BACKEND_X11
+constexpr const char* const kX11SurfaceExtension =
+		VK_KHR_XLIB_SURFACE_EXTENSION_NAME;
 #else
-constexpr const char* const kXcbSurfaceExtension = "VK_KHR_xcb_surface";
+constexpr const char* const kX11SurfaceExtension = "VK_KHR_xlib_surface";
 #endif
 
-#if VV_HAVE_WAYLAND
+#if VV_WINDOW_BACKEND_WAYLAND
 constexpr const char* const kWaylandSurfaceExtension =
 		VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME;
 #else
@@ -87,8 +90,8 @@ std::vector<const char*> requiredVulkanInstanceExtensions(
 		case NativeWindowKind::Win32:
 			extensions.push_back(kWin32SurfaceExtension);
 			break;
-		case NativeWindowKind::Xcb:
-			extensions.push_back(kXcbSurfaceExtension);
+		case NativeWindowKind::X11:
+			extensions.push_back(kX11SurfaceExtension);
 			break;
 		case NativeWindowKind::Wayland:
 			extensions.push_back(kWaylandSurfaceExtension);
@@ -178,46 +181,46 @@ bool createVulkanSurface(VkInstance instance, const NativeWindow& nativeWindow,
 	return true;
 #else
 	switch (nativeWindow.kind) {
-#if VV_HAVE_XCB
-		case NativeWindowKind::Xcb: {
-			PFN_vkCreateXcbSurfaceKHR createSurface =
-					reinterpret_cast<PFN_vkCreateXcbSurfaceKHR>(
-							vkGetInstanceProcAddr(instance, "vkCreateXcbSurfaceKHR"));
+#if VV_WINDOW_BACKEND_X11
+		case NativeWindowKind::X11: {
+			PFN_vkCreateXlibSurfaceKHR createSurface =
+					reinterpret_cast<PFN_vkCreateXlibSurfaceKHR>(
+							vkGetInstanceProcAddr(instance, "vkCreateXlibSurfaceKHR"));
 			if (createSurface == nullptr) {
 				outError =
-						"vkCreateXcbSurfaceKHR is not available in the Vulkan loader.";
+						"vkCreateXlibSurfaceKHR is not available in the Vulkan loader.";
 				return false;
 			}
 
-			VkXcbSurfaceCreateInfoKHR createInfo{};
-			createInfo.sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR;
-			createInfo.connection =
-					static_cast<xcb_connection_t*>(nativeWindow.displayHandle);
-			createInfo.window =
-					static_cast<xcb_window_t>(nativeWindow.x11WindowId);
+			VkXlibSurfaceCreateInfoKHR createInfo{};
+			createInfo.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
+			createInfo.dpy = static_cast<Display*>(nativeWindow.displayHandle);
+			createInfo.window = static_cast<Window>(nativeWindow.x11WindowId);
 
 			VkResult result =
 					createSurface(instance, &createInfo, nullptr, outSurface);
 			if (result != VK_SUCCESS) {
-				outError = "Failed to create X11 (XCB) Vulkan surface (result " +
+				outError = "Failed to create X11 (Xlib) Vulkan surface (result " +
 									 std::to_string(static_cast<int>(result)) + ").";
 				return false;
 			}
 			return true;
 		}
 #else
-		case NativeWindowKind::Xcb:
+		case NativeWindowKind::X11:
 			outError =
-					"The X11 (XCB) Vulkan surface backend was not compiled in. Install "
-					"the xcb development headers (libxcb1-dev on Debian/Ubuntu, "
-					"libxcb-devel on Fedora) and reconfigure the project.";
+					"The X11 Vulkan surface backend was not compiled in (GLFW was "
+					"built without its X11 backend). Install the GLFW X11 "
+					"dependencies (libxcb/libxrandr/libxinerama/libxcursor/libxi/"
+					"libxkb, or libglfw3-dev with X11 support) and reconfigure.";
 			return false;
 #endif
-#if VV_HAVE_WAYLAND
+#if VV_WINDOW_BACKEND_WAYLAND
 		case NativeWindowKind::Wayland: {
 			PFN_vkCreateWaylandSurfaceKHR createSurface =
 					reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
-							vkGetInstanceProcAddr(instance, "vkCreateWaylandSurfaceKHR"));
+							vkGetInstanceProcAddr(instance,
+																		"vkCreateWaylandSurfaceKHR"));
 			if (createSurface == nullptr) {
 				outError =
 						"vkCreateWaylandSurfaceKHR is not available in the Vulkan loader.";
@@ -231,8 +234,8 @@ bool createVulkanSurface(VkInstance instance, const NativeWindow& nativeWindow,
 			createInfo.surface =
 					static_cast<wl_surface*>(nativeWindow.waylandSurface);
 
-			VkResult result = createSurface(instance, &createInfo, nullptr,
-																			outSurface);
+			VkResult result =
+					createSurface(instance, &createInfo, nullptr, outSurface);
 			if (result != VK_SUCCESS) {
 				outError = "Failed to create Wayland Vulkan surface (result " +
 									 std::to_string(static_cast<int>(result)) + ").";
@@ -243,10 +246,10 @@ bool createVulkanSurface(VkInstance instance, const NativeWindow& nativeWindow,
 #else
 		case NativeWindowKind::Wayland:
 			outError =
-					"The Wayland Vulkan surface backend was not compiled in. Install "
-					"the Wayland client development headers (libwayland-dev on "
-					"Debian/Ubuntu, wayland-devel on Fedora) and reconfigure the "
-					"project.";
+					"The Wayland Vulkan surface backend was not compiled in (GLFW "
+					"was built without its Wayland backend). Install the Wayland "
+					"client development headers (libwayland-dev + libxkbcommon-dev "
+					"on Debian/Ubuntu) or run the game on X11.";
 			return false;
 #endif
 		case NativeWindowKind::Win32:
@@ -264,4 +267,4 @@ bool createVulkanSurface(VkInstance instance, const NativeWindow& nativeWindow,
 #endif
 }
 
-} // namespace vv::platform
+}  // namespace vv::platform

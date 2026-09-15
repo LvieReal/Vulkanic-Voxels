@@ -28,52 +28,23 @@ function(vv_add_game_target target_name)
         $<$<CONFIG:Release>:-O3 -DNDEBUG -s>
     )
 
-    target_link_libraries(${target_name} PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
-    target_link_libraries(${target_name} PRIVATE Vulkan::Vulkan)
+    target_link_libraries(${target_name} PRIVATE ${VV_GLFW_TARGET} Vulkan::Vulkan)
+    target_link_libraries(${target_name} PRIVATE Threads::Threads)
+
+    # Vendored single-header libraries (stb_image decodes the voxel textures;
+    # see third_party/README.md). Header-only: nothing extra to link.
+    target_include_directories(${target_name} SYSTEM PRIVATE
+        "${CMAKE_SOURCE_DIR}/third_party")
+
+    # GLFW must not pull in an OpenGL header: presentation goes through
+    # Vulkan and no GL symbols are used (GLFW_INCLUDE_NONE is glfw's own
+    # switch for that, see its documentation).
+    target_compile_definitions(${target_name} PRIVATE GLFW_INCLUDE_NONE=1)
 
     # glm (header-only) location discovered in Dependencies.cmake.
     if(VV_GLM_INCLUDE_DIR)
         target_include_directories(${target_name} SYSTEM PRIVATE
             "${VV_GLM_INCLUDE_DIR}")
-    endif()
-
-    # Qt's (installed) private QtGui headers expose the QPA native interface,
-    # the only way to query some native handles (per-window Wayland
-    # wl_surface). Not every Qt distribution ships them, so they are strictly
-    # OPTIONAL: without them the game still runs on Windows, macOS and X11 via
-    # public native interfaces; only the native Wayland backend is lost (run
-    # via XWayland then, see README).
-    set(VV_HAVE_QT_QPA OFF)
-    if(TARGET Qt6::GuiPrivate)
-        target_link_libraries(${target_name} PRIVATE Qt6::GuiPrivate)
-        set(VV_HAVE_QT_QPA ON)
-    else()
-        # Some distributions install the private headers but not the
-        # Qt6::GuiPrivate CMake target; find them manually. They live in
-        # <qt-prefix>/include/QtGui/<version>/QtGui/qpa/.
-        get_filename_component(VV_QT_INSTALL_PREFIX
-            "${Qt6Gui_DIR}/../../.." ABSOLUTE)
-        file(GLOB VV_QPA_HEADER_GLOB
-            "${VV_QT_INSTALL_PREFIX}/include/QtGui/*/QtGui/qpa/qplatformnativeinterface.h")
-        if(VV_QPA_HEADER_GLOB)
-            list(GET VV_QPA_HEADER_GLOB 0 VV_QPA_HEADER)
-            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_HEADER}" DIRECTORY)  # .../QtGui/qpa
-            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_PRIVATE_DIR}" DIRECTORY)  # .../<version>/QtGui
-            get_filename_component(VV_QPA_PRIVATE_DIR "${VV_QPA_PRIVATE_DIR}" DIRECTORY)  # .../QtGui/<version>
-            target_include_directories(${target_name} SYSTEM PRIVATE
-                "${VV_QPA_PRIVATE_DIR}")
-            set(VV_HAVE_QT_QPA ON)
-        endif()
-    endif()
-    if(VV_HAVE_QT_QPA)
-        target_compile_definitions(${target_name} PRIVATE VV_HAVE_QT_QPA=1)
-        message(STATUS "Qt QPA native interface: available (full platform coverage)")
-    else()
-        message(STATUS
-            "Qt QPA native interface: unavailable - Windows, macOS and X11 "
-            "use public interfaces; the native Wayland backend needs Qt "
-            "private headers (run via XWayland instead: "
-            "QT_QPA_PLATFORM=xcb)")
     endif()
 
     if(WIN32)
@@ -90,48 +61,49 @@ function(vv_add_game_target target_name)
         # Nothing special: the MoltenVK surface backend is selected at run
         # time and needs no extra frameworks for surface creation.
     else()
-        # Linux/BSD: both the X11 (XCB) and Wayland Vulkan surface backends
-        # are compiled in when their headers are available. Only headers are
-        # needed; the WSI entry points come from the Vulkan loader.
-        find_package(PkgConfig QUIET)
-        if(PKG_CONFIG_FOUND)
-            pkg_check_modules(PC_XCB QUIET xcb)
-            pkg_check_modules(PC_WAYLAND_CLIENT QUIET wayland-client)
-        endif()
-
-        find_path(VV_XCB_INCLUDE_DIR xcb/xcb.h HINTS ${PC_XCB_INCLUDE_DIRS})
-        find_path(VV_WAYLAND_INCLUDE_DIR wayland-client-core.h
-            HINTS ${PC_WAYLAND_CLIENT_INCLUDE_DIRS})
-
-        if(VV_XCB_INCLUDE_DIR)
-            message(STATUS "Vulkan X11/XCB surface backend: enabled")
-            target_compile_definitions(${target_name} PRIVATE VV_HAVE_XCB=1)
-            target_include_directories(${target_name} SYSTEM PRIVATE
-                "${VV_XCB_INCLUDE_DIR}")
+        # Linux/BSD: the native-window handles come from GLFW's headers
+        # (glfw3native.h), which declare the X11 (xcb_connection_t,
+        # xcb_window_t) and Wayland (wl_display, wl_surface) types behind
+        # GLFW_EXPOSE_NATIVE_X11 / _WAYLAND.
+        #
+        # Which backend exists is GLFW's business (it picks one at run time);
+        # the definitions below only describe what the compiler has to see.
+        if(VV_GLFW_NULL_ONLY)
+            set(VV_GLFW_HAS_X11 OFF)
+            set(VV_GLFW_HAS_WAYLAND OFF)
+        elseif(glfw3_FOUND)
+            # System GLFW: probe the headers it was built against.
+            find_path(VV_GLFW_X11_HEADERS X11/Xlib.h)
+            find_path(VV_GLFW_WAYLAND_HEADERS wayland-client-core.h)
+            if(VV_GLFW_X11_HEADERS)
+                set(VV_GLFW_HAS_X11 ON)
+            endif()
+            if(VV_GLFW_WAYLAND_HEADERS)
+                set(VV_GLFW_HAS_WAYLAND ON)
+                target_include_directories(${target_name} SYSTEM PRIVATE
+                    "${VV_GLFW_WAYLAND_HEADERS}")
+            endif()
         else()
-            message(WARNING
-                "xcb headers not found - the X11 Vulkan surface backend is "
-                "disabled. Install libxcb1-dev (Debian/Ubuntu) or "
-                "libxcb-devel (Fedora) and reconfigure.")
+            # GLFW fetched from source builds both backends by default.
+            set(VV_GLFW_HAS_X11 ON)
+            set(VV_GLFW_HAS_WAYLAND ON)
         endif()
 
-        if(VV_WAYLAND_INCLUDE_DIR)
-            message(STATUS "Vulkan Wayland surface backend: enabled")
-            target_compile_definitions(${target_name} PRIVATE VV_HAVE_WAYLAND=1)
-            target_include_directories(${target_name} SYSTEM PRIVATE
-                "${VV_WAYLAND_INCLUDE_DIR}")
-        else()
-            message(WARNING
-                "Wayland client headers not found - the Wayland Vulkan "
-                "surface backend is disabled. Install libwayland-dev "
-                "(Debian/Ubuntu) or wayland-devel (Fedora) and reconfigure.")
+        if(VV_GLFW_HAS_X11)
+            message(STATUS "GLFW native-window backend: X11")
+            target_compile_definitions(${target_name} PRIVATE VV_WINDOW_BACKEND_X11=1)
         endif()
-
-        if(NOT VV_XCB_INCLUDE_DIR AND NOT VV_WAYLAND_INCLUDE_DIR)
-            message(FATAL_ERROR
-                "Neither X11 nor Wayland headers were found: the game cannot "
-                "create a Vulkan surface on this system. Install at least one "
-                "of: libxcb1-dev / libx11-dev, libwayland-dev.")
+        if(VV_GLFW_HAS_WAYLAND)
+            message(STATUS "GLFW native-window backend: Wayland")
+            target_compile_definitions(${target_name} PRIVATE VV_WINDOW_BACKEND_WAYLAND=1)
+        endif()
+        if(NOT VV_GLFW_HAS_X11 AND NOT VV_GLFW_HAS_WAYLAND AND NOT VV_GLFW_NULL_ONLY)
+            message(WARNING
+                "GLFW has neither the X11 nor the Wayland backend here, so "
+                "the game cannot create a window on this system. Install the "
+                "GLFW dependencies (libxcb/libxrandr/libxinerama/libxcursor/"
+                "libxi/libxkb + libwayland-dev + libxkbcommon-dev on "
+                "Debian/Ubuntu) and reconfigure.")
         endif()
     endif()
 
