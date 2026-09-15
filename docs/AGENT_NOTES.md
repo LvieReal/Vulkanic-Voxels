@@ -73,7 +73,11 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   penumbra but the owner read that as "bright spots", and it did not soften
   the steep-cliff side edges (a 1D top-plane limitation). Current state =
   pass 34: k*h/t in the clear branch, hard 0 in the below-top/solid branch.
-  kShadowSharpness in the shader tunes the sun's angular size / softness).
+  kShadowSharpness in the shader tunes the sun's angular size / softness.
+  Pass 37 adds a real 3D voxel SDF (src/voxel/SdfField.hpp) validated on the
+  CPU (testSdfSoftShadow3d) so the penumbra is soft on the vertical/side
+  edges too; the GPU port (3D SDF texture + the same sphere trace) is
+  pass 38).
   Exact binary shadows remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
   future foliage can attenuate and be marched through instead of
@@ -403,3 +407,61 @@ if the owner wants true-soft vertical casters.
 VALIDATED: after the revert, CPU tests green (plain k*h/t expectations),
 shader compiles to valid SPIR-V, release build clean, ctest green,
 offscreen smoke: no crash.
+
+Pass 37 (owner green-lit, option (a)): 3D VOXEL SDF FOR THE SDF SHADOW
+(CPU REFERENCE). Owner green-lit a "real and proper" 3D voxel SDF (based on
+established references, not reinvented) so the penumbra is soft on ALL
+edges - including the side/vertical edges the 1D top-plane model (pass-34
+k*h/t) cannot soften. SDF experimental path only (VV_SDF_SHADOWS /
+scene.misc.w > 0.5); the exact binary sunRayEscapes stays the bit-identical
+reference; no lighter lit-side penumbra (owner rule from pass 36).
+
+TECHNIQUE (the established real-time voxel-SDF soft-shadow pipeline:
+voxelize -> 3D distance field -> sphere-traced soft shadow; the k*h/t
+estimate from iquilezles.org/articles/rmshadows/):
+- src/voxel/SdfField.hpp (header-only; the CPU reference and the parity
+  source for the pass-38 GPU port): SdfField builds a 3D SDF from the
+  solid/air voxel grid. A two-pass chamfer distance transform (W1=1,
+  W2=sqrt(2), W3=sqrt(3), 26-neighbor) tracks, per cell, the NEAREST SOLID
+  CELL (the argmin seed). sample(p) is the exact L2 distance from p to the
+  nearest solid CUBE (min over the 3x3x3 cell neighborhood's seeds):
+  exactly 0 inside the solid, >0 in air. THE BUG THE FIRST ATTEMPT HIT: a
+  trilinear field of cell-center distances is NON-ZERO inside solid cells
+  near a boundary (it treats voxels as points), so the sphere trace skipped
+  over the surface (129 light leaks); the cube SDF (0 inside solid) fixes
+  it.
+- sphereTracedShadow(sdf, o, d, k=8, steps=160): sphere-trace toward the
+  sun; h = sdf.sample; hit (h < 1e-3) -> 0; fold k*h/t into the running min;
+  conservative step t += max(0.7*h, 0.05) (the chamfer field can slightly
+  over-estimate, so a factor <1 keeps the march from overshooting a surface
+  - the standard sphere-trace safety); low sun (d.y <= 0.05) -> 1; leaving
+  the field -> break (open space).
+
+TEST (testSdfSoftShadow3d, shadow-mirror namespace): makeSdfTestWorld =
+64x48x64 rolling ground (type 1) + MESA x[20,24) z[12,44) y[0,40) (type 2)
++ OVERHANG slab x[44,52) z[20,30) y[30,34) (type 3, air beneath),
+farDim=0 so the SDF box and the exact march see identical geometry. Invariants:
+(1) 2500 points over 4 surface kinds (ground top / mesa -x vertical face /
+mesa top / under the overhang): NO light leak (soft <= 0.5+1e-3 wherever the
+exact march is blocked), range [0,1], both shadowed and lit well exercised.
+(2) The mesa's SIDE edge (the shadow boundary running along its west face
+x=20): scan the GROUND SURFACE across it (x=5..14 at z=28.5, on the actual
+column top). Must cross both shadow (<0.25) and light (>0.75) and make no
+>0.7 jump between adjacent columns (a hard edge). Measured penumbra:
+1.0 -> 0.810 -> 0.153 -> 0.0 across x=9,10,11 (a real soft ramp, max step
+0.657); the 2.5D top-plane path has no data for the vertical face and makes
+a hard jump here. (The first draft of this check scanned a fixed y=16 line,
+which crosses the terrain surface itself - a hard in/out-of-ground edge, not
+a caster's shadow - and was wrong; it now follows the ground top.)
+(3) The overhang's UNDERSIDE (48,16,25): the exact march blocks it and the
+3D SDF keeps it at most half-lit (the 2.5D top-plane path sees only the
+column's top and can light it).
+
+RESULTS: CPU green - sdf3d shadow: 852 shadowed, 1648 lit of 2500; 0 leaks,
+0 out-of-range; the side scan crosses shadow+light with no hard jump; the
+overhang underside <= 0.5. Every other test green (no regressions).
+
+NEXT (pass 38): GPU port - build the same 3D SDF on the GPU (3D texture,
+or in-register) and run the same sphere trace in the SDF branch of
+sunShadow; the CPU binary is the parity source. Keep soft <= 0.5 wherever
+the exact march is dark; do NOT add a lighter lit-side penumbra term.

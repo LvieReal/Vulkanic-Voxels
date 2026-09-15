@@ -16,6 +16,7 @@
 #include "terrain/Noise.hpp"
 #include "terrain/TerrainGenerator.hpp"
 #include "voxel/Chunk.hpp"
+#include "voxel/SdfField.hpp"
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
@@ -2228,6 +2229,192 @@ void testSunShadowSdfMarch() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 3D voxel SDF soft shadow (pass 37): a REAL 3D distance field (distance to
+// the nearest solid surface, via a two-pass chamfer EDT) sphere-traced with
+// k*h/t, cross-checked against the exact binary march. The point: h is now
+// the true 3D distance to the surface - vertical faces and overhangs
+// included - so the shadow edges running along steep casters get the same
+// continuous penumbra as the top edge. That is exactly what the 2.5D
+// top-plane path (sunRayEscapesSdfMirror) cannot do.
+// ---------------------------------------------------------------------------
+
+// A world with a MESA (a finite block: vertical faces on every side, top
+// y=40) and an OVERHANG (a floating slab with air beneath) on rolling ground.
+// No far field, so the SDF box and the exact march see identical geometry.
+ShadowWorld makeSdfTestWorld() {
+	ShadowWorld w;
+	w.near.wx = 64;
+	w.near.wz = 64;
+	w.near.wh = 48;
+	w.near.cells.assign(std::size_t(w.near.wx) * w.near.wh * w.near.wz, 0);
+	for (int z = 0; z < w.near.wz; ++z) {
+		for (int x = 0; x < w.near.wx; ++x) {
+			const double h = 16.0 + 5.0 * std::sin(x * 0.29) +
+				4.0 * std::cos(z * 0.21);
+			const int top = int(std::floor(h));
+			for (int y = 0; y <= top; ++y) {
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 1;
+			}
+		}
+	}
+	// MESA: x in [20,24), z in [12,44), solid from the ground to y=40.
+	for (int z = 12; z < 44; ++z)
+		for (int x = 20; x < 24; ++x)
+			for (int y = 0; y < 40; ++y)
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 2;
+	// OVERHANG: x in [44,52), z in [20,30), a slab at y in [30,34) with air
+	// beneath (the ground there is only ~16).
+	for (int z = 20; z < 30; ++z)
+		for (int x = 44; x < 52; ++x)
+			for (int y = 30; y < 34; ++y)
+				w.near.cells[std::size_t(x) + std::size_t(y) * w.near.wx +
+						std::size_t(z) * w.near.wx * w.near.wh] = 3;
+	w.near.recomputeHeights();
+	// No far field: the SDF box and the exact march see the same geometry.
+	w.farDim = 0;
+	w.farCells.clear();
+	return w;
+}
+
+void testSdfSoftShadow3d() {
+	ShadowWorld w = makeSdfTestWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	// Build the 3D SDF over the near box (distance to the nearest solid).
+	vv::voxel::SdfField sdf;
+	sdf.build(w.near.wx, w.near.wh, w.near.wz,
+		[&](int x, int y, int z) { return w.near.at(x, y, z) != 0; });
+
+	std::uint64_t rng = 0x51ed270b85e8ab9full;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+	auto originOf = [&](const double p[3], const double n[3], double o[3]) {
+		for (int a = 0; a < 3; ++a) {
+			o[a] = p[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+		}
+	};
+	auto soft3d = [&](const double o[3]) {
+		const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+		return vv::voxel::sphereTracedShadow(sdf, of, sf);
+	};
+
+	// (1) Occlusion parity + range over a mix of surface kinds. The critical
+	// invariant: wherever the exact (center-ray) march is blocked, the soft
+	// shadow is at most half-lit (the dark-side penumbra) - never fully lit
+	// (no light leak through a vertical face or an overhang).
+	int outOfRange = 0, leaked = 0, shadowed = 0, lit = 0, total = 0;
+	for (int i = 0; i < 2500; ++i) {
+		double p[3], n[3] = {0.0, 1.0, 0.0};
+		const int kind = i % 4;
+		if (kind == 0) {  // rolling ground top
+			p[0] = next01() * 64.0;
+			p[2] = next01() * 64.0;
+			const unsigned b = w.near.boundAt(int(std::floor(p[0])),
+				int(std::floor(p[2])));
+			p[1] = b == 0xFFFFu ? 10.0 : double(b);
+		} else if (kind == 1) {  // mesa -x vertical face (x=20)
+			p[0] = 20.0;
+			p[1] = 1.0 + next01() * 38.0;
+			p[2] = 12.0 + next01() * 32.0;
+			n[0] = -1.0; n[1] = 0.0; n[2] = 0.0;
+		} else if (kind == 2) {  // mesa top
+			p[0] = 20.0 + next01() * 4.0;
+			p[1] = 40.0;
+			p[2] = 12.0 + next01() * 32.0;
+		} else {  // under the overhang slab
+			p[0] = 44.0 + next01() * 8.0;
+			p[2] = 20.0 + next01() * 10.0;
+			const unsigned b = w.near.boundAt(int(std::floor(p[0])),
+				int(std::floor(p[2])));
+			p[1] = b == 0xFFFFu ? 10.0 : double(b);
+		}
+		double o[3];
+		originOf(p, n, o);
+		++total;
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const float soft = soft3d(o);
+		if (soft < -1e-9f || soft > 1.0f + 1e-9f) {
+			++outOfRange;
+		}
+		if (!exactLit && soft > 0.5 + 1e-3f) {
+			if (leaked <= 3) {
+				std::printf("FAIL sdf3d leak at (%.2f,%.2f,%.2f): exact "
+					"shadowed, soft %.3f\n", p[0], p[1], p[2], double(soft));
+			}
+			++leaked;
+		}
+		exactLit ? ++lit : ++shadowed;
+	}
+	check(outOfRange == 0, "sdf3d shadow: visibility stays in [0, 1]");
+	check(leaked == 0,
+		"sdf3d shadow: no light leak (at most half-lit where exact is dark)");
+	check(shadowed > 200 && lit > 200,
+		"sdf3d shadow: both outcomes well exercised");
+	std::printf("sdf3d shadow: %d shadowed, %d lit of %d; %d leaks, %d "
+		"out-of-range\n",
+		shadowed, lit, total, leaked, outOfRange);
+
+	// (2) The mesa's SIDE edge (the shadow boundary running along its west
+	// face, x=20) is a smooth ramp under the 3D SDF, not a hard 0->1 jump.
+	// Scan the GROUND SURFACE across that edge (x from 5 to 14 at z=28, on
+	// the actual ground top): the 3D SDF must transition lit<->shadowed over
+	// a few voxels (the side penumbra), and must not make a >0.7 jump between
+	// adjacent columns (a hard edge). The 2.5D top-plane path has no data for
+	// the vertical face and makes a hard jump here.
+	const double scanZ = 28.0;
+	int hardJumps = 0;
+	double prevSoft = 1.0;
+	bool seenShadow = false, seenLit = false;
+	for (int x = 5; x <= 14; ++x) {
+		const unsigned b = w.near.boundAt(x, 28);
+		double p[3] = {double(x) + 0.5, b == 0xFFFFu ? 10.0 : double(b),
+			(scanZ + 0.5)};
+		double n[3] = {0.0, 1.0, 0.0};
+		double o[3];
+		originOf(p, n, o);
+		const float soft = soft3d(o);
+		if (soft < 0.25) {
+			seenShadow = true;
+		}
+		if (soft > 0.75) {
+			seenLit = true;
+		}
+		if (std::abs(soft - prevSoft) > 0.7) {
+			++hardJumps;
+		}
+		prevSoft = soft;
+	}
+	check(seenShadow && seenLit,
+		"sdf3d side edge: scan crosses both shadow and light");
+	check(hardJumps == 0,
+		"sdf3d side edge: no hard 0->1 jump along the vertical-caster edge");
+
+	// (3) The overhang's UNDERSIDE: a point on the ground directly beneath
+	// the slab is in the slab's shadow (the exact march blocks it), and the
+	// 3D SDF keeps it at most half-lit (the 2.5D top-plane path sees only the
+	// column's top and can light it).
+	{
+		double p[3] = {48.0, 16.0, 25.0};  // under the slab (ground ~16)
+		double n[3] = {0.0, 1.0, 0.0};
+		double o[3];
+		originOf(p, n, o);
+		const bool exactLit = sunRayEscapesMirror(w, o, sun);
+		const float soft = soft3d(o);
+		check(!exactLit, "sdf3d overhang: point under the slab is shadowed");
+		check(soft <= 0.5 + 1e-3f,
+			"sdf3d overhang: underside stays at most half-lit");
+	}
+}
+
 }  // namespace
 }  // namespace
 
@@ -2574,6 +2761,7 @@ int main() {
 	testFarMarch();
 	testSunShadowMarch();
 	testSunShadowSdfMarch();
+	testSdfSoftShadow3d();
 	testStreamPriority();
 	testVoxelTextures();
 
