@@ -75,6 +75,15 @@ class GameWindow final {
 	std::uint32_t framebufferWidth() const { return m_framebufferWidth; }
 	std::uint32_t framebufferHeight() const { return m_framebufferHeight; }
 
+	// Checks that a maximized window sits where a maximized window belongs (its
+	// content area at the top-left of the monitor's work area, give or take a
+	// caption) and re-runs the sequence when it does not: restore, move to the
+	// centred restore rect, maximize again. Only called while the window is
+	// still hidden, and only on the backends whose position query is live
+	// before the window is mapped (Win32; see GameWindow::init).
+	void verifyMaximizedPlacement(int areaX, int areaY, int restoreX,
+														int restoreY);
+
 	// Pumps events until the framebuffer size has stopped changing (three
 	// identical samples, at least 30 ms apart in total) or maxWaitSeconds
 	// elapsed, and keeps the reported size current.

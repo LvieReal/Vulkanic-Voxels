@@ -89,13 +89,20 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
 	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-	// The window is created hidden and shown at the end of this function, with
-	// the maximize state already set: GLFW applies GLFW_MAXIMIZED in each
-	// backend's create path (X11 sets _NET_WM_STATE before mapping, Wayland
-	// remembers it for the toplevel, Win32 creates the window with WS_MAXIMIZE,
-	// Cocoa zooms), so it comes up maximized without ever flashing at the
-	// restored size.
-	glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+	// The window is created hidden, sized and placed FIRST, and maximized only
+	// afterwards, still hidden (pass 46). The GLFW_MAXIMIZED create hint cannot
+	// be used here: on Win32 it puts WS_MAXIMIZE on the window at creation
+	// (win32_window.c creates with the style, and Windows maximizes such a
+	// window there and then), so the glfwSetWindowPos() below would move a
+	// window that is already maximized - Windows keeps the maximized size but
+	// applies the move to the maximized window, and the window comes up with
+	// its top-left corner somewhere near the middle of the screen. Maximizing
+	// explicitly after the placement takes each backend's pre-map path
+	// instead: Win32 maximizeWindowManually() computes the work-area rect
+	// itself, X11 appends _NET_WM_STATE_MAXIMIZED_{HORZ,VERT} to the unmapped
+	// window, Wayland records the state for the toplevel it creates on show,
+	// Cocoa zooms. So the placement stays window-manager policy and the size
+	// this process asked for stays the geometry the window restores to.
 	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
 	// MAXIMIZED BY DEFAULT, with half the monitor as the size to restore to
@@ -140,21 +147,40 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 		return false;
 	}
 
+	// Where the restore-size window goes: centred in the work area.
+	const int restoreX = areaX + (areaWidth - restoreWidth) / 2;
+	const int restoreY = areaY + (areaHeight - restoreHeight) / 2;
+
 	// Centre the restored-size window in the work area. Wayland does not let a
 	// client place its windows and reports the attempt as an error; the
 	// compositor decides, which is fine (it will be maximized anyway).
 	const int platform = glfwGetPlatform();
 	if (platform != GLFW_PLATFORM_WAYLAND && areaWidth > 0 && areaHeight > 0) {
-		glfwSetWindowPos(m_window, areaX + (areaWidth - restoreWidth) / 2,
-										 areaY + (areaHeight - restoreHeight) / 2);
+		glfwSetWindowPos(m_window, restoreX, restoreY);
 	}
 
 	glfwSetWindowSizeLimits(m_window, minWidth, minHeight, GLFW_DONT_CARE,
 												 GLFW_DONT_CARE);
 	glfwSetWindowUserPointer(m_window, this);
 
-	// Shown last: the window is already marked maximized, and the size above is
-	// the geometry the window manager restores to when the user un-maximizes.
+	// Maximize while the window is still hidden and after the position above:
+	// the window manager places the maximized window (that rectangle is its
+	// policy) and keeps the centred half-monitor rect as the geometry to
+	// restore to on un-maximize.
+	glfwMaximizeWindow(m_window);
+
+	// On Win32 - the only backend whose position query is live before the
+	// window is mapped - check where the maximize actually landed and re-apply
+	// the sequence if it is not where a maximized window belongs (that is what
+	// the user does by hand when grabbing the title bar fixes it). The other
+	// backends cannot be asked here: X11 would report the position this process
+	// requested, and Wayland never reports one.
+	if (platform == GLFW_PLATFORM_WIN32) {
+		verifyMaximizedPlacement(areaX, areaY, restoreX, restoreY);
+	}
+
+	// Shown last: the window is already maximized and placed, and the size
+	// above is the geometry the window manager restores to on un-maximize.
 	glfwShowWindow(m_window);
 
 	int fbWidth = 0;
@@ -217,6 +243,43 @@ void GameWindow::waitEvents() {
 	}
 }
 
+void GameWindow::verifyMaximizedPlacement(int areaX, int areaY, int restoreX,
+																		 int restoreY) {
+	if (m_window == nullptr) {
+		return;
+	}
+	// NOTE: GLFW's GLFW_MAXIMIZED flag is not consulted here. On Win32 it is
+	// driven by WM_SIZE messages, so it is still false at this point (the
+	// window has never been shown); the maximize this checks was requested
+	// unconditionally one line above and, on Win32, is applied by
+	// maximizeWindowManually() directly, without messaging.
+
+	// 64 px of slack covers the caption and frame of a correctly maximized
+	// window, and is far less than the half-screen offset a misplaced one has.
+	constexpr int kTolerance = 64;
+	int x = 0;
+	int y = 0;
+	glfwGetWindowPos(m_window, &x, &y);
+	if (x >= areaX - kTolerance && x <= areaX + kTolerance &&
+			y >= areaY - kTolerance && y <= areaY + kTolerance) {
+		return;
+	}
+
+	std::fprintf(stderr,
+							 "[vv] window: the maximize left the window at %d,%d instead "
+							 "of the work area origin %d,%d; re-applying the placement\n",
+							 x, y, areaX, areaY);
+	glfwRestoreWindow(m_window);
+	glfwSetWindowPos(m_window, restoreX, restoreY);
+	glfwMaximizeWindow(m_window);
+
+	int movedX = 0;
+	int movedY = 0;
+	glfwGetWindowPos(m_window, &movedX, &movedY);
+	std::fprintf(stderr, "[vv] window: maximized placement is now %d,%d\n",
+							 movedX, movedY);
+}
+
 void GameWindow::settleFramebufferSize(double maxWaitSeconds) {
 	if (m_window == nullptr) {
 		return;
@@ -268,6 +331,30 @@ void GameWindow::settleFramebufferSize(double maxWaitSeconds) {
 								 "window manager)\n",
 								 m_framebufferWidth, m_framebufferHeight,
 								 static_cast<int>(waited * 1000.0 + 0.5));
+	}
+
+	// One geometry line after the window manager has had its say: the size the
+	// frames use, whether the window came up maximized, and where its content
+	// area sits. A report about the launch window then carries its own numbers.
+	const bool maximized =
+			glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) == GLFW_TRUE;
+	if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) {
+		// Wayland does not tell a client where its window is; asking would print
+		// through the GLFW error callback.
+		std::fprintf(stderr,
+								 "[vv] window: %ux%u framebuffer pixels, maximized %s "
+								 "(Wayland does not report the position)\n",
+								 m_framebufferWidth, m_framebufferHeight,
+								 maximized ? "yes" : "no");
+	} else {
+		int contentX = 0;
+		int contentY = 0;
+		glfwGetWindowPos(m_window, &contentX, &contentY);
+		std::fprintf(stderr,
+								 "[vv] window: %ux%u framebuffer pixels, maximized %s, "
+								 "content at %d,%d\n",
+								 m_framebufferWidth, m_framebufferHeight,
+								 maximized ? "yes" : "no", contentX, contentY);
 	}
 }
 

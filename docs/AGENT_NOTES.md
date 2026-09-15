@@ -1002,3 +1002,94 @@ check: launch looks right from the first frame (no glitch to clear by moving the
 window) while the window still comes up maximized and un-maximizes to half the
 monitor, on both X11 and Wayland. If an artifact survives, the startup log now
 carries the window size, the settled size and the swapchain extent.
+
+## Pass 46: maximize goes through the window manager, not around it
+
+OWNER (on-device, Windows/Win32, after pass 45): "still behaves the same, at
+least on windows. it looks like it maximizes, but does not get centered to
+screen, instead the top left corner of the window sits in center." With the
+log:
+
+  [vv] window: 1920x1009 window pixels -> 1920x1009 framebuffer pixels
+               (content scale 1.00x1.00, platform 393217)
+  [vv] window: maximized (work area 1920x1032, restores to 960x516),
+               decorations on
+  [vv] window backend: Win32
+  ...
+  [vv] swapchain: 1920x1009 (window reports 1920x1009)
+
+Read it carefully, because it splits pass 45's problem in two: the SIZE is
+right from the first frame (no "settled to ..." line - the size was already the
+maximized one - and the swapchain matches the window), so pass 45's
+size/reconciliation work did its job. What is wrong is the PLACEMENT: 1920x1009
+of client area against a 1920x1032 work area is a caption-height difference,
+i.e. a properly maximized decorated window, but the window's origin is not the
+work area origin.
+
+ROOT CAUSE (GLFW 3.5.1 win32_window.c). The GLFW_MAXIMIZED create hint does not
+only record a wish: it puts `WS_MAXIMIZE` into the window style at creation
+(:1356-1360) and `maximizeWindowManually()` (:481) then sizes the window to the
+monitor work area with a SetWindowPos. Windows treats a window created with
+WS_MAXIMIZE as maximized from that moment. The pass-44/45 code then ran
+`glfwSetWindowPos()` to centre the window in the work area - and that is
+`SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER |
+SWP_NOSIZE)` (:1635) on an ALREADY MAXIMIZED window. A move of a maximized
+window keeps its size (hence 1920x1009, "it looks like it maximizes") but its
+origin becomes the value passed - half the work area in from the corner, i.e.
+"the top left corner of the window sits in center". This is Win32-specific in
+symptom (X11 and Wayland apply placement at map time and their window managers
+own the maximized rectangle) and unavoidable with the create-hint ordering: the
+hint applies the maximize before the app can place the window.
+
+FIX. Placement first, maximize second, both while the window is still hidden:
+
+* The GLFW_MAXIMIZED hint is gone (`GLFW_VISIBLE = false` stays). The window is
+  created at the centred restore size, `glfwSetWindowPos()` places it (still
+  skipped on Wayland, where the platform reports placement as unavailable), and
+  `glfwMaximizeWindow()` is called AFTERWARDS, before `glfwShowWindow()`. Each
+  backend then takes its pre-map path: Win32 `maximizeWindowManually()`
+  computes the work-area rect itself and only moves/sizes a window that is NOT
+  maximized, X11 appends `_NET_WM_STATE_MAXIMIZED_{HORZ,VERT}` to the unmapped
+  window (`_glfwMaximizeWindowX11` -> the `!visible` branch), Wayland records
+  the state for the toplevel it creates on show, Cocoa zooms. Nothing moves a
+  maximized window any more, the maximized rectangle is the window manager's
+  policy (work area, panels, decoration) and the centred half-monitor rect
+  stays the geometry the window un-maximizes to.
+* `GameWindow::verifyMaximizedPlacement()` runs on Win32 only, while the window
+  is still hidden: the content area must be at the work area origin (64 px of
+  slack for caption/frame, against an error of half the screen), and if it is
+  not, the sequence is re-applied - restore, move to the centred rect, maximize
+  - exactly what the user does by hand by grabbing the title bar. This is a
+  safety net, not the fix; it also exists because on Win32 the position query is
+  live for a hidden window (ClientToScreen), while X11 would report the position
+  this process requested and Wayland does not report one at all. It does NOT
+  gate on GLFW_MAXIMIZED: on Win32 that flag is driven by WM_SIZE messages and
+  is therefore still false for a window that has never been shown, even though
+  `maximizeWindowManually()` has already applied the maximize.
+* One more diagnostic line, printed by `settleFramebufferSize()` after the
+  window manager has had its say:
+
+  `[vv] window: 1920x1009 framebuffer pixels, maximized yes, content at 0,0`
+  (on Wayland: `... maximized yes (Wayland does not report the position)`).
+
+  A launch-window report from any machine now carries the size the frames use,
+  whether the window reports itself maximized, and where its content sits.
+
+VERIFIED IN THE SANDBOX (deps /home/user/.cache/vv-deps rebuilt after an
+environment reset wiped it and build/: configure + build clean for Release and
+Debug, no warnings; ctest green in both, 5.8 s / 25.5 s; glslangValidator -V
+exit 0). `VV_PLATFORM=null` smoke: the null backend applies the synchronous
+maximize through the new call order and reports itself maximized
+(`[vv] window: 960x400 framebuffer pixels, maximized yes, content at 480,277` -
+480,277 is exactly the centred restore rect in the null monitor's work area),
+then exits 1 through the documented "no native window handle" path. There is no
+window manager in the sandbox, so the Win32 branch itself is reasoned from the
+GLFW source above and cannot be run here.
+
+NOT PROVEN HERE: the real Win32 maximize/placement. Owner check: launch on
+Windows shows a maximized window filling the screen from the top-left of the
+work area (no half-screen offset), un-maximizing gives the centred half-monitor
+window, and the new log line says `maximized yes` with `content at` the work
+area origin. If the offset is still there, the new line says where the window
+is and whether Windows agrees it is maximized - and the "re-applying the
+placement" line says whether the safety net had to step in.
