@@ -188,37 +188,22 @@ private:
 // o/d are in voxel units (field-local); d must be a unit vector with
 // d.y > ~0 (the sun is up).
 //
-// This variant reports where the march STOPPED: outExit/outExitT/
-// outVisibility (all optional) receive the hand-off point, the distance
-// travelled along the ray and the accumulated visibility, and the return
-// value is true - the caller MUST continue the ray with a wider traversal
-// (on the GPU, the shader's whole-region 2.5D march; see sunRayEscapesSdf).
-//
-// Pass 41 (mirrors the shader's sunRayEscapesSdf3d): the hand-off point is a
-// FIXED distance along the ray (`traceLength` voxels from the start point),
-// not the box crossing. Pass 40 handed the ray over where it left the box,
-// and the box recenters on the camera's chunk every crossing - so the same
-// ground got a different answer depending on where the box happened to sit,
-// which is what showed up as flicker on a rebuild. Measured on real terrain
-// (probe_rebuild_swap): with the crossing hand-off 806/4239 = 19.0% of the
-// window's outer band ground columns moved by > 0.05 visibility across a
-// one-chunk recenter; with the fixed length, 0 of the columns the two boxes
-// share move at all, and what is left is the band where the box END is closer
-// than the fixed length (4.2% overall, 12% of that band).
-//
-// Returns false when the field hands nothing over, and outVisibility then
-// says which case it is: 0 = the march hit a surface (fully shadowed), 1 =
-// there is no field term here (a low sun; a start point outside the box; or
-// the box ending closer than the fixed length) and the caller must run the
-// plain 2.5D march from the start point - the VV_SDF_SHADOWS=0 path.
-//
-// The box's Y faces are the world floor and sky: the same plane wherever the
-// box sits, so a ray that leaves through them hands over there.
+// This variant reports where the march STOPPED when it leaves the field (or
+// spends `steps`) without hitting anything: outExit/outExitT/outVisibility
+// (all optional) receive the exit point, the distance travelled and the
+// accumulated visibility, and the return value is true - the caller MUST
+// continue the ray with a wider traversal. outExit is the point where the
+// ray crosses the field boundary (not the first sample past it), so the
+// continuation starts exactly where the field stops. On the GPU the field
+// covers only the 6x6 chunks around the camera, so leaving it is NOT open
+// space: the shader hands the ray to its whole-region 2.5D march (see
+// sunRayEscapesSdf3d, pass 40). Returns false when the field resolved the
+// ray itself (a hit, a low sun, or the march never left it): outVisibility
+// is then the final answer.
 inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
                                     const float d[3], float outExit[3],
                                     float* outExitT, float* outVisibility,
-                                    float sharpness = 8.0f, int steps = 160,
-                                    float traceLength = 64.0f) {
+                                    float sharpness = 8.0f, int steps = 160) {
     if (outExitT != nullptr) {
         *outExitT = 0.0f;
     }
@@ -230,42 +215,39 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         }
         return false;
     }
-    const float lo[3] = {0.0f, 0.0f, 0.0f};
+    // Pass 40 (shader mirror): hand the ray over at the box CROSSING, not at
+    // the first sample past it, so a step (up to 0.7 * h) cannot skip a
+    // caster sitting in the strip just outside the box. 0 when the origin
+    // already starts outside - those rays belong to the wider march alone.
     const float hi[3] = {float(sdf.nx()), float(sdf.ny()), float(sdf.nz())};
-    if (o[0] < lo[0] || o[0] >= hi[0] || o[1] < lo[1] || o[1] >= hi[1] ||
-        o[2] < lo[2] || o[2] >= hi[2]) {
-        if (outVisibility != nullptr) {
-            *outVisibility = 1.0f;  // no field data under this ray
-        }
-        return false;
-    }
-    // Where the ray leaves the box: any face, and the lateral faces alone.
-    // The lateral exit is the one that MOVES with the box, so it is the one
-    // that decides whether the fixed term is available at all.
-    float tExit = 1e30f;
-    float tExitLateral = 1e30f;
-    for (int a = 0; a < 3; ++a) {
-        if (std::abs(d[a]) > 1e-6f) {
-            const float face = (d[a] > 0.0f) ? hi[a] : lo[a];
-            const float t = (face - o[a]) / d[a];
-            tExit = std::min(tExit, t);
-            if (a != 1) {
-                tExitLateral = std::min(tExitLateral, t);
+    float tExit = 0.0f;
+    if (o[0] >= 0.0f && o[0] < hi[0] && o[1] >= 0.0f && o[1] < hi[1] &&
+        o[2] >= 0.0f && o[2] < hi[2]) {
+        tExit = 1e30f;
+        for (int a = 0; a < 3; ++a) {
+            if (std::abs(d[a]) > 1e-6f) {
+                const float face = (d[a] > 0.0f) ? hi[a] : 0.0f;
+                tExit = std::min(tExit, (face - o[a]) / d[a]);
             }
         }
     }
-    if (tExitLateral < traceLength) {
-        if (outVisibility != nullptr) {
-            *outVisibility = 1.0f;  // the box ends before the fixed term
-        }
-        return false;
-    }
-    const float tCap = std::min(traceLength, tExit);
     float visibility = 1.0f;
     float t = 0.0f;
     for (int i = 0; i < steps; ++i) {
-        if (t >= tCap) {
-            break;
+        // Left the field: report where, so the caller can keep marching.
+        if (t >= tExit) {
+            if (outExit != nullptr) {
+                outExit[0] = o[0] + d[0] * tExit;
+                outExit[1] = o[1] + d[1] * tExit;
+                outExit[2] = o[2] + d[2] * tExit;
+            }
+            if (outExitT != nullptr) {
+                *outExitT = tExit;
+            }
+            if (outVisibility != nullptr) {
+                *outVisibility = visibility;
+            }
+            return true;
         }
         const float px = o[0] + d[0] * t;
         const float py = o[1] + d[1] * t;
@@ -284,16 +266,14 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         // surface the chamfer field slightly over-estimates.
         t += std::max(h * 0.7f, 0.05f);
     }
-    // Hand the ray over: at the fixed length (or at the box's Y face, or at
-    // the last sample if the step budget ran out first).
-    const float tHand = std::min(t, tCap);
+    // Budget spent inside the field: the shader hands the rest over as well.
     if (outExit != nullptr) {
-        outExit[0] = o[0] + d[0] * tHand;
-        outExit[1] = o[1] + d[1] * tHand;
-        outExit[2] = o[2] + d[2] * tHand;
+        outExit[0] = o[0] + d[0] * t;
+        outExit[1] = o[1] + d[1] * t;
+        outExit[2] = o[2] + d[2] * t;
     }
     if (outExitT != nullptr) {
-        *outExitT = tHand;
+        *outExitT = t;
     }
     if (outVisibility != nullptr) {
         *outVisibility = visibility;
@@ -301,40 +281,18 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
     return true;
 }
 
-// The field's own term, with NO hand-off: the march runs until it hits a
-// surface or spends its step budget, and treats the box's edge as open space -
-// the pass-38 shader behavior, which is what the field-vs-voxel tests means by
-// "the SDF's soft shadow" (they build a field over the whole test world, so
-// nothing is lost). The SHIPPED path is sphereTracedShadowExits above: it
-// stops at a fixed distance and lets the 2.5D march carry the rest.
-inline float sphereTracedShadowFieldOnly(const SdfField& sdf, const float o[3],
-                                         const float d[3],
-                                         float sharpness = 8.0f,
-                                         int steps = 160) {
+// The march alone, treating "left the field" as open space - the pre-pass-40
+// shader behavior, kept for the field-only tests (the field must agree with
+// the voxels it was built from) and probes. Returns visibility in [0, 1].
+inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
+                                const float d[3], float sharpness = 8.0f,
+                                int steps = 160) {
     if (d[1] <= 0.05f) {
         return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
     }
-    const float lo[3] = {0.0f, 0.0f, 0.0f};
-    const float hi[3] = {float(sdf.nx()), float(sdf.ny()), float(sdf.nz())};
     float visibility = 1.0f;
-    float t = 0.0f;
-    for (int i = 0; i < steps; ++i) {
-        const float px = o[0] + d[0] * t;
-        const float py = o[1] + d[1] * t;
-        const float pz = o[2] + d[2] * t;
-        if (px < lo[0] || px >= hi[0] || py < lo[1] || py >= hi[1] ||
-            pz < lo[2] || pz >= hi[2]) {
-            break;  // left the field: open space as far as it can tell
-        }
-        const float h = sdf.sample(px, py, pz);
-        if (h < 1e-3f) {
-            return 0.0f;  // hit the surface: fully shadowed from here
-        }
-        visibility = std::min(
-            visibility,
-            std::clamp(sharpness * h / std::max(t, 1e-4f), 0.0f, 1.0f));
-        t += std::max(h * 0.7f, 0.05f);
-    }
+    sphereTracedShadowExits(sdf, o, d, nullptr, nullptr, &visibility,
+                            sharpness, steps);
     return visibility;
 }
 

@@ -83,19 +83,15 @@ The full-detail terrain region is the default. Set `VV_FAR_LOD=1` to enable
 the optional coarse terrain field beyond it; without that variable LOD is off,
 so no far-field build or seam ring is generated. Set `VV_SDF_SHADOWS=1` to try
 the SDF soft-shadow marcher: a 3D voxel SDF of the near terrain (a
-camera-centered 8x8-chunk box over the full world height, rebuilt on a
+camera-centered 6x6-chunk box over the full world height, rebuilt on a
 background thread on every region change) is sphere-traced toward the sun with
 the plain Quilez `k*h/t` penumbra estimate, so shadow edges are soft on
 vertical / side casters too and not just on flat tops (`kShadowSharpness` in
-the shader tunes the softness). The field's term covers a FIXED 64 voxels of
-the sun ray, and the rest of the ray goes to the 2.5D penumbra traversal
-(seeded with the distance already marched and the visibility so far), so
-casters outside the field still shadow the frame and no part of the answer
-depends on where the window happens to sit - which is what used to re-flow the
-shadows on every rebuild. A column whose window ends before those 64 voxels, or
-that starts outside it, gets the plain 2.5D march (the `VV_SDF_SHADOWS=0`
-path), and until the first box lands the same 2.5D traversal runs from the
-surface. Exact binary sun shadows remain the default
+the shader tunes the softness). Only the box is
+field-aware: a shadow ray that leaves it hands over to the 2.5D penumbra
+traversal (keeping the distance already marched and the visibility so far), so
+casters outside the box still shadow the frame; until the first box lands the
+same 2.5D traversal runs from the surface. Exact binary sun shadows remain the default
 reference; `VV_SHADOW_SHARP=1` explicitly selects them.
 
 Both the X11 (XCB) and Wayland surface backends are compiled in when their

@@ -2124,34 +2124,23 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 	return visibility;
 }
 
-// Mirror of the shader's sunRayEscapesSdf3d (pass 41): sphere trace the ray
-// through the (box-local) SDF for a FIXED length (traceLength voxels of ray),
-// then hand the rest of the ray to the whole-region 2.5D march, seeded with
-// the distance travelled and the visibility the field accumulated. The
-// hand-off point is a function of the shaded point and the sun alone - never
-// of where the box sits - which is what keeps a rebuild from moving any
-// shadow the field is responsible for. `boxOrigin` is where the field's
-// (0,0,0) sits in world coordinates.
-//
-// When the field has no term to contribute (the box ends closer than the
-// fixed length, the point is outside it, or the sun is too low) the composite
-// is exactly the plain 2.5D march from the shaded point, i.e. the
-// VV_SDF_SHADOWS=0 path - the shader's fallback.
+// Mirror of the shader's sunRayEscapesSdf3d + its pass-40 hand-off: sphere
+// trace the ray through the (box-local) SDF, and when the march leaves the
+// field - or spends its step budget - continue in world space with the
+// whole-region 2.5D march, seeded with the distance travelled and the
+// visibility the field accumulated. `boxOrigin` is where the field's (0,0,0)
+// sits in world coordinates.
 double sdf3dHandoffMirror(const vv::voxel::SdfField& sdf,
 		const double boxOrigin[3], const ShadowWorld& w, const double o[3],
-		const double dir[3], double traceLength = 64.0) {
-	const float of[3] = {float(o[0] - boxOrigin[0]), float(o[1] - boxOrigin[1]),
-			float(o[2] - boxOrigin[2])};
+		const double dir[3]) {
+	const float of[3] = {float(o[0] - boxOrigin[0]),
+			float(o[1] - boxOrigin[1]), float(o[2] - boxOrigin[2])};
 	const float df[3] = {float(dir[0]), float(dir[1]), float(dir[2])};
 	float exit[3] = {0.0f, 0.0f, 0.0f};
 	float exitT = 0.0f;
 	float vis = 1.0f;
-	if (!vv::voxel::sphereTracedShadowExits(sdf, of, df, exit, &exitT, &vis,
-											8.0f, 160, float(traceLength))) {
-		if (vis <= 0.0f) {
-			return 0.0;  // the field's own march hit the surface
-		}
-		return sunRayEscapesSdfMirror(w, o, dir, 0.0, 1.0);  // no field term
+	if (!vv::voxel::sphereTracedShadowExits(sdf, of, df, exit, &exitT, &vis)) {
+		return double(vis);
 	}
 	const double exitWorld[3] = {boxOrigin[0] + double(exit[0]),
 			boxOrigin[1] + double(exit[1]), boxOrigin[2] + double(exit[2])};
@@ -2341,20 +2330,13 @@ bool nearSolidOnRay(const ShadowWorld& w, const double o[3],
 	return false;
 }
 
-// Pass 40/41: the 6x6-chunk SDF box is not the world. Its whole point is to
-// soften the near shadows; casters outside it still shadow the ray, so the
-// shader hands the ray it cannot cover to the 2.5D march instead of treating
-// it as open space. Pass 41 moved that hand-off to a FIXED distance along the
-// ray (64 voxels), so it no longer moves when the box recenters.
-//
-// This pins both halves of the pass-41 contract:
-//   (1) a box that ends closer than the fixed trace gives NO field term at
-//       all: the composite is exactly the plain 2.5D march (which is why the
-//       band next to the box's faces cannot flicker from the box moving),
-//   (2) a trace short enough to fit inside the box (8 voxels, the same code
-//       path the shipped 64 takes when the box is big enough) hands the ray
-//       over mid-flight and still never leaks: the continuation finds the
-//       caster the field could not see.
+// Pass 40: the 6x6-chunk SDF box is not the world. Its whole point is to
+// soften the near shadows; casters OUTSIDE it still shadow the ray, so
+// sunRayEscapesSdf3d hands the ray to the 2.5D march at the boundary instead
+// of treating it as open space. Pins (1) the scenario - a caster outside the
+// box, where the field alone leaks full light, (2) no leak once the hand-off
+// continues the ray, and (3) that outside the field the composite is exactly
+// the 2.5D march.
 void testSdfBoxHandoff() {
 	ShadowWorld w = makeSdfTestWorld();
 	double sun[3] = {0, 0, 0};
@@ -2373,7 +2355,6 @@ void testSdfBoxHandoff() {
 	int darkened = 0;  // the continuation found occlusion the field missed
 	int judged = 0;    // shadowed columns a real cell blocks (usable oracle)
 	int unjudged = 0;  // shadowed only in the height-field model: skipped
-	int plainExact = 0, shortDarkened = 0, shortLeaks = 0;
 	for (int x = 6; x < 16; ++x) {
 		for (int z = 12; z < 44; z += 2) {
 			const unsigned bound = w.near.boundAt(x, z);
@@ -2388,25 +2369,12 @@ void testSdfBoxHandoff() {
 			}
 			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 			const float df[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
-			// The field's own term ("can it cover the ray by itself?"), read
-			// with a trace short enough to fit inside this 16-voxel box.
-			const double softFieldOnly = double(
-					vv::voxel::sphereTracedShadowFieldOnly(sdf, of, df));
+			const double softFieldOnly =
+					double(vv::voxel::sphereTracedShadow(sdf, of, df));
 			const double softHandoff =
 					sdf3dHandoffMirror(sdf, boxOrigin, w, o, sun);
-			const double softShort = sdf3dHandoffMirror(sdf, boxOrigin, w, o, sun, 8.0);
-			// (1) The shipped trace (64) does not fit this 16-voxel box, so the
-			// composite must be the plain march, to the last bit.
-			if (std::abs(softHandoff -
-					double(sunRayEscapesSdfMirror(w, o, sun, 0.0, 1.0))) < 1e-12) {
-				++plainExact;
-			}
 			if (softHandoff < softFieldOnly - 1e-6) {
 				++darkened;
-			}
-			// (2) A trace that fits hands over mid-flight and still blocks.
-			if (softShort < softFieldOnly - 1e-6) {
-				++shortDarkened;
 			}
 			if (sunRayEscapesMirror(w, o, sun)) {
 				++lit;
@@ -2426,305 +2394,28 @@ void testSdfBoxHandoff() {
 			if (softHandoff > 0.5 + 1e-3) {
 				++leaksHandoff;
 			}
-			if (softShort > 0.5 + 1e-3) {
-				++shortLeaks;
-			}
 		}
 	}
 	check(shadowed > 20,
 			"sdf box hand-off: the caster-outside-the-box setup is exercised");
 	check(leaksFieldOnly > 0,
-			"sdf box hand-off: the field's own term really leaks here (scenario)");
+			"sdf box hand-off: the field alone really leaks here (scenario valid)");
 	check(leaksHandoff == 0,
 			"sdf box hand-off: no light leak with the whole-region continuation");
-	check(shortLeaks == 0,
-			"sdf box hand-off: a trace that fits the box leaks nothing either");
-	check(plainExact == shadowed + lit,
-			"sdf box hand-off: a box narrower than the trace gives the plain march");
 	check(judged > 10,
 			"sdf box hand-off: real cell blockers are exercised");
 	check(darkened > 0,
 			"sdf box hand-off: the continuation actually finds the casters");
-	check(shortDarkened > 0,
-			"sdf box hand-off: a fitting trace darkens what the field alone missed");
 	// Outside the field the composite must reduce to the plain 2.5D march.
 	const double outside[3] = {40.5, 20.0, 20.5};
 	check(std::abs(sdf3dHandoffMirror(sdf, boxOrigin, w, outside, sun) -
 			sunRayEscapesSdfMirror(w, outside, sun)) < 1e-9,
 			"sdf box hand-off: outside the field it is exactly the 2.5D march");
 	std::printf("sdf box hand-off: %d shadowed / %d lit columns (%d judged, "
-			"%d height-field-only); leaks field only %d, with the hand-off %d "
-			"(short trace %d); %d darkened, %d by the short trace, %d exactly "
-			"the plain march\n",
+			"%d height-field-only); leaks field only %d, with the hand-off %d; "
+			"%d darkened by it\n",
 			shadowed, lit, judged, unjudged, leaksFieldOnly, leaksHandoff,
-			shortLeaks, darkened, shortDarkened, plainExact);
-}
-
-// Pass 41: what a bigger build box BUYS, and what it does not. The chamfer
-// EDT only sees solids inside the box it runs over, so a box's outermost
-// chunk-wide band reports nearest-solid distances from a truncated candidate
-// set - values that depend on where the box sits (probe_rebuild_swap, real
-// terrain: a one-chunk recenter moves 33.4% of that band's cells, 0.1% one
-// chunk deeper). The renderer therefore builds a box one chunk bigger than the
-// near field it has to get right: with kSdfHalfChunks = 4 the shipped 8x8
-// build keeps its truncated band a whole chunk outside the 6x6 near field the
-// renderer used to shade.
-//
-// This pins that: against a reference build with one MORE chunk of halo (the
-// stand-in for "accurate"), the shipped build's 6x6 near field agrees to the
-// last bit, while the shipped build's own edge chunk does not.
-void testSdfHaloStability() {
-	using vv::voxel::Chunk;
-	using vv::voxel::ChunkCoord;
-	using vv::voxel::SdfBoxGeometry;
-	using vv::voxel::SdfField;
-
-	const int cx = 32, cz = 32, wh = 128;
-	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
-	vv::voxel::World world(tcfg, cx, wh, cz);
-	std::vector<const Chunk*> added;
-	std::vector<ChunkCoord> evicted;
-	world.ensureRegion(0, 0, 5, added, evicted);  // 11x11 chunks
-
-	// The shipped box (kSdfHalfChunks = 4) and the accurate reference: the same
-	// box grown by one more chunk of halo.
-	const SdfBoxGeometry shipped =
-			SdfBoxGeometry::centeredOn(0, 0, 4, cx, cz, wh);
-	const SdfBoxGeometry reference = shipped.haloed(1);
-	const auto buildField = [&](const SdfBoxGeometry& box, SdfField& field) {
-		std::vector<std::vector<std::uint8_t>> snaps(
-				std::size_t(box.chunksPerSide) * box.chunksPerSide);
-		const int32_t firstX = box.originX / cx;
-		const int32_t firstZ = box.originZ / cz;
-		for (std::uint32_t bz = 0; bz < box.chunksPerSide; ++bz) {
-			for (std::uint32_t bx = 0; bx < box.chunksPerSide; ++bx) {
-				if (const Chunk* c = world.findChunk(ChunkCoord{
-								firstX + static_cast<int32_t>(bx),
-								firstZ + static_cast<int32_t>(bz)})) {
-					snaps[std::size_t(bz) * box.chunksPerSide + bx] =
-							c->voxelTypes();
-				}
-			}
-		}
-		vv::voxel::buildSdfBoxField(box, snaps, field);
-	};
-	SdfField shippedField, referenceField;
-	buildField(shipped, shippedField);
-	buildField(reference, referenceField);
-
-	// Both fields report their own lattice coordinates; sample by WORLD voxel
-	// (the same cell of the same world) in each.
-	const auto sampleWorld = [](const SdfField& field,
-											 const SdfBoxGeometry& box, int x, int y, int z) {
-		return field.sample(float(x - box.originX) + 0.5f,
-											 float(y - box.originY) + 0.5f,
-											 float(z - box.originZ) + 0.5f);
-	};
-	int nearCells = 0, nearMismatch = 0, bandCells = 0, bandMismatch = 0;
-	double nearMax = 0.0, bandMax = 0.0;
-	const int nearHi = 3 * cx - 2;      // the 6x6 near field the renderer shaded
-	const int bandHi = 4 * cx - 2;      // ... plus the shipped box's edge chunk
-	for (int z = -bandHi; z <= bandHi; z += 2) {
-		for (int x = -bandHi; x <= bandHi; x += 2) {
-			const bool inNear = x >= -nearHi && x <= nearHi && z >= -nearHi &&
-											 z <= nearHi;
-			for (int y = 0; y < wh; y += 2) {
-				const float a = sampleWorld(shippedField, shipped, x, y, z);
-				const float b = sampleWorld(referenceField, reference, x, y, z);
-				const double d = std::abs(double(a) - double(b));
-				if (inNear) {
-					++nearCells;
-					nearMax = std::max(nearMax, d);
-					if (d > 0.5) {
-						++nearMismatch;
-					}
-				} else {
-					++bandCells;
-					bandMax = std::max(bandMax, d);
-					if (d > 0.5) {
-						++bandMismatch;
-					}
-				}
-			}
-		}
-	}
-	check(nearCells > 100000, "sdf halo: enough near-field cells compared");
-	check(nearMismatch == 0,
-			"sdf halo: the shipped box's near field matches the accurate reference");
-	check(bandCells > 20000, "sdf halo: the box's edge chunk is sampled too");
-	check(bandMismatch > 100,
-			"sdf halo: the shipped box's own edge chunk does not (it is truncated)");
-	std::printf("sdf halo: near field %d cells, shipped vs a one-chunk-bigger "
-			"reference: %d mismatches (max %.3f voxels); the shipped box's own "
-			"edge chunk: %d/%d (max %.3f voxels)\n",
-			nearCells, nearMismatch, nearMax, bandMismatch, bandCells, bandMax);
-}
-
-void testSdfReshadeInvariance() {
-	using vv::voxel::Chunk;
-	using vv::voxel::ChunkCoord;
-	using vv::voxel::SdfBoxGeometry;
-	using vv::voxel::SdfField;
-
-	const int cx = 32, cz = 32, wh = 128;
-	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
-	vv::voxel::World world(tcfg, cx, wh, cz);
-	std::vector<const Chunk*> added;
-	std::vector<ChunkCoord> evicted;
-	world.ensureRegion(0, 0, 5, added, evicted);  // 11x11 chunks
-
-	const std::uint32_t half = 4;  // the shipped kSdfHalfChunks
-	const SdfBoxGeometry boxA = SdfBoxGeometry::centeredOn(0, 0, half, cx, cz, wh);
-	const SdfBoxGeometry boxB = SdfBoxGeometry::centeredOn(1, 0, half, cx, cz, wh);
-	const auto buildField = [&](const SdfBoxGeometry& box, SdfField& field) {
-		std::vector<std::vector<std::uint8_t>> snaps(
-				std::size_t(box.chunksPerSide) * box.chunksPerSide);
-		const int32_t firstX = box.originX / cx;
-		const int32_t firstZ = box.originZ / cz;
-		for (std::uint32_t bz = 0; bz < box.chunksPerSide; ++bz) {
-			for (std::uint32_t bx = 0; bx < box.chunksPerSide; ++bx) {
-				if (const Chunk* c = world.findChunk(ChunkCoord{
-								firstX + static_cast<int32_t>(bx),
-								firstZ + static_cast<int32_t>(bz)})) {
-					snaps[std::size_t(bz) * box.chunksPerSide + bx] =
-							c->voxelTypes();
-				}
-			}
-		}
-		vv::voxel::buildSdfBoxField(box, snaps, field);
-	};
-	SdfField sdfA, sdfB;
-	buildField(boxA, sdfA);
-	buildField(boxB, sdfB);
-
-	// Real ground height of a column, straight from the chunks (the same voxel
-	// layout the box uses: x + y*chunkSizeX + z*chunkSizeX*worldHeight).
-	const auto topAt = [&](int x, int z) {
-		const int ccx = x >= 0 ? x / cx : -(((-x) + cx - 1) / cx);
-		const int ccz = z >= 0 ? z / cz : -(((-z) + cz - 1) / cz);
-		const Chunk* c = world.findChunk(ChunkCoord{ccx, ccz});
-		if (c == nullptr) {
-			return -1;
-		}
-		const int lx = x - ccx * cx;
-		const int lz = z - ccz * cz;
-		const std::vector<std::uint8_t>& t = c->voxelTypes();
-		for (int y = wh - 1; y >= 0; --y) {
-			if (t[std::size_t(lx) + std::size_t(y) * std::size_t(cx) +
-						std::size_t(lz) * std::size_t(cx) * std::size_t(wh)] != 0) {
-				return y;
-			}
-		}
-		return -1;
-	};
-
-	double sun[3] = {0, 0, 0};
-	shadowSun(sun);
-	const double traceLength = 64.0;
-
-	// The near field the renderer shaded before this pass: 6x6 chunks around
-	// the camera, two voxels inside its faces. Each placement gives every one
-	// of these columns the full fixed trace two chunks before its own sunward
-	// face, so the two answers must be identical - that is the user-visible
-	// claim ("a rebuild no longer moves the shadows I am looking at").
-	const int nearHi = 3 * cx - 2;
-	const int loX = -nearHi, loZ = -nearHi, hiX = nearHi, hiZ = nearHi;
-	int checked = 0, handoffs = 0, termless = 0, moved = 0;
-	double worstExitT = 0.0, worstVis = 0.0, crossingSpan = 0.0;
-	for (int x = loX; x <= hiX; x += 2) {
-		for (int z = loZ; z <= hiZ; z += 2) {
-			const int top = topAt(x, z);  // topmost SOLID cell
-			if (top <= 0) {
-				continue;
-			}
-			// The surface: the first air cell above it, exactly like the
-			// height-field bound the other shadow tests start from.
-			double p[3] = {double(x) + 0.5, double(top + 1), double(z) + 0.5};
-			const double n[3] = {0.0, 1.0, 0.0};
-			double o[3];
-			for (int a = 0; a < 3; ++a) {
-				o[a] = p[a] + n[a] * 1e-3 + sun[a] * 1e-2;
-			}
-			const float df[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
-			float exitA[3] = {0.0f, 0.0f, 0.0f}, exitB[3] = {0.0f, 0.0f, 0.0f};
-			float tA = 0.0f, tB = 0.0f, visA = 1.0f, visB = 1.0f;
-			const float ofA[3] = {float(o[0] - double(boxA.originX)),
-					float(o[1] - double(boxA.originY)),
-					float(o[2] - double(boxA.originZ))};
-			const float ofB[3] = {float(o[0] - double(boxB.originX)),
-					float(o[1] - double(boxB.originY)),
-					float(o[2] - double(boxB.originZ))};
-			const bool handA = vv::voxel::sphereTracedShadowExits(
-					sdfA, ofA, df, exitA, &tA, &visA, 8.0f, 160, float(traceLength));
-			const bool handB = vv::voxel::sphereTracedShadowExits(
-					sdfB, ofB, df, exitB, &tB, &visB, 8.0f, 160, float(traceLength));
-			// The exits come back in each field's own lattice space (the two
-			// builds have different origins), so compare them in WORLD space -
-			// that is the space the composite shadow lives in.
-			const double exitWorldA[3] = {
-					double(boxA.originX) + double(exitA[0]),
-					double(boxA.originY) + double(exitA[1]),
-					double(boxA.originZ) + double(exitA[2])};
-			const double exitWorldB[3] = {
-					double(boxB.originX) + double(exitB[0]),
-					double(boxB.originY) + double(exitB[1]),
-					double(boxB.originZ) + double(exitB[2])};
-			const double dExit =
-					std::abs(exitWorldA[0] - exitWorldB[0]) +
-					std::abs(exitWorldA[1] - exitWorldB[1]) +
-					std::abs(exitWorldA[2] - exitWorldB[2]);
-			const double dT = std::abs(double(tA) - double(tB));
-			const double dVis = std::abs(double(visA) - double(visB));
-			// What the field hands the composite: 0 = it hit a surface (the
-			// composite is exactly dark), 1 = it hands a term over, 2 = it has
-			// no term here, so the whole ray is the plain 2.5D march.
-			const int kindA = handA ? 1 : (visA > 0.01f ? 2 : 0);
-			const int kindB = handB ? 1 : (visB > 0.01f ? 2 : 0);
-			// "Visible" = the composite could change by an eye-visible amount:
-			// a different kind, or a term that differs by 1% of visibility,
-			// a hand-off point a voxel apart or two voxels of exit point. (The
-			// accumulated visibilities do still differ in the last few float
-			// bits where the two builds disagree by one seed cell: printed,
-			// not asserted.)
-			const bool differs = (kindA != kindB) ||
-					(kindA == 1 && kindB == 1 &&
-					 (dVis > 0.01 || dT > 1.0 || dExit > 2.0));
-			++checked;
-			if (handA && handB) {
-				++handoffs;
-			} else if (!handA && !handB) {
-				++termless;
-			}
-			if (differs) {
-				++moved;
-			}
-			worstExitT = std::max(worstExitT, dT);
-			worstVis = std::max(worstVis, dVis);
-			const double crossA = std::min(
-					(sun[0] > 1e-6) ? (double(boxA.originX + int(boxA.nx)) - o[0]) / sun[0]
-											: 1e30,
-					(sun[2] > 1e-6) ? (double(boxA.originZ + int(boxA.nz)) - o[2]) / sun[2]
-											: 1e30);
-			const double crossB = std::min(
-					(sun[0] > 1e-6) ? (double(boxB.originX + int(boxB.nx)) - o[0]) / sun[0]
-											: 1e30,
-					(sun[2] > 1e-6) ? (double(boxB.originZ + int(boxB.nz)) - o[2]) / sun[2]
-											: 1e30);
-			crossingSpan = std::max(crossingSpan, std::abs(crossA - crossB));
-		}
-	}
-	check(checked > 2000, "sdf reshade: the near field is well sampled");
-	check(handoffs > checked / 2,
-			"sdf reshade: the fixed-length hand-off really runs over the near field");
-	check(moved == 0,
-			"sdf reshade: a one-chunk recenter moves NOTHING the near field shadows");
-	check(crossingSpan > 1.0,
-			"sdf reshade: the pass-40 crossing hand-off really did move (scenario)");
-	std::printf("sdf reshade: %d near-field ground columns (%d hand-offs, %d with "
-			"no field term) unchanged by a one-chunk recenter (max hand-off delta "
-			"%.4f voxels along the ray, max visibility delta %.5f); the pass-40 "
-			"crossing hand-off would have moved by up to %.1f voxels\n",
-			checked, handoffs, termless, worstExitT, worstVis, crossingSpan);
+			darkened);
 }
 
 void testSdfSoftShadow3d() {
@@ -2752,7 +2443,7 @@ void testSdfSoftShadow3d() {
 	auto soft3d = [&](const double o[3]) {
 		const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
-		return vv::voxel::sphereTracedShadowFieldOnly(sdf, of, sf);
+		return vv::voxel::sphereTracedShadow(sdf, of, sf);
 	};
 
 	// (1) Occlusion parity + range over a mix of surface kinds. The critical
@@ -2884,7 +2575,7 @@ void testSdfBoxBuild() {
 	vv::voxel::World world(tcfg, cx, wh, cz);
 	std::vector<const Chunk*> added;
 	std::vector<ChunkCoord> evicted;
-	world.ensureRegion(0, 0, 4, added, evicted);  // 9x9 chunks: covers the 8x8 box
+	world.ensureRegion(0, 0, 4, added, evicted);  // 9x9 chunks
 
 	// Dense region copy (the reference the box must agree with), built from
 	// the chunks' own voxel data - the REAL layout, not the box's walk.
@@ -2927,13 +2618,12 @@ void testSdfBoxBuild() {
 									std::size_t(rz) * rnx * wh] != 0;
 	};
 
-	// The renderer's box: 8x8 whole chunks centered on chunk (0,0) (pass 41
-	// grew it from 6x6 so the window's truncated edge chunk sits outside the
-	// near field), full world height.
-	const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, 4, cx, cz, wh);
-	check(box.valid() && box.nx == 256 && box.ny == 128 && box.nz == 256 &&
-					box.originX == -128 && box.originZ == -128 && box.originY == 0,
-				"sdfBox: 8x8-chunk geometry, full world height");
+	// The renderer's box: 6x6 whole chunks centered on chunk (0,0), full
+	// world height.
+	const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, 3, cx, cz, wh);
+	check(box.valid() && box.nx == 192 && box.ny == 128 && box.nz == 192 &&
+					box.originX == -96 && box.originZ == -96 && box.originY == 0,
+				"sdfBox: 6x6-chunk geometry, full world height");
 
 	// Snapshot the box's chunks exactly like launchSdfBuild does.
 	const std::size_t side = box.chunksPerSide;
@@ -3036,7 +2726,7 @@ void testSdfBoxBuild() {
 											 o[1] - float(box.originY),
 											 o[2] - float(box.originZ)};
 		const bool ex = exactLit(o);
-		const float soft = vv::voxel::sphereTracedShadowFieldOnly(sdf, ol, sun);
+		const float soft = vv::voxel::sphereTracedShadow(sdf, ol, sun);
 		++total;
 		softSum += soft;
 		if (soft < 0.05f) {
@@ -3413,8 +3103,6 @@ int main() {
 	testSdfSoftShadow3d();
 	testSdfBoxBuild();
 	testSdfBoxHandoff();
-	testSdfHaloStability();
-	testSdfReshadeInvariance();
 	testStreamPriority();
 	testVoxelTextures();
 

@@ -123,23 +123,10 @@ class VoxelResources final {
 	// buffered like the far field: the writer targets the inactive half,
 	// the renderer flips a uniform half index (in the box uniform's w,
 	// repurposed to -1/0/1 when no field is active).
-	// The SDF box is 2*kSdfHalfChunks chunks wide on each axis (8x8) and
+	// The SDF box is 2*kSdfHalfChunks chunks wide on each axis (6x6) and
 	// the full world height tall; its cell dims are
 	// (2*kSdfHalfChunks*chunkSizeX, worldHeight, 2*kSdfHalfChunks*chunkSizeZ).
-	//
-	// Pass 41: four chunks per side, not three. The box is a WINDOW that the
-	// renderer recenters on the camera's chunk at every crossing, and the field
-	// can only be accurate where its own build reached far enough: its
-	// outermost chunk of cells has a truncated view of the world (measured:
-	// 33.4% of that band's cells change value on a one-chunk recenter) and a
-	// ray leaving it has less than the fixed trace length to run. Growing the
-	// window by one chunk moves both effects a chunk further out - the whole
-	// 6x6 near field that used to be shaded is then a full chunk inside the
-	// build - and cuts what a rebuild moves there to zero (testSdfReshadeInvariance).
-	// The cost is (8*8)/(6*6) = 1.78x the build cells and seed buffer, i.e. the
-	// pass-42 latency work (incremental strips / a non-blocking upload) is what
-	// pays for it.
-	static constexpr std::uint32_t kSdfHalfChunks = 4;  // box = 2*kSdfHalfChunks chunks
+	static constexpr std::uint32_t kSdfHalfChunks = 3;  // box = 2*kSdfHalfChunks chunks
 	// Uploads a complete SDF (the argmin seed per cell) into the buffer.
 	// Staging + fence (no device/queue waits); waits for its own copy to
 	// land before returning, so the caller can publish the box uniform
