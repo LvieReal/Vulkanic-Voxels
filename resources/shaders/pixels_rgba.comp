@@ -556,37 +556,41 @@ float shadowOpacity(uint type)
 // raise it for harder shadows (32 ~= 2 degrees), lower it for softer.
 const float kShadowSharpness = 8.0;
 
-// One penumbra sample of the SDF soft shadow (technique:
-// iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t.
-// h is the distance from the sample to the closest relevant surface (a
-// column's top plane - the shadow ray is always ascending), t the distance
-// marched so far. Returns the visibility factor to fold into the min
-// (1.0 = no darkening).
+// One penumbra sample of the SDF soft shadow (extended-sun-disk / circle-
+// segment; technique family: iquilezles.org/articles/rmshadows/). d is the
+// SIGNED height of the sample over the column's top plane (d < 0 ray above
+// the top, d > 0 ray below it, d = 0 at the top); t the distance marched so
+// far. a = d / (t * alpha) is the top's offset from the sun center in sun-
+// disk radii (alpha = 1/k, the angular radius); the lit fraction is the
+// circle segment of the disk above the top: 0.5 - (asin a + a*sqrt(1-a^2))
+// / pi. It is the exact extended-disk answer for a heightfield top and is
+// CONTINUOUS (0.5) across the top, unlike the plain Quilez k*h/t (which is
+// 0 at the top and only sees height over the top plane, leaving every
+// side/vertical shadow edge hard). Sampled at every DDA column and folded
+// into the min, it gives every shadow edge its penumbra.
 //
-// The article's Aaltonen two-sphere refinement (estimating the closest
-// point from the current distance h and the PREVIOUS sample's distance) was
-// tried and REMOVED: it is only well-conditioned where the distance is
-// changing slowly (h/prev ~= 1, right at the closest approach) and
-// degenerates to a near-vertical cliff at h/prev ~= 2 (the distance doubling
-// in one step). Sampled at every DDA column and folded into the min, that
-// cliff projects a hard straight edge across the lit terrain - the
-// "clamped edge" stripe. The plain estimate is a smooth, well-conditioned
-// function of (h, t), and the dense per-column sampling (every column the
-// ray clears) already resolves the closest approach well within a pixel, so
-// the refinement's light-leak correction is not needed.
-float shadowPenumbra(float h, float t)
+// The article's Aaltonen two-sphere refinement was tried and REMOVED earlier
+// (ill-conditioned at h/prev ~= 2: it projected a hard "clamped edge" stripe
+// across the lit terrain).
+float shadowPenumbra(float d, float t)
 {
-    return clamp(kShadowSharpness * h / max(t, 1e-4), 0.0, 1.0);
+    const float alpha = 1.0 / kShadowSharpness;
+    float a = d / (max(t, 1e-4) * alpha);
+    a = clamp(a, -1.0, 1.0);
+    const float frac =
+        0.5 - (asin(a) + a * sqrt(max(0.0, 1.0 - a * a))) / 3.141592653589793;
+    return clamp(frac, 0.0, 1.0);
 }
 
 // SDF soft shadow ray (VV_SDF_SHADOWS=1). The TRAVERSAL is the exact
 // march's ascending column DDA + height-bound cell walk + coarse far cells -
-// the same occlusion events as sunRayEscapes, so nothing the binary march
-// shadows can leak, and the 256-column budget matches it (the old
-// sphere-traced variant stepped by the "SDF" value, crawled at ~0.04
-// voxels/step near surfaces, and burned its 128-step budget within ~50
-// voxels). Softness comes from shadowPenumbra, sampled at every column the
-// ray clears, from the distance to that column's top plane. Returns
+// the same occlusion events as sunRayEscapes, and the 256-column budget
+// matches it (the old sphere-traced variant stepped by the "SDF" value,
+// crawled at ~0.04 voxels/step near surfaces, and burned its 128-step budget
+// within ~50 voxels). Softness comes from shadowPenumbra, the extended-sun-
+// disk fraction sampled at every column (both sides of a shadow edge get a
+// penumbra: the lit side in (0.5, 1), the blocked side in (0, 0.5) - the ray
+// is below the blocking top, so at most half the disk can clear it). Returns
 // fractional visibility (1.0 = fully lit, 0.0 = fully shadowed).
 float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 {
@@ -634,49 +638,51 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
         ivec2 local = ivec2(0);
         if (resolveColumn(col.x, col.y, slot, local)) {
             const uint bound = columnHeightAt(slot, local);
-            if (bound == kNoHeightData) {
-                // No height data: air, exactly like the exact march.
-            } else if (y0 >= float(bound)) {
-                // Clear of the column: its top plane at `bound` is the
-                // closest relevant surface (the ray is ascending).
-                const float h = y0 - float(bound);
-                visibility = min(visibility, shadowPenumbra(h, t));
-            } else {
-                // The segment dips below the column's top: the exact cell
-                // walk decides (identical walk to sunRayEscapes).
-                const float y1 = origin.y + sunV.y * sExit;
-                const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
-                                     int(pc.chunkSize.y) - 1);
-                const uint colBase = uint(local.x) +
-                                     uint(local.y) *
-                                         (pc.chunkSize.x * pc.chunkSize.y);
-                uint solidType = 0u;
-                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
-                    const uint type =
-                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
-                    if (type != 0u) {
-                        solidType = type;
-                        break;
+            if (bound != kNoHeightData) {
+                // Extended-disk estimate: the fraction of the sun disk above
+                // this column's top plane (d = bound - y0, signed), sampled
+                // at every column so the min is the closest approach.
+                // Continuous (0.5) at the top, so both sides of a shadow
+                // edge get their penumbra.
+                visibility = min(
+                    visibility, shadowPenumbra(float(bound) - y0, t));
+                if (y0 < float(bound)) {
+                    // The segment dips below the column's top: the exact cell
+                    // walk decides (identical walk to sunRayEscapes).
+                    const float y1 = origin.y + sunV.y * sExit;
+                    const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
+                                         int(pc.chunkSize.y) - 1);
+                    const uint colBase = uint(local.x) +
+                                         uint(local.y) *
+                                             (pc.chunkSize.x * pc.chunkSize.y);
+                    uint solidType = 0u;
+                    for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
+                        const uint type =
+                            fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
+                        if (type != 0u) {
+                            solidType = type;
+                            break;
+                        }
                     }
+                    if (solidType != 0u) {
+                        const float opacity = shadowOpacity(solidType);
+                        if (opacity >= 0.999) {
+                            // Opaque: the ray is below this top, so the
+                            // penumbra accumulated so far (<= 0.5) is the
+                            // soft-shadow answer - the part of the disk that
+                            // still clears the top. Not a hard 0.
+                            return visibility;
+                        }
+                        // Fractional-opacity foliage: attenuate and keep
+                        // reading occupancy beyond it.
+                        visibility *= 1.0 - opacity;
+                        if (visibility <= 0.01) {
+                            return 0.0;
+                        }
+                    }
+                    // Air all the way (an overhanging shaft): the top plane
+                    // still bounds the estimate, but nothing blocks here.
                 }
-                if (solidType != 0u) {
-                    const float opacity = shadowOpacity(solidType);
-                    if (opacity >= 0.999) {
-                        // Opaque: the penumbra up to the surface is already
-                        // accumulated in `visibility`; the surface itself
-                        // blocks the rest of the sun.
-                        return 0.0;
-                    }
-                    // Fractional-opacity foliage: attenuate and keep
-                    // reading occupancy beyond it.
-                    visibility *= 1.0 - opacity;
-                    if (visibility <= 0.01) {
-                        return 0.0;
-                    }
-                }
-                // Air all the way (an overhanging shaft): the topmost solid
-                // sits above the segment and the ray ascends away from it -
-                // no relevant surface here, no estimate for this column.
             }
         } else if (pc.far.z > 0) {
             // Beyond the near region: coarse far cells, conservative in the
@@ -694,10 +700,12 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
                                  uint(fc.y) * uint(farDim.x)];
                 const float h = float(packed & 0xFFFFu);
                 if (h > 0.0) {
+                    // Extended-disk estimate over the far cell's top plane.
+                    visibility = min(visibility, shadowPenumbra(h - y0, t));
                     if (y0 < h) {
-                        return 0.0;  // the exact march's far occlusion
+                        // Far terrain blocks the rest (penumbra <= 0.5).
+                        return visibility;
                     }
-                    visibility = min(visibility, shadowPenumbra(y0 - h, t));
                 }
             }
         }
@@ -721,9 +729,9 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 // - column DDA + height-bound voxel walk, coarse far cells beyond the near
 // region. By default the exact binary march (1.0 lit / 0.0 shadowed);
 // scene.misc.w (VV_SDF_SHADOWS=1) selects sunRayEscapesSdf instead - the
-// SAME traversal with the Quilez penumbra estimate, returning fractional
-// visibility. Far-LOD hits shadow through the same march: from beyond the
-// region it self-selects the cheap far-cell path.
+// SAME traversal with the extended-disk penumbra estimate, returning
+// fractional visibility. Far-LOD hits shadow through the same march: from
+// beyond the region it self-selects the cheap far-cell path.
 float sunShadow(vec3 hitPosVox, vec3 n)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);

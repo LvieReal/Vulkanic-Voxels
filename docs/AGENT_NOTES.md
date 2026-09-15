@@ -65,11 +65,14 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 - VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
 - VV_FAR_LOD=1: opt into the coarse terrain LOD field (OFF by default).
 - VV_SDF_SHADOWS=1: SDF soft-shadow experiment (pass 33: the exact
-  march's traversal + the Quilez k*h/t penumbra estimate -
-  iquilezles.org/articles/rmshadows/; the Aaltonen two-sphere refinement
-  was removed in pass 34 - it projected a hard "clamped edge" stripe;
-  kShadowSharpness in the shader tunes softness). Exact binary shadows
-  remain the default reference.
+  march's traversal + an extended-sun-disk penumbra estimate -
+  iquilezles.org/articles/rmshadows/ family. Pass 34 removed the Aaltonen
+  two-sphere refinement (it projected a hard "clamped edge" stripe); pass
+  35 replaced the plain k*h/t with the unified circle-segment - the
+  fraction of the sun disk above each column's top plane, continuous
+  (0.5) at the top, so every heightfield shadow edge gets a soft penumbra.
+  kShadowSharpness in the shader tunes the sun's angular size / softness).
+  Exact binary shadows remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
   future foliage can attenuate and be marched through instead of
   requiring precise decal projection.
@@ -299,52 +302,63 @@ the penumbra is now a SMOOTH MONOTONIC ramp (1.0 -> 0.93 -> 0.77 -> 0.59 ->
 and the shadow is fully dark under the wall top. Wall penumbra shape pinned:
 1.0, 1.0, 0.409, 0.0, 0.0 (lit, lit, partial, hard, hard).
 
-Pass 35 IN PROGRESS (owner green-lit, absent until tomorrow — work
-unattended, prototype in the CPU mirror first; SDF experimental path only,
-exact binary sunRayEscapes stays bit-identical). Owner: "sides of the SDF
-shadow right now are completely sharp... limitation or can be fixed?" ->
-it IS fixable. GOAL: the penumbra SOFT ON ALL EDGES (top/leading AND
-side/vertical edges) of the SDF shadow, no hard 0->1 jumps.
+Pass 35 (DONE, owner green-lit the full fix): THE UNIFIED CIRCLE-SEGMENT
+PENUMBRA - soft on every edge a heightfield top can cast. Owner: "sides of
+the SDF shadow right now are completely sharp... limitation or can be
+fixed?" -> it IS fixable, and this is the fix. GOAL met: the penumbra is
+soft on the top/leading edge AND the side/vertical edge of a heightfield,
+no hard 0->1 jumps. SDF experimental path only (VV_SDF_SHADOWS /
+scene.misc.w > 0.5); the exact binary sunRayEscapes is untouched and stays
+the bit-identical reference.
 
-ROOT CAUSE (confirmed, L2027-2120 + diag11-16): the penumbra term
-h = y0 - bound is only evaluated in the CLEAR branch (ray above the
-column's top plane). In the BELOW-top/solid branch (y0 < bound, the ray
-crosses the caster's SIDE face — the shadow's side/leading edge) the
-estimate does `return 0.0` with NO penumbra term at all. So the side edge
-is a hard 0->1. k*h/t can NEVER see the side edge: h is height over the
-top plane, constant along the caster's side.
+ROOT CAUSE: the penumbra term was only evaluated in the CLEAR branch (ray
+above the column's top plane, h = y0 - bound); the BELOW-top/solid branch
+(y0 < bound, the ray crosses the caster's side - the shadow's side/leading
+edge) did `return 0.0` with NO penumbra term, so every side edge was a hard
+0->1. k*h/t can never soften it: h is height over the top plane, constant
+along the caster's side, and 0 at the top.
 
-GROUND TRUTH (diag12 brute force: 168-ray sun disk, radius 1/k = 0.125,
-fraction of rays escaping; world = box x/z 28..37, y 10..39, ground y=10,
-sun = normalize(0.5,1,0.5), dy/dx = 2). The correct shape is a SMOOTH
-VALLEY with a ramp on EVERY edge:
-  x:      9    12   16   20 21 22 23   24   28   30   33+   (z=20)
-  truth: 0.837 0.633 0.245 0.0  0  0  0  0.020 0.408 0.633 1.000
-  k*h/t: 1.000 0.211 0.000 0.0  0  0  0  0.000 0.000 0.000 1.000  (hard step)
-  z=30 truth: x17:0.959 19:0.755 21:0.571 23:0.143 25:0.000 27:0.000
-Left penumbra x~9-19, right penumbra x~24-32, narrow umbra x=20-23.
+THE FIX (validated against 168-ray brute-force ground truth before the
+shader): shadowPenumbra is now the EXTENDED-SUN-DISK circle segment, one
+formula used in BOTH branches (and both near + far). d = bound - y0 is the
+SIGNED height of the sample over the column's top plane; a = d/(t*alpha)
+with alpha = 1/kShadowSharpness is the top's offset from the sun center in
+sun-disk radii; the lit fraction = 0.5 - (asin a + a*sqrt(1-a^2))/pi (the
+circle-segment cap (1/pi)(acos a - a*sqrt(1-a^2)), clamped a to [-1,1]).
+It is the exact extended-disk answer for a heightfield top and is
+CONTINUOUS (0.5) at the top, so a shadow edge - where the march
+transitions clear<->below-top - gets a smooth ramp on BOTH sides instead of
+a jump (lit side in (0.5,1), blocked side in (0,0.5)). Sampled at every
+DDA column and folded into the min (closest approach). When a solid column
+blocks, the march returns the accumulated visibility (the penumbra of that
+top, <= 0.5) instead of a hard 0.0.
 
-CANDIDATE (marchSdfEdge, diag15/16) — CONFIRMED CORRECT MECHANISM, needs
-tuning: in the below-top branch, instead of `return 0.0`, return
-k*edgeDist/t where edgeDist = perpendicular distance from the march ray to
-the caster's TRAILING edge (the top-edge boundary of the next voxel it is
-heading toward, min of |px-(colX+1)| and |pz-(colZ+1)|). This is exactly
-the missing quantity — it IS zero on the side face (edgeDist=0 -> 0) and
-grows as the ray crosses the top plane, so it produces the side penumbra
-that k*h/t lacks. diag15: the side edge becomes a RAMP (x13:0.113 -> x20:
-0.218, k=4) instead of the hard 0->1 the current code gives.
+WHY NOT THE ALTERNATIVES (all measured against the brute-force truth):
+- corner-based circle segment (distance to the caster's top CORNER): ~0 on
+  the side edge (the ray drifts in z so the corner sits far off-axis).
+- deficit-only (bound - y0) with k*h/t in the clear branch: 0 on the side
+  edge (rays escape EAST of the vertical corner, not above the top plane).
+- trailing-edgeDist (marchSdfEdge, diag15/16): DEAD END - inverted ramp /
+  lit-in-umbra. Do not retry.
+- A true vertical wall (a box's side) is still sharp: the 1D top-plane SDF
+  has no data for a vertical face. That is a known limitation of this
+  approximation, NOT of soft shadows; the owner's terrain is a heightfield
+  (sloped sides) where this formula is continuous and soft. A proper 3D
+  voxel SDF would be needed for true vertical casters - parked, not done.
 
-TUNING TODO (next step): the edgeDist measure and the k constant are not
-calibrated yet (the ramp is too shallow, and a z=30 variant regressed to
-too-bright — the edge distance needs to be measured from the ACTUAL march
-point to the specific trailing-edge segment, not a crude min). Match the
-ground-truth valley at z=20 AND z=30 (both ramps soft, umbra stays dark),
-then the diag10 gentle-bump lit pocket must fill. Then port to the shader
-(same structure: shadowPenumbra gains a 3rd edge-distance arg in the
-below-top branch), rebuild both, ctest, offscreen smoke, one commit.
+VALIDATED (CPU mirror first, then shader): CPU tests green - sdf shadow:
+2191 shadowed, 231 penumbral, 578 lit of 3000 (the penumbra is now a real
+minority, was 7 under k*h/t), 0 leaks (blocked pixels are at most half-lit,
+never fully lit), visibility in [0,1]. Wall ramp pinned at
+[1.0, 1.0, 0.751, 0.212, 0.0] (lit, lit, grazing-light-side, under-top,
+deep) - a smooth ramp straddling the top at 0.5, no hard jump. X-sweep
+(far/top edge) against 168-ray truth: unified tracks truth far better than
+k*h/t (x14 0.633 vs 0.211; x15 0.358 vs 0.000). Shader compiles to valid
+SPIR-V (glslangValidator -V + the build pipeline). Both builds config clean,
+ctest green, offscreen smoke: no crash (idle on the Vulkan error dialog, no
+ICD in the sandbox).
 
-DIAGNOSTICS in /tmp (NOT wiped this turn): diag12.cpp = brute-force
-ground-truth generator (ShadowWorld + 168 sun-disk rays); diag13/14/15/16 =
-estimate candidates. Rebuild: g++ -std=c++20 -O2 -ffp-contract=off diagNN.cpp
-(they embed the CPU mirrors from diag5.cpp: ShadowWorld, sunRayEscapesSdfMirror,
-sunRayEscapesMirror, shadowSun).
+NOTE (stale section above replaced): the earlier "trailing-edge = CONFIRMED
+CORRECT MECHANISM / TUNING TODO" text in this pass's draft was WRONG
+(contradicted by diag15/16) and has been removed; the correct fix is the
+top-plane unified circle-segment described here.

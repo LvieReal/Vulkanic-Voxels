@@ -247,10 +247,12 @@ class VulkanRenderer final {
   // removed in pass 10 - supersampling was too heavy.)
   bool m_debugTerminators = false;
   // Optional SDF soft-shadow experiment (pass 33: the exact march's
-  // traversal + the plain Quilez k*h/t penumbra estimate - pass 34; the
-  // Aaltonen two-sphere refinement was removed, it projected a hard
-  // "clamped edge" stripe). Exact binary shadows remain the default;
-  // VV_SDF_SHADOWS=1 selects the soft marcher.
+  // traversal + a penumbra estimate; pass 34 removed the Aaltonen two-sphere
+  // refinement - it projected a hard "clamped edge" stripe - and pass 35
+  // replaced the plain k*h/t with the unified circle-segment: the fraction
+  // of the sun disk above each column's top plane, continuous at the top, so
+  // every heightfield shadow edge gets a soft penumbra). Exact binary
+  // shadows remain the default; VV_SDF_SHADOWS=1 selects the soft marcher.
   bool m_sdfShadows = false;
   // VV_PERF: frame-time logging for hitch diagnosis (frames > 25 ms,
   // rate-limited). VV_DEBUG_HOLE: color far-march misses over a chunk.
