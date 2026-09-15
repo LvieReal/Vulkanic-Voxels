@@ -88,31 +88,46 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
 	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-	// The game ran "maximized" until this pass; a borderless window on the
-	// primary monitor's work area is the closest GLFW equivalent. On a
-	// compositor that cannot do undecorated windows the decorated fallback is
-	// used (the same path a failed borderless creation takes).
+	// The window is created hidden and shown at the end of this function, with
+	// the maximize state already set: GLFW applies GLFW_MAXIMIZED in each
+	// backend's create path (X11 sets _NET_WM_STATE before mapping, Wayland
+	// remembers it for the toplevel, Win32 creates the window with WS_MAXIMIZE,
+	// Cocoa zooms), so it comes up maximized without ever flashing at the
+	// restored size.
+	glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+
+	// MAXIMIZED BY DEFAULT, with half the monitor as the size to restore to
+	// (pass 44). Pass 43 sized a borderless window to the work area by hand,
+	// which covered the panel/taskbar on the owner's desktop and looked like
+	// fullscreen; "maximized" means work area minus panels, decorations and
+	// dock autohide, and that is window-manager policy this process cannot
+	// reimplement portably.
 	GLFWmonitor* monitor = glfwGetPrimaryMonitor();
 	int areaX = 0;
 	int areaY = 0;
-	int areaWidth = 1280;
-	int areaHeight = 720;
+	int areaWidth = 0;
+	int areaHeight = 0;
 	if (monitor != nullptr) {
 		glfwGetMonitorWorkarea(monitor, &areaX, &areaY, &areaWidth, &areaHeight);
 	}
-	int scaleWidth = areaWidth;
-	int scaleHeight = areaHeight;
+	const GLFWvidmode* mode =
+			monitor != nullptr ? glfwGetVideoMode(monitor) : nullptr;
+	const int minWidth = 640;
+	const int minHeight = 400;
+	// Half the monitor (the work area when there is one - a panel eats part of
+	// the screen): the window the user gets back on un-maximize.
+	const int halfOfWidth =
+			(areaWidth > 0 ? areaWidth : (mode != nullptr ? mode->width : 1280)) /
+			2;
+	const int halfOfHeight =
+			(areaHeight > 0 ? areaHeight : (mode != nullptr ? mode->height : 720)) /
+			2;
+	const int restoreWidth = std::max(minWidth, halfOfWidth);
+	const int restoreHeight = std::max(minHeight, halfOfHeight);
 
-	glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-	m_window = glfwCreateWindow(areaWidth, areaHeight, "Vulkanic Voxels",
+	m_window = glfwCreateWindow(restoreWidth, restoreHeight, "Vulkanic Voxels",
 															nullptr, nullptr);
-	if (m_window == nullptr) {
-		glfwDefaultWindowHints();
-		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-		glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
-		m_window = glfwCreateWindow(scaleWidth, scaleHeight, "Vulkanic Voxels",
-																nullptr, nullptr);
-	}
 	if (m_window == nullptr) {
 		const char* description = nullptr;
 		glfwGetError(&description);
@@ -124,11 +139,23 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 		return false;
 	}
 
-	glfwSetWindowPos(m_window, areaX, areaY);
-	glfwSetWindowSizeLimits(m_window, 640, 400, GLFW_DONT_CARE, GLFW_DONT_CARE);
+	// Centre the restored-size window in the work area. Wayland does not let a
+	// client place its windows and reports the attempt as an error; the
+	// compositor decides, which is fine (it will be maximized anyway).
+	const int platform = glfwGetPlatform();
+	if (platform != GLFW_PLATFORM_WAYLAND && areaWidth > 0 && areaHeight > 0) {
+		glfwSetWindowPos(m_window, areaX + (areaWidth - restoreWidth) / 2,
+										 areaY + (areaHeight - restoreHeight) / 2);
+	}
+
+	glfwSetWindowSizeLimits(m_window, minWidth, minHeight, GLFW_DONT_CARE,
+												 GLFW_DONT_CARE);
 	glfwSetWindowUserPointer(m_window, this);
 
-	const int platform = glfwGetPlatform();
+	// Shown last: the window is already marked maximized, and the size above is
+	// the geometry the window manager restores to when the user un-maximizes.
+	glfwShowWindow(m_window);
+
 	int fbWidth = 0;
 	int fbHeight = 0;
 	glfwGetFramebufferSize(m_window, &fbWidth, &fbHeight);
@@ -142,11 +169,15 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 	float scaleY = 1.0f;
 	glfwGetWindowContentScale(m_window, &scaleX, &scaleY);
 	std::fprintf(stderr,
-							 "[vv] window: %dx%d window pixels -> %ux%u framebuffer "
-							 "pixels (content scale %.2fx%.2f, platform %d)\n",
-							 winWidth, winHeight, m_framebufferWidth,
-							 m_framebufferHeight, static_cast<double>(scaleX),
-							 static_cast<double>(scaleY), platform);
+						 "[vv] window: %dx%d window pixels -> %ux%u framebuffer "
+						 "pixels (content scale %.2fx%.2f, platform %d)\n",
+						 winWidth, winHeight, m_framebufferWidth, m_framebufferHeight,
+						 static_cast<double>(scaleX), static_cast<double>(scaleY),
+						 platform);
+	std::fprintf(stderr,
+						 "[vv] window: maximized (work area %dx%d, restores to %dx%d), "
+						 "decorations on\n",
+						 areaWidth, areaHeight, restoreWidth, restoreHeight);
 
 	applyMainLoopHooks();
 	return true;

@@ -853,3 +853,62 @@ GLFW's documented semantics and built, not run. The owner's gates: a real
 window appears on the target machine (X11 and Wayland), the WASD keys work on
 the owner's layout, the mouse lock behaves (Escape, alt-tab, click to resume),
 and `VV_SDF_SHADOWS=1` still looks as it did in pass 42.
+
+## Pass 44: maximized by default, half the monitor when un-maximized
+
+OWNER (on-device, after pass 43): "pretty sure window is scaled to monitor size
+(can't even see the toolbar), it instead should be 2x less monitor size (when
+not maximized) + maximized by default."
+
+Pass 43 created a BORDERLESS window sized to the monitor's work area and placed
+it at the work area origin. On the owner's desktop that covered the panel
+("can't even see the toolbar") and read as fullscreen, because a client that
+sizes itself to the work area still gets what it asked for on several window
+managers - and on any WM that ignores the request the borderless window ends up
+whatever the WM decides. Hand-rolling "maximized" was the mistake: the work
+area, the panel, dock autohide and decoration geometry are window-manager
+policy, and a client cannot reimplement them portably.
+
+FIX (GameWindow::init):
+
+* Hints: decorated (the default - the borderless hint is gone) and
+  GLFW_VISIBLE = false.
+* The window is created at HALF the monitor's work area (the video mode when
+  there is no work area, 1280x720 if there is no monitor at all), clamped to the
+  640x400 minimum, and centred in the work area. This is the size the user gets
+  back on un-maximize.
+* The maximize state goes through GLFW's OWN create path: the
+  GLFW_MAXIMIZED hint, with the window still hidden and glfwShowWindow() last.
+  That ordering is the point, and it was checked in the GLFW 3.5.1 sources for
+  every backend this supports - x11_window.c sets _NET_WM_STATE before the
+  window is mapped, wl_window.c stores wl.maximized and calls
+  xdg_toplevel_set_maximized when the (deferred) toplevel is created,
+  win32_window.c creates the window with WS_MAXIMIZE (and has a
+  maximizeWindowManually path for the hidden case), cocoa_window.m zooms at
+  creation - so the window comes up maximized with no flash of the restored
+  size, and the size the client asked for is what the WM treats as the geometry
+  to restore to. glfwMaximizeWindow() would have taken the "window already
+  exists" path in each backend and depended on the same source facts less
+  directly.
+* glfwSetWindowPos is skipped on Wayland, which does not let a client place its
+  windows and reports the attempt as GLFW_FEATURE_UNAVAILABLE (that error would
+  otherwise print through the GLFW error callback on every start). The
+  compositor places the window; it is maximized a moment later anyway.
+
+The startup log now says both sizes:
+
+  [vv] window: 1920x1040 window pixels -> 1920x1040 framebuffer pixels
+               (content scale 1.00x1.00, platform 393221)
+  [vv] window: maximized (work area 1920x1040, restores to 960x520),
+               decorations on
+
+which also makes the debug title (build id + fps) visible for the first time -
+the pass-43 borderless window had no title bar to show it in.
+
+NOT PROVEN HERE: the sandbox has no window manager, so the maximize request, the
+restore geometry and the panel behavior are reasoned from GLFW's documented
+semantics plus its X11/Wayland source (checked: x11_window.c sets
+_NET_WM_STATE on an unmapped window; wl_window.c applies wl.maximized when the
+toplevel is created) and built, not run. Owner check: the window comes up
+maximized with the panel visible, and un-maximizing gives a window about half
+the screen, centred.

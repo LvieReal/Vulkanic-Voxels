@@ -18,6 +18,11 @@ namespace vv::core {
 // window centre by GLFW), so callbacks deliver relative deltas; Escape
 // releases it (GLFW_CURSOR_NORMAL) and pauses the game. lockMouse() also
 // refocuses and re-centres the cursor so no first frame sees a jump.
+//
+// Window state: created hidden at half the monitor's work area, centered,
+// maximized and then shown (pass 44) - the maximize request reaches the window
+// manager before the window is mapped, so it comes up maximized with no flash
+// and un-maximizing gives the half-size window back.
 class GameWindow final {
  public:
 	struct Hooks {
@@ -49,11 +54,9 @@ class GameWindow final {
 	// client API (GLFW_NO_API), applies the platform hints, installs the
 	// hooks and enters the main loop on run().
 	//
-	// The window is created at the primary monitor's work area, borderless
-	// (the game was "maximized" until this pass); on a compositor that does
-	// not support undecorated windows (some Wayland ones) it falls back to
-	// the decorated window, and the content scale the compositor reports is
-	// logged for both the framebuffer and the window size.
+	// The window starts MAXIMIZED (decorated, so the window manager decides
+	// what maximized means: work area minus panels) and un-maximizes to half
+	// the monitor. The content scale and both sizes are logged.
 	bool init(const Hooks& hooks, std::string& outError);
 
 	// True once the user (or the compositor) asked the window and the loop

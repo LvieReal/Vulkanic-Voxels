@@ -34,6 +34,7 @@ startup log prints which position and which label each action got.
 | `Shift` | Sprint (×3) |
 | Mouse | Look (cursor disabled while playing, relative motion, no button needed) |
 | `Esc` | Release the cursor & pause the camera — press again (or click) to resume |
+| Window | Starts maximized; un-maximizing (title-bar button or WM shortcut) gives a window half the monitor size |
 
 ## Building
 
@@ -94,9 +95,13 @@ cmake --build build
 ./build/release/bin/game
 ```
 
-A small pure-logic test suite (noise, terrain layering, chunked world) builds
-alongside by default — run it with `ctest --test-dir build` (or disable with
-`-DVV_BUILD_TESTS=OFF`).
+The window opens **maximized** (decorated, so the window manager keeps panels
+and the title bar usable) and un-maximizes to **half the monitor**. Both sizes
+are printed at startup (`[vv] window: ...`).
+
+A small pure-logic test suite (noise, terrain layering, chunked world, key
+bindings, the PNG decoder) builds alongside by default — run it with
+`ctest --test-dir build` (or disable with `-DVV_BUILD_TESTS=OFF`).
 
 ### Render experiments
 
