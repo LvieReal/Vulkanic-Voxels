@@ -88,8 +88,10 @@ background thread on every region change) is sphere-traced toward the sun with
 the plain Quilez `k*h/t` penumbra estimate, so shadow edges are soft on
 vertical / side casters too and not just on flat tops (`kShadowSharpness` in
 the shader tunes the softness). Only the box is
-field-aware - a shadow ray that leaves it is treated as open space - and until
-the first box lands the 2.5D top-plane penumbra runs instead. Exact binary sun shadows remain the default
+field-aware: a shadow ray that leaves it hands over to the 2.5D penumbra
+traversal (keeping the distance already marched and the visibility so far), so
+casters outside the box still shadow the frame; until the first box lands the
+same 2.5D traversal runs from the surface. Exact binary sun shadows remain the default
 reference; `VV_SHADOW_SHARP=1` explicitly selects them.
 
 Both the X11 (XCB) and Wayland surface backends are compiled in when their

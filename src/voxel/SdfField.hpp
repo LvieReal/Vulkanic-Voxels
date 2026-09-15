@@ -192,9 +192,11 @@ private:
 // spends `steps`) without hitting anything: outExit/outExitT/outVisibility
 // (all optional) receive the exit point, the distance travelled and the
 // accumulated visibility, and the return value is true - the caller MUST
-// continue the ray with a wider traversal. On the GPU the field covers only
-// the 6x6 chunks around the camera, so leaving it is NOT open space: the
-// shader hands the ray to its whole-region 2.5D march (see
+// continue the ray with a wider traversal. outExit is the point where the
+// ray crosses the field boundary (not the first sample past it), so the
+// continuation starts exactly where the field stops. On the GPU the field
+// covers only the 6x6 chunks around the camera, so leaving it is NOT open
+// space: the shader hands the ray to its whole-region 2.5D march (see
 // sunRayEscapesSdf3d, pass 40). Returns false when the field resolved the
 // ray itself (a hit, a low sun, or the march never left it): outVisibility
 // is then the final answer.
@@ -213,28 +215,43 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         }
         return false;
     }
+    // Pass 40 (shader mirror): hand the ray over at the box CROSSING, not at
+    // the first sample past it, so a step (up to 0.7 * h) cannot skip a
+    // caster sitting in the strip just outside the box. 0 when the origin
+    // already starts outside - those rays belong to the wider march alone.
+    const float hi[3] = {float(sdf.nx()), float(sdf.ny()), float(sdf.nz())};
+    float tExit = 0.0f;
+    if (o[0] >= 0.0f && o[0] < hi[0] && o[1] >= 0.0f && o[1] < hi[1] &&
+        o[2] >= 0.0f && o[2] < hi[2]) {
+        tExit = 1e30f;
+        for (int a = 0; a < 3; ++a) {
+            if (std::abs(d[a]) > 1e-6f) {
+                const float face = (d[a] > 0.0f) ? hi[a] : 0.0f;
+                tExit = std::min(tExit, (face - o[a]) / d[a]);
+            }
+        }
+    }
     float visibility = 1.0f;
     float t = 0.0f;
     for (int i = 0; i < steps; ++i) {
-        const float px = o[0] + d[0] * t;
-        const float py = o[1] + d[1] * t;
-        const float pz = o[2] + d[2] * t;
         // Left the field: report where, so the caller can keep marching.
-        if (px < 0.0f || px >= float(sdf.nx()) || py < 0.0f ||
-            py >= float(sdf.ny()) || pz < 0.0f || pz >= float(sdf.nz())) {
+        if (t >= tExit) {
             if (outExit != nullptr) {
-                outExit[0] = px;
-                outExit[1] = py;
-                outExit[2] = pz;
+                outExit[0] = o[0] + d[0] * tExit;
+                outExit[1] = o[1] + d[1] * tExit;
+                outExit[2] = o[2] + d[2] * tExit;
             }
             if (outExitT != nullptr) {
-                *outExitT = t;
+                *outExitT = tExit;
             }
             if (outVisibility != nullptr) {
                 *outVisibility = visibility;
             }
             return true;
         }
+        const float px = o[0] + d[0] * t;
+        const float py = o[1] + d[1] * t;
+        const float pz = o[2] + d[2] * t;
         const float h = sdf.sample(px, py, pz);
         if (h < 1e-3f) {
             if (outVisibility != nullptr) {

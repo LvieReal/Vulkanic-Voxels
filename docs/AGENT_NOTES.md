@@ -79,10 +79,11 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   edges too; pass 38 ports it to the GPU (argmin-seed storage buffer +
   sphere trace), pass 39 fixes the box build (wrong chunk Z stride -> the
   whole region around the camera was fully shadowed).
-  Current state = pass 39: the 3D voxel SDF sphere trace (CPU reference in
+  Current state = pass 40: the 3D voxel SDF sphere trace (CPU reference in
   src/voxel/SdfField.hpp, box build + chunk-layout walk in
-  src/voxel/SdfBox.hpp, GPU mirror in pixels_rgba.comp), 2.5D k*h/t as the
-  fallback until the first box lands.
+  src/voxel/SdfBox.hpp, GPU mirror in pixels_rgba.comp) hands a ray leaving
+  its box over to the 2.5D k*h/t traversal at the box crossing instead of
+  calling the box edge open space (pass 39 = the scrambled box build).
   Exact binary shadows remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
   future foliage can attenuate and be marched through instead of
@@ -597,4 +598,67 @@ ALSO MEASURED, NOT CHANGED (parked):
   If a shadow cutoff is ever seen at the box faces, the fix is to hand the
   march over to the 2.5D column traversal on leaving the box (thread t0 and
   the accumulated visibility into sunRayEscapesSdf) instead of breaking.
+  SUPERSEDED by pass 40 below: that hand-off is now in, for the other half
+  of the problem (surfaces outside the box).
 
+## Pass 40: the box edge was open space - hand the ray over instead
+
+FOUND WHILE VERIFYING PASS 39 (first-person view probe, real terrain, seed
+1337, 120x40 camera rays): the stride fix removed the whole-region shadowing,
+but 53 of the 2946 hit pixels still rendered fully lit where the exact march
+is shadowed. All 53 are pixels whose own surface lies OUTSIDE the 6x6-chunk
+box (0 of the 2385 in-box surfaces leak): for them the old sunRayEscapesSdf3d
+sampled once, found the sample outside the box and returned "open space" - no
+SDF shadow at all. Note it is the other half of the box question the pass-39
+parked note measured: a surface INSIDE the box blocked by a caster OUTSIDE it
+still does not happen at this sun (0 of 2946).
+
+FIX (one problem, one pass): leaving the box now CONTINUES the ray in world
+space. sunRayEscapesSdf3d hands over to the 2.5D column traversal
+(sunRayEscapesSdf - the whole near region plus far cells, exactly what shadows
+the frame until the first box lands) with
+- the hand-off point ON the box crossing (analytic slab exit; the origin
+  itself when it already starts outside). Handing over at the first SAMPLE
+  past the box instead would skip the strip between the last in-box sample
+  and the boundary - a march step is up to 0.7 * h, so a caster just outside
+  the face could hide in it;
+- startT = the distance already marched, so the k*h/t estimate keeps the true
+  distance from the shaded surface (penumbra width must not restart);
+- startVisibility = the visibility the field accumulated, so both traversals
+  fold into one min (never brighter than either alone).
+sunRayEscapesSdf now takes (startT, startVisibility) and runs positions off a
+local t; with (0, 1) it is bit-identical to the old fallback, and a 160-step
+budget that runs out while still inside the box hands over the same way. CPU
+mirrors: SdfField::sphereTracedShadowExits reports the crossing point, and the
+test's sunRayEscapesSdfMirror takes the same two seed arguments.
+
+MEASURED (probe7 = probes/probe_view.cpp, exact 0.25-step march as the oracle,
+output /tmp/probe7.txt; "leaks" = lit where the exact march is dark,
+"over-dark" = dark where it is lit):
+
+    pass-38 walk + old shader          53 leaks   2241 over-dark
+    pass-39 walk + old shader          53 leaks     21 over-dark
+    pass-39 walk + pass-40 hand-off     0 leaks     21 over-dark
+
+The 53 leaks were 0 at in-box surfaces and 53 at out-of-box surfaces; the
+hand-off removes all of them. The 21 remaining over-dark pixels are the
+pass-34 k*h/t penumbra on exactly-lit penumbra pixels (owner-accepted over the
+pass-35/36 "bright spots").
+
+TEST: testSdfBoxHandoff pins it against a field covering only x < 16 with the
+caster outside it: 82 shadowed / 78 lit columns, the field alone leaks 56, the
+hand-off leaks 0, and outside the field the composite equals the plain 2.5D
+march exactly. Leak judging is restricted to columns where real voxels block
+the ray (79 of 82; the other 3 are height-field skims - the exact mirror's
+height model blocks a ray that merely grazes a column top, which the
+cell-accurate field march correctly does not). Full suite green; the exact
+binary path (VV_SDF_SHADOWS=0) is untouched and the pre-build 2.5D fallback
+call passes (0, 1), so its output is unchanged.
+
+VERIFIED IN THE SANDBOX (toolchain: scripts/build-linux-toolchain.sh under
+/tmp/deps): glslangValidator -V resources/shaders/pixels_rgba.comp exits 0
+(the hand-off compiles for real), and the project builds warning-free in both
+build/release and build/debug (the first in-tree build of SdfBox.hpp and the
+renderer's box geometry logging) with ctest green in both and the offscreen
+smoke run (QT_QPA_PLATFORM=offscreen) exiting cleanly. On-device rendering is
+still the owner's gate.

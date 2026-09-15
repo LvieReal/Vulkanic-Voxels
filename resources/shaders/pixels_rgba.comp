@@ -663,48 +663,81 @@ float sampleSdf3d(vec3 p)
 // step conservatively by the SDF (0.7x so the chamfer over-estimate can
 // never skip a surface), fold k*h/t into the running min. h is the true 3D
 // distance to the solid surface, so every shadow edge shares one continuous
-// penumbra. Leaving the box = open space (the box covers the near surface;
-// casters that reach the sun are within it). Returns fractional visibility.
+// penumbra.
+//
+// Pass 40: the field covers only the 6x6 chunks around the camera (-96..96),
+// so a ray that leaves it is NOT in open space - terrain farther out still
+// shadows it, and breaking there left lit leaks / a hard box-edge band (CPU
+// probe: 53 leaked pixels of 2946 and a visible band without the hand-off, 0
+// with it). Leaving the box - or exhausting the 160-step budget while still
+// inside it - hands the rest of the ray to the 2.5D traversal below, which
+// walks the WHOLE region with the exact march's occlusion events. Returns
+// fractional visibility.
+float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
+                       float startVisibility);
+
 float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
 {
     if (sdfBox.box.w < 0)
         return 1.0;  // no field yet: fully lit
+    const vec3 lo = vec3(sdfBox.box.xyz);
+    const vec3 hi = lo + vec3(float(sdfBox.dims.x), float(sdfBox.dims.y),
+                              float(sdfBox.dims.z));
+    // Parameter of the box crossing. 0 when the origin already starts
+    // outside: such a ray is the world-space march's business alone.
+    float tExit = 0.0;
+    if (all(greaterThanEqual(origin, lo)) && all(lessThan(origin, hi))) {
+        tExit = 1e30;
+        for (int a = 0; a < 3; ++a) {
+            if (abs(sunV[a]) > 1e-6) {
+                const float face = (sunV[a] > 0.0) ? hi[a] : lo[a];
+                tExit = min(tExit, (face - origin[a]) / sunV[a]);
+            }
+        }
+    }
     float visibility = 1.0;
     float t = 0.0;
     for (int i = 0; i < 160; ++i) {
-        vec3 p = origin + sunV * t;
-        if (p.x < float(sdfBox.box.x) ||
-            p.x >= float(sdfBox.box.x + sdfBox.dims.x) ||
-            p.y < float(sdfBox.box.y) ||
-            p.y >= float(sdfBox.box.y + sdfBox.dims.y) ||
-            p.z < float(sdfBox.box.z) ||
-            p.z >= float(sdfBox.box.z + sdfBox.dims.z))
-            break;  // left the field: open space
-        float h = sampleSdf3d(p);
+        // Hand off exactly at the crossing, not at the first sample past
+        // it: a step (up to 0.7 * h) must not skip a caster sitting in
+        // the strip just outside the box.
+        if (t >= tExit)
+            return sunRayEscapesSdf(origin + sunV * tExit, sunV, tExit,
+                                    visibility);
+        const vec3 p = origin + sunV * t;
+        const float h = sampleSdf3d(p);
         if (h < 1e-3)
             return 0.0;  // hit the surface: fully shadowed from here
         visibility = min(visibility, shadowPenumbra(h, t));
         t += max(h * 0.7, 0.05);
     }
-    return visibility;
+    return sunRayEscapesSdf(origin + sunV * t, sunV, t, visibility);
 }
 
 // SDF soft shadow ray (VV_SDF_SHADOWS=1), the 2.5D top-plane penumbra
-// (pass 34) - kept as the fallback when no 3D SDF field is uploaded yet
-// (the first region before the background build lands, and every frame the
-// field is still building). The TRAVERSAL is the exact march's ascending
-// column DDA + height-bound cell walk + coarse far cells - the same
-// occlusion events as sunRayEscapes, so nothing the binary march shadows
-// can leak, and the 256-column budget matches it (the old sphere-traced
-// variant stepped by the "SDF" value, crawled at ~0.04 voxels/step near
-// surfaces, and burned its 128-step budget within ~50 voxels). Softness
-// comes from shadowPenumbra, sampled at every column the ray clears, from
-// the distance to that column's top plane. Returns fractional visibility
-// (1.0 = fully lit, 0.0 = fully shadowed).
-float sunRayEscapesSdf(vec3 origin, vec3 sunV)
+// (pass 34) - the fallback when no 3D SDF field is uploaded yet (the first
+// region before the background build lands, and every frame the field is
+// still building), AND since pass 40 the continuation of the 3D SDF march
+// once that ray leaves the SDF box (see sunRayEscapesSdf3d). The TRAVERSAL
+// is the exact march's ascending column DDA + height-bound cell walk + coarse
+// far cells over the WHOLE region, so nothing the binary march shadows can
+// leak, and the 256-column budget matches it (the old sphere-traced variant
+// stepped by the "SDF" value, crawled at ~0.04 voxels/step near surfaces, and
+// burned its 128-step budget within ~50 voxels). Softness comes from
+// shadowPenumbra, sampled at every column the ray clears, from the distance
+// to that column's top plane. Returns fractional visibility (1.0 = fully lit,
+// 0.0 = fully shadowed).
+//
+// `origin` is the point the traversal starts from; `startT` is how far the ray
+// has ALREADY come from the shaded surface (the sphere trace hands its ray
+// over mid-flight, and the penumbra estimate must keep using the true distance
+// from that surface, not the distance from the hand-off point), and
+// `startVisibility` the visibility accumulated so far, folded into.
+float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
+                       float startVisibility)
 {
     if (sunV.y <= 0.05) {
-        return 1.0;  // low/sunset sun: no cheap ascend bound, skip
+        return startVisibility;  // low/sunset sun: no cheap ascend bound, skip
     }
     const float EPS = 1e-6;
     const float maxTerr = float(pc.grid.w) + 1.0;
@@ -730,12 +763,14 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
         sStepZ = 0;
     }
 
-    float visibility = 1.0;  // min over the march's penumbra samples
-    float t = 0.0;           // distance marched (voxel units)
+    float visibility = startVisibility;  // min over the penumbra samples
+    float tLocal = 0.0;  // distance from THIS traversal's origin (positions)
+    // Penumbra samples need the distance from the shaded surface, which keeps
+    // growing across a hand-off: startT + tLocal.
 
     for (int i = 0; i < 256; ++i) {
         const float sExit = min(sMaxX, sMaxZ);
-        const float y0 = origin.y + sunV.y * t;
+        const float y0 = origin.y + sunV.y * tLocal;
 
         // Above all possible terrain: lit from here on. Keep the
         // accumulated penumbra - a distant graze already darkened it.
@@ -753,7 +788,8 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
                 // Clear of the column: its top plane at `bound` is the
                 // closest relevant surface (the ray is ascending).
                 const float h = y0 - float(bound);
-                visibility = min(visibility, shadowPenumbra(h, t));
+                visibility =
+                    min(visibility, shadowPenumbra(h, startT + tLocal));
             } else {
                 // The segment dips below the column's top: the exact cell
                 // walk decides (identical walk to sunRayEscapes).
@@ -810,7 +846,8 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
                     if (y0 < h) {
                         return 0.0;  // the exact march's far occlusion
                     }
-                    visibility = min(visibility, shadowPenumbra(y0 - h, t));
+                    visibility = min(visibility,
+                                     shadowPenumbra(y0 - h, startT + tLocal));
                 }
             }
         }
@@ -818,7 +855,7 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV)
 
         // Advance to the next column: branchless 2D DDA step (identical to
         // the exact march, same tie rule).
-        t = sExit;
+        tLocal = sExit;
         const bool takeX = sMaxX < sMaxZ;
         sMaxX += takeX ? sDeltaX : 0.0;
         sMaxZ += takeX ? 0.0 : sDeltaZ;
@@ -855,7 +892,7 @@ float sunShadow(vec3 hitPosVox, vec3 n)
         if (sdfBox.box.w >= 0) {
             return sunRayEscapesSdf3d(origin, sunV);
         }
-        return sunRayEscapesSdf(origin, sunV);
+        return sunRayEscapesSdf(origin, sunV, 0.0, 1.0);
     }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }

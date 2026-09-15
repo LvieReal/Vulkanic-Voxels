@@ -2035,9 +2035,9 @@ double shadowPenumbraMirror(double h, double t) {
 // column DDA + height-bound walk + coarse far cells (same occlusion
 // events), fractional visibility from per-column penumbra samples.
 double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
-		const double dir[3]) {
+		const double dir[3], double startT = 0.0, double startVisibility = 1.0) {
 	if (dir[1] <= 0.05) {
-		return 1.0;
+		return startVisibility;
 	}
 	const double EPS = 1e-6;
 	int stepX = (dir[0] > 0.0) ? 1 : -1;
@@ -2058,11 +2058,14 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 		stepZ = 0;
 	}
 
-	double visibility = 1.0;
-	double t = 0.0;
+	// `startT` is how far the ray has already come from the shaded surface
+	// (the 3D SDF march hands over mid-flight, pass 40) and startVisibility
+	// what it has already accumulated; positions run off tLocal.
+	double visibility = startVisibility;
+	double tLocal = 0.0;
 	for (int i = 0; i < 256; ++i) {
 		const double sExit = std::min(tMaxX, tMaxZ);
-		const double y0 = o[1] + dir[1] * t;
+		const double y0 = o[1] + dir[1] * tLocal;
 		if (y0 >= w.maxTerr) {
 			return visibility;
 		}
@@ -2073,7 +2076,9 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 			if (bound != 0xFFFFu) {
 				if (y0 >= double(bound)) {
 					const double h = y0 - double(bound);
-					visibility = std::min(visibility, shadowPenumbraMirror(h, t));
+					visibility = std::min(
+							visibility,
+							shadowPenumbraMirror(h, startT + tLocal));
 				} else {
 					const double y1 = o[1] + dir[1] * sExit;
 					const int yTop = std::min(
@@ -2105,10 +2110,11 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 				if (y0 < h) {
 					return 0.0;
 				}
-				visibility = std::min(visibility, shadowPenumbraMirror(y0 - h, t));
+				visibility = std::min(
+						visibility, shadowPenumbraMirror(y0 - h, startT + tLocal));
 			}
 		}
-		t = sExit;
+		tLocal = sExit;
 		const bool takeX = tMaxX < tMaxZ;
 		tMaxX += takeX ? dX : 0.0;
 		tMaxZ += takeX ? 0.0 : dZ;
@@ -2116,6 +2122,29 @@ double sunRayEscapesSdfMirror(const ShadowWorld& w, const double o[3],
 		colZ += takeX ? 0 : stepZ;
 	}
 	return visibility;
+}
+
+// Mirror of the shader's sunRayEscapesSdf3d + its pass-40 hand-off: sphere
+// trace the ray through the (box-local) SDF, and when the march leaves the
+// field - or spends its step budget - continue in world space with the
+// whole-region 2.5D march, seeded with the distance travelled and the
+// visibility the field accumulated. `boxOrigin` is where the field's (0,0,0)
+// sits in world coordinates.
+double sdf3dHandoffMirror(const vv::voxel::SdfField& sdf,
+		const double boxOrigin[3], const ShadowWorld& w, const double o[3],
+		const double dir[3]) {
+	const float of[3] = {float(o[0] - boxOrigin[0]),
+			float(o[1] - boxOrigin[1]), float(o[2] - boxOrigin[2])};
+	const float df[3] = {float(dir[0]), float(dir[1]), float(dir[2])};
+	float exit[3] = {0.0f, 0.0f, 0.0f};
+	float exitT = 0.0f;
+	float vis = 1.0f;
+	if (!vv::voxel::sphereTracedShadowExits(sdf, of, df, exit, &exitT, &vis)) {
+		return double(vis);
+	}
+	const double exitWorld[3] = {boxOrigin[0] + double(exit[0]),
+			boxOrigin[1] + double(exit[1]), boxOrigin[2] + double(exit[2])};
+	return sunRayEscapesSdfMirror(w, exitWorld, dir, double(exitT), double(vis));
 }
 
 // SDF soft shadow: occlusion parity with the exact march (fully dark
@@ -2278,6 +2307,115 @@ ShadowWorld makeSdfTestWorld() {
 	w.farDim = 0;
 	w.farCells.clear();
 	return w;
+}
+
+// Does the ray actually cross a solid cell of the near voxel world? The
+// exact mirror's blocked verdict also fires where a ray merely skims a
+// column top in its height-field model, which the cell-accurate field march
+// (correctly) does not - such a column is not a usable leak oracle.
+bool nearSolidOnRay(const ShadowWorld& w, const double o[3],
+		const double dir[3]) {
+	for (double t = 0.0; t <= 200.0; t += 0.05) {
+		const int cx = int(std::floor(o[0] + dir[0] * t));
+		const int cy = int(std::floor(o[1] + dir[1] * t));
+		const int cz = int(std::floor(o[2] + dir[2] * t));
+		if (cx < 0 || cx >= w.near.wx || cz < 0 || cz >= w.near.wz || cy < 0 ||
+				cy >= w.near.wh) {
+			return false;  // left the near world: no cell can block further
+		}
+		if (w.near.at(cx, cy, cz) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Pass 40: the 6x6-chunk SDF box is not the world. Its whole point is to
+// soften the near shadows; casters OUTSIDE it still shadow the ray, so
+// sunRayEscapesSdf3d hands the ray to the 2.5D march at the boundary instead
+// of treating it as open space. Pins (1) the scenario - a caster outside the
+// box, where the field alone leaks full light, (2) no leak once the hand-off
+// continues the ray, and (3) that outside the field the composite is exactly
+// the 2.5D march.
+void testSdfBoxHandoff() {
+	ShadowWorld w = makeSdfTestWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+
+	// A field over x in [0,16) only: the mesa (x in [20,24), the caster of
+	// every shadow over this ground) lies outside it, like the GPU's field
+	// (6x6 chunks around the camera) versus the whole near region.
+	const int bx = 16;
+	vv::voxel::SdfField sdf;
+	sdf.build(bx, w.near.wh, w.near.wz,
+			[&](int x, int y, int z) { return w.near.at(x, y, z) != 0; });
+	const double boxOrigin[3] = {0.0, 0.0, 0.0};
+
+	int shadowed = 0, lit = 0, leaksFieldOnly = 0, leaksHandoff = 0;
+	int darkened = 0;  // the continuation found occlusion the field missed
+	int judged = 0;    // shadowed columns a real cell blocks (usable oracle)
+	int unjudged = 0;  // shadowed only in the height-field model: skipped
+	for (int x = 6; x < 16; ++x) {
+		for (int z = 12; z < 44; z += 2) {
+			const unsigned bound = w.near.boundAt(x, z);
+			if (bound == 0xFFFFu) {
+				continue;
+			}
+			double p[3] = {double(x) + 0.5, double(bound), double(z) + 0.5};
+			double n[3] = {0.0, 1.0, 0.0};
+			double o[3];
+			for (int a = 0; a < 3; ++a) {
+				o[a] = p[a] + n[a] * 1e-3 + sun[a] * 1e-2;
+			}
+			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+			const float df[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+			const double softFieldOnly =
+					double(vv::voxel::sphereTracedShadow(sdf, of, df));
+			const double softHandoff =
+					sdf3dHandoffMirror(sdf, boxOrigin, w, o, sun);
+			if (softHandoff < softFieldOnly - 1e-6) {
+				++darkened;
+			}
+			if (sunRayEscapesMirror(w, o, sun)) {
+				++lit;
+				continue;
+			}
+			++shadowed;
+			if (softFieldOnly > 0.5 + 1e-3) {
+				++leaksFieldOnly;
+			}
+			// Judge the leak only where voxels really block the ray; a
+			// height-field skim is a model disagreement, not a leak.
+			if (!nearSolidOnRay(w, o, sun)) {
+				++unjudged;
+				continue;
+			}
+			++judged;
+			if (softHandoff > 0.5 + 1e-3) {
+				++leaksHandoff;
+			}
+		}
+	}
+	check(shadowed > 20,
+			"sdf box hand-off: the caster-outside-the-box setup is exercised");
+	check(leaksFieldOnly > 0,
+			"sdf box hand-off: the field alone really leaks here (scenario valid)");
+	check(leaksHandoff == 0,
+			"sdf box hand-off: no light leak with the whole-region continuation");
+	check(judged > 10,
+			"sdf box hand-off: real cell blockers are exercised");
+	check(darkened > 0,
+			"sdf box hand-off: the continuation actually finds the casters");
+	// Outside the field the composite must reduce to the plain 2.5D march.
+	const double outside[3] = {40.5, 20.0, 20.5};
+	check(std::abs(sdf3dHandoffMirror(sdf, boxOrigin, w, outside, sun) -
+			sunRayEscapesSdfMirror(w, outside, sun)) < 1e-9,
+			"sdf box hand-off: outside the field it is exactly the 2.5D march");
+	std::printf("sdf box hand-off: %d shadowed / %d lit columns (%d judged, "
+			"%d height-field-only); leaks field only %d, with the hand-off %d; "
+			"%d darkened by it\n",
+			shadowed, lit, judged, unjudged, leaksFieldOnly, leaksHandoff,
+			darkened);
 }
 
 void testSdfSoftShadow3d() {
@@ -2964,6 +3102,7 @@ int main() {
 	testSunShadowSdfMarch();
 	testSdfSoftShadow3d();
 	testSdfBoxBuild();
+	testSdfBoxHandoff();
 	testStreamPriority();
 	testVoxelTextures();
 
