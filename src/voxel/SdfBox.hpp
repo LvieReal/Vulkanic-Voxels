@@ -33,6 +33,31 @@ namespace vv::voxel {
 
 // Geometry of the SDF box in world voxels: `origin*` is the min corner,
 // `nx/ny/nz` the size in cells.
+//
+// Pass 41 - the box is a WINDOW that MOVES. The renderer recenters it on the
+// camera's chunk at every crossing, so anything about the shading that depends
+// on where the box sits shows up as flicker while walking. Two things did:
+//
+//   1. The chamfer EDT only sees solids inside the box it runs over, so the
+//      field's outermost chunk-wide band has a truncated view: its nearest-
+//      solid seeds come from a candidate set that depends on the placement.
+//      Measured on real terrain (probe_rebuild_swap): a one-chunk recenter
+//      moves 33.4% of that band's cells, 0.1% one chunk deeper, 0.0% two
+//      chunks deeper; measured against a bigger-halo reference build over the
+//      test world: 30,707 of 589,824 sampled cells (max 18.9 voxels) differ
+//      for a halo-less box, 0 for a box built one chunk larger than it is
+//      queried (testSdfHaloStability). The renderer therefore builds a box
+//      one chunk bigger than the near field it must get right (pass 41 grew
+//      kSdfHalfChunks 3 -> 4): everything that used to be shaded is then a
+//      whole chunk inside the build. `haloed(n)` is what grows a box by whole
+//      chunks, and it is also how the test builds its reference.
+//   2. The shadow ray's hand-off point, which is what the owner actually saw:
+//      pass 40 handed the ray to the 2.5D march where it LEFT the box, i.e. at
+//      a point that moved a whole chunk with every recenter. Pass 41 pins the
+//      hand-off to a FIXED distance along the ray (SdfField::
+//      sphereTracedShadowExits, shader sunRayEscapesSdf3d), which makes the
+//      composite shadow at a point independent of the window for every point
+//      the window keeps covering (testSdfReshadeInvariance).
 struct SdfBoxGeometry final {
 	std::int32_t originX = 0;
 	std::int32_t originY = 0;
@@ -77,6 +102,21 @@ struct SdfBoxGeometry final {
 				static_cast<std::int32_t>(chunkSizeZ);
 		box.nx = box.chunksPerSide * chunkSizeX;
 		box.ny = worldHeight;
+		box.nz = box.chunksPerSide * chunkSizeZ;
+		return box;
+	}
+
+	// The same box grown by `haloChunks` whole chunks on each lateral side
+	// (X/Z). Y is untouched: the box already spans the whole world height, so
+	// no solid can sit below it and nothing above it is solid.
+	SdfBoxGeometry haloed(std::uint32_t haloChunks) const {
+		SdfBoxGeometry box = *this;
+		box.chunksPerSide = chunksPerSide + 2u * haloChunks;
+		box.originX -= static_cast<std::int32_t>(haloChunks) *
+									 static_cast<std::int32_t>(chunkSizeX);
+		box.originZ -= static_cast<std::int32_t>(haloChunks) *
+									 static_cast<std::int32_t>(chunkSizeZ);
+		box.nx = box.chunksPerSide * chunkSizeX;
 		box.nz = box.chunksPerSide * chunkSizeZ;
 		return box;
 	}

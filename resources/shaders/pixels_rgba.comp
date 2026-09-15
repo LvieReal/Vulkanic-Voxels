@@ -135,8 +135,8 @@ layout(set = 0, binding = 12) readonly buffer SdfField {
 } sdfField;
 
 layout(std140, set = 0, binding = 13) uniform SdfBox {
-    ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
-    uvec4 dims;   // xyz = box size in cells (== sdfDim), w = 0 when no SDF
+    ivec4 box;    // xyz = box origin in world voxels, w = -1 if none
+    uvec4 dims;   // xyz = box size in cells, w = 0 when no SDF
 } sdfBox;
 
 
@@ -628,13 +628,12 @@ float sampleSdf3d(vec3 p)
         return 1e30;
     vec3 local = p - vec3(sdfBox.box.xyz);
     ivec3 c = ivec3(floor(local));
-    if (c.x < 0 || c.x >= int(sdfBox.dims.x) ||
-        c.y < 0 || c.y >= int(sdfBox.dims.y) ||
-        c.z < 0 || c.z >= int(sdfBox.dims.z))
-        return 1e30;
     uint nx = sdfBox.dims.x;
     uint ny = sdfBox.dims.y;
     uint nz = sdfBox.dims.z;
+    if (c.x < 0 || c.x >= int(nx) || c.y < 0 || c.y >= int(ny) ||
+        c.z < 0 || c.z >= int(nz))
+        return 1e30;
     float best = 1e30;
     for (int dz = -1; dz <= 1; ++dz) {
         int zc = c.z + dz;
@@ -648,8 +647,7 @@ float sampleSdf3d(vec3 p)
                 uint s = sdfField.seed[uint(xc) + uint(yc) * nx +
                                        uint(zc) * nx * ny];
                 if (s == 0xFFFFFFFFu) continue;
-                vec3 v = vec3(float(s % nx),
-                              float((s / nx) % ny),
+                vec3 v = vec3(float(s % nx), float((s / nx) % ny),
                               float(s / (nx * ny)));
                 best = min(best, sdfCubeDistance(local, v));
             }
@@ -665,16 +663,34 @@ float sampleSdf3d(vec3 p)
 // distance to the solid surface, so every shadow edge shares one continuous
 // penumbra.
 //
-// Pass 40: the field covers only the 6x6 chunks around the camera (-96..96),
+// Pass 40: the field covers only the 8x8 chunks around the camera (-128..128),
 // so a ray that leaves it is NOT in open space - terrain farther out still
 // shadows it, and breaking there left lit leaks / a hard box-edge band (CPU
 // probe: 53 leaked pixels of 2946 and a visible band without the hand-off, 0
-// with it). Leaving the box - or exhausting the 160-step budget while still
-// inside it - hands the rest of the ray to the 2.5D traversal below, which
-// walks the WHOLE region with the exact march's occlusion events. Returns
-// fractional visibility.
+// with it). The rest of the ray goes to the 2.5D traversal below, which walks
+// the WHOLE region with the exact march's occlusion events. Returns fractional
+// visibility.
 float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
                        float startVisibility);
+
+// Pass 41: the SDF term is a FIXED length of ray (kSdfTraceVoxels) from the
+// shaded point, so the point where the 2.5D traversal takes over is a function
+// of the shaded point and the sun alone - never of where the box sits. That is
+// the flicker fix: pass 40 handed the ray over at the box CROSSING, so the
+// same ground shadows re-flowed every time the camera crossed a chunk and the
+// box recentered (measured on real terrain: 806/4239 = 19.0% of the window's
+// outer band columns moved by > 0.05 visibility per crossing). With the fixed
+// hand-off a rebuild moves NOTHING the two boxes share.
+//
+// A point the box cannot give the fixed term to - its lateral faces closer
+// than the fixed length (the band along a box face), a start point outside the
+// box, or a sun too low to ascend - gets the plain 2.5D march from the shaded
+// point, which is exactly the VV_SDF_SHADOWS=0 path. That is deliberate: a
+// hand-off that moved with the box would be visible, and the 2.5D path is the
+// same answer whatever the box does. The box's Y faces are the world floor and
+// sky, the same plane wherever the box sits, so a ray that climbs out of the
+// world hands over there instead.
+const float kSdfTraceVoxels = 64.0;
 
 float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
 {
@@ -683,27 +699,27 @@ float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
     const vec3 lo = vec3(sdfBox.box.xyz);
     const vec3 hi = lo + vec3(float(sdfBox.dims.x), float(sdfBox.dims.y),
                               float(sdfBox.dims.z));
-    // Parameter of the box crossing. 0 when the origin already starts
-    // outside: such a ray is the world-space march's business alone.
-    float tExit = 0.0;
-    if (all(greaterThanEqual(origin, lo)) && all(lessThan(origin, hi))) {
-        tExit = 1e30;
-        for (int a = 0; a < 3; ++a) {
-            if (abs(sunV[a]) > 1e-6) {
-                const float face = (sunV[a] > 0.0) ? hi[a] : lo[a];
-                tExit = min(tExit, (face - origin[a]) / sunV[a]);
-            }
+    if (any(lessThan(origin, lo)) || any(greaterThanEqual(origin, hi)))
+        return sunRayEscapesSdf(origin, sunV, 0.0, 1.0);  // outside: plain march
+    float tExit = 1e30;    // parameter of leaving the box (any face)
+    float tExitXZ = 1e30;  // ... of leaving it sideways (the faces that move)
+    for (int a = 0; a < 3; ++a) {
+        if (abs(sunV[a]) > 1e-6) {
+            const float face = (sunV[a] > 0.0) ? hi[a] : lo[a];
+            const float t = (face - origin[a]) / sunV[a];
+            tExit = min(tExit, t);
+            if (a != 1)
+                tExitXZ = min(tExitXZ, t);
         }
     }
+    if (tExitXZ < kSdfTraceVoxels)
+        return sunRayEscapesSdf(origin, sunV, 0.0, 1.0);  // no room: plain march
+    const float tCap = min(kSdfTraceVoxels, tExit);
     float visibility = 1.0;
     float t = 0.0;
     for (int i = 0; i < 160; ++i) {
-        // Hand off exactly at the crossing, not at the first sample past
-        // it: a step (up to 0.7 * h) must not skip a caster sitting in
-        // the strip just outside the box.
-        if (t >= tExit)
-            return sunRayEscapesSdf(origin + sunV * tExit, sunV, tExit,
-                                    visibility);
+        if (t >= tCap)
+            break;
         const vec3 p = origin + sunV * t;
         const float h = sampleSdf3d(p);
         if (h < 1e-3)
@@ -711,7 +727,8 @@ float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
         visibility = min(visibility, shadowPenumbra(h, t));
         t += max(h * 0.7, 0.05);
     }
-    return sunRayEscapesSdf(origin + sunV * t, sunV, t, visibility);
+    const float tHand = min(t, tCap);
+    return sunRayEscapesSdf(origin + sunV * tHand, sunV, tHand, visibility);
 }
 
 // SDF soft shadow ray (VV_SDF_SHADOWS=1), the 2.5D top-plane penumbra
