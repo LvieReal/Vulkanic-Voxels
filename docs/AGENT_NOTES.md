@@ -912,3 +912,93 @@ _NET_WM_STATE on an unmapped window; wl_window.c applies wl.maximized when the
 toplevel is created) and built, not run. Owner check: the window comes up
 maximized with the panel visible, and un-maximizing gives a window about half
 the screen, centred.
+
+## Pass 45: the launch frame is the window's real size
+
+OWNER (on-device, after pass 44): "it's working but it glitches every launch. as
+soon as i grab topbar and start moving window, it resolves." The maximize /
+half-monitor behavior of pass 44 is accepted; the per-launch glitch is not.
+
+DIAGNOSIS. Two size-related facts met at launch:
+
+* GLFW's window size is the CACHED size it last got from the window manager
+  (`glfwGetFramebufferSize` returns `window->x11.width/height` on X11 and
+  `window->wl.fbWidth/fbHeight` on Wayland - both are written only when an event
+  is processed, x11_window.c ConfigureNotify handler / wl_window.c
+  handleToplevelConfigure -> resizeWindow). Pass 44 showed the window and read
+  the size immediately, without ever pumping events, so the renderer was created
+  for the RESTORE size (half the monitor) while the window manager was already
+  maximizing the window. The maximize happens pre-map (that is what the
+  GLFW_MAXIMIZED hint buys), so its ConfigureNotify /
+  xdg_toplevel configure arrives right after the map request - and nothing had
+  read it yet.
+* The frame paths in VulkanRenderer::drawFrame recreated the swapchain with
+  `m_swapchainExtent` - the extension of the swapchain being replaced, i.e. the
+  size we are trying to leave - instead of the window size (drawFrame acquire
+  OUT_OF_DATE / present OUT_OF_DATE|SUBOPTIMAL|m_framebufferResized). On X11 the
+  driver's `currentExtent` usually overrides the value passed to
+  chooseSwapExtent, which hides the mistake; where the surface reports the
+  special `(UINT32_MAX, UINT32_MAX)` extent (Wayland) the passed value wins, so
+  a recreate could rebuild at the OLD size.
+
+Moving the title bar delivers a fresh configure to the client, which is exactly
+why the artifact cleared "as soon as" the owner touched the window.
+
+FIX.
+
+* `GameWindow::settleFramebufferSize(maxWaitSeconds = 0.25)`, called once in
+  App::init between `GameWindow::init()` (which shows the window) and
+  `resolveNativeWindow()`: pumps `glfwWaitEventsTimeout(10 ms)` until the
+  framebuffer size is stable (three identical samples AND at least 30 ms of wall
+  time, so a burst of events cannot fake a settled size) or the budget runs out,
+  and keeps m_framebufferWidth/Height current on the way. The swapchain is then
+  created for the size the window manager itself reported. It logs the answer
+  when it changes the size:
+  `[vv] window: settled to 1920x1040 framebuffer pixels after 20 ms (the
+  maximize request was answered by the window manager)`.
+* Size reconciliation is one code path, not a callback-only hope:
+  `App::syncRendererSize(width, height)` is called from the framebuffer-size
+  hook AND from the frame loop right before `drawFrame()`, and it is a no-op
+  until the requested size actually differs from the last one the renderer was
+  given (so a callback and the frame check in the same frame cannot rebuild the
+  swapchain twice). The frame-loop call runs after `waitEvents()`, i.e. after
+  the pending configure has been delivered, so the first frame presented after
+  the answer is already correct - with no user action.
+* `VulkanRenderer` remembers the window size it was asked for
+  (`m_requestedWidth/Height`, set by init()/resize(), floored at 1) and the two
+  drawFrame recreate paths use that instead of the previous extent.
+  `resize()` clears `m_framebufferResized` when its own rebuild succeeded, so a
+  resize no longer costs a second redundant rebuild at present time (the flag
+  still stays set when the rebuild failed, so the present path retries).
+* A recreate that fails leaves no swapchain; `drawFrame()` now recreates once
+  more instead of acquiring from VK_NULL_HANDLE. The frame loop keeps pumping
+  events while this retries, so a window that is being resized or un-minimized
+  recovers by itself.
+* Diagnostics, all on stderr: the launch line prints the swapchain extent next
+  to the window's (`[vv] swapchain: 1920x1040 (window reports 1920x1040)`), each
+  change prints `[vv] swapchain: A x B -> C x D` followed by
+  `[vv] swapchain: now C x D (window C x D)` - so a report that still shows an
+  artifact carries the numbers that identify it.
+
+VERIFIED IN THE SANDBOX (deps /home/user/.cache/vv-deps, GLFW 3.5.1 null-only):
+build/release and build/debug warning-free; ctest green in both (5.1 s / 24.4 s);
+glslangValidator -V exit 0; `VV_PLATFORM=null` smoke prints the two pass-44
+window lines and exits 1 through the "no native window handle" path in 34 ms
+(the settle costs its 30 ms floor and does not burn the 250 ms budget when the
+size never changes). The sandbox has no window manager, so the settle loop was
+driven directly by a probe (not committed) against GLFW's null backend, with the
+real GameWindow.cpp: (a) nothing changes -> returns in 30 ms at the same size;
+(b) window already resized -> reports the new size (1600x900); (c) budgets of
+50 ms and 200 ms -> both return in 30 ms; (d) a resize arriving 3 ms into the
+settle -> detected in-loop, exits 30 ms later, logs "settled to 1280x1024 ...
+after 30 ms", reports the new size; (e) an answer arriving 80 ms AFTER the
+settle returned (budget 50 ms) -> the framebuffer-size hook still records it
+(1440x900), which is what the frame-loop reconciliation keys off. Probe verdict:
+PROBE OK, exit 0.
+
+NOT PROVEN HERE: the real maximize handshake (X11 ConfigureNotify / Wayland
+configure) and the visual result - the sandbox has no WM and no GPU. Owner
+check: launch looks right from the first frame (no glitch to clear by moving the
+window) while the window still comes up maximized and un-maximizes to half the
+monitor, on both X11 and Wayland. If an artifact survives, the startup log now
+carries the window size, the settled size and the swapchain extent.

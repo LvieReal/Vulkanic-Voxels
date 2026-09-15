@@ -75,6 +75,18 @@ class GameWindow final {
 	std::uint32_t framebufferWidth() const { return m_framebufferWidth; }
 	std::uint32_t framebufferHeight() const { return m_framebufferHeight; }
 
+	// Pumps events until the framebuffer size has stopped changing (three
+	// identical samples, at least 30 ms apart in total) or maxWaitSeconds
+	// elapsed, and keeps the reported size current.
+	//
+	// Called once, between showing the window and creating the swapchain: the
+	// window manager answers the maximize request asynchronously (a
+	// ConfigureNotify on X11, a wl_surface configure on Wayland), and creating
+	// the swapchain before that answer arrives means creating it for the
+	// RESTORE size while the window is really maximized - a stretched frame
+	// until something else forces a resize.
+	void settleFramebufferSize(double maxWaitSeconds = 0.25);
+
 	// True when presenting makes sense: the window is on screen and not
 	// iconified. Presenting to an invisible surface just burns swapchain
 	// cycles (and an acquire that never completes), so the loop skips the

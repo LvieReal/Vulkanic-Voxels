@@ -44,6 +44,12 @@ class VulkanRenderer final {
 
   bool init(const InitInfo& info, std::string& outError);
   void resize(uint32_t width, uint32_t height);
+
+  // Size of the swapchain currently in use (the extent the driver reported on
+  // surface creation; compare against the window's framebuffer size when a
+  // rendering report has to be diagnosed).
+  uint32_t swapchainWidth() const { return m_swapchainExtent.width; }
+  uint32_t swapchainHeight() const { return m_swapchainExtent.height; }
   void drawFrame();
   void setCamera(const vv::core::Camera& camera, float timeSeconds);
   void setWorldConfig(const vv::voxel::VoxelConfig& config);
@@ -128,6 +134,10 @@ class VulkanRenderer final {
   void cleanupSwapchain();
   bool recreateSwapchain(uint32_t width, uint32_t height,
                          std::string& outError);
+  // m_requested* with a sane floor (never 0: vkCreateSwapchainKHR rejects a
+  // zero extent).
+  uint32_t requestedWidth() const;
+  uint32_t requestedHeight() const;
 
   bool createVoxelWorldAndUpload(std::string& outError);
   // Generates/evicts chunks for the new region center, uploads new chunk
@@ -176,6 +186,12 @@ class VulkanRenderer final {
   VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
   VkFormat m_swapchainFormat = VK_FORMAT_UNDEFINED;
   VkExtent2D m_swapchainExtent{};
+  // The window size the swapchain should have: set on init and on every
+  // resize(). The recreate paths in drawFrame() use these, NOT the previous
+  // extent - recreating for the old size left the launch frame stretched
+  // until the window was touched (pass 45).
+  uint32_t m_requestedWidth = 0;
+  uint32_t m_requestedHeight = 0;
   std::vector<VkImage> m_swapchainImages;
   std::vector<VkImageView> m_swapchainImageViews;
   std::vector<VkImageLayout> m_swapchainImageLayouts;

@@ -51,6 +51,11 @@ class App final {
 	void handleCursorPosition(double x, double y);
 	void handleFocusLost();
 
+	// Keeps the renderer's swapchain in step with the window. The framebuffer
+	// size callback is the fast path, and the frame loop calls this too, so a
+	// size change is never left unnoticed (pass 45).
+	void syncRendererSize(std::uint32_t width, std::uint32_t height);
+
 	void tick();
 	void refreshDebugTitle();
 	void setGamePaused(bool paused);
@@ -68,6 +73,9 @@ class App final {
 	vv::core::Camera m_camera;
 	vv::core::GameTimer m_gameTimer;
 	std::vector<Binding> m_bindings;
+	// The size the renderer's swapchain was last (re)created for.
+	std::uint32_t m_rendererWidth = 0;
+	std::uint32_t m_rendererHeight = 0;
 
 	bool m_initialized = false;
 	bool m_deviceLostReported = false;

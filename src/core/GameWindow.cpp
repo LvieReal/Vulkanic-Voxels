@@ -1,6 +1,7 @@
 #include "core/GameWindow.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -213,6 +214,60 @@ void GameWindow::waitEvents() {
 		glfwWaitEventsTimeout(0.001);
 	} else {
 		glfwWaitEventsTimeout(0.05);
+	}
+}
+
+void GameWindow::settleFramebufferSize(double maxWaitSeconds) {
+	if (m_window == nullptr) {
+		return;
+	}
+	const std::uint32_t initialWidth = m_framebufferWidth;
+	const std::uint32_t initialHeight = m_framebufferHeight;
+
+	// Each iteration blocks up to 10 ms in the event loop, so this is not a
+	// spin. The size counts as settled after three identical samples AND at
+	// least kStableSeconds of wall time, because events can arrive fast enough
+	// for three samples to pass in well under a millisecond.
+	constexpr double kStepSeconds = 0.01;
+	constexpr double kStableSeconds = 0.03;
+	constexpr int kStableSamples = 3;
+	const auto start = std::chrono::steady_clock::now();
+	double waited = 0.0;
+	int stable = 0;
+	std::uint32_t lastWidth = m_framebufferWidth;
+	std::uint32_t lastHeight = m_framebufferHeight;
+	while (waited < maxWaitSeconds) {
+		glfwWaitEventsTimeout(kStepSeconds);
+		const std::chrono::steady_clock::time_point sampled =
+				std::chrono::steady_clock::now();
+		waited = std::chrono::duration<double>(sampled - start).count();
+
+		int width = 0;
+		int height = 0;
+		glfwGetFramebufferSize(m_window, &width, &height);
+		m_framebufferWidth = static_cast<std::uint32_t>(std::max(1, width));
+		m_framebufferHeight = static_cast<std::uint32_t>(std::max(1, height));
+
+		if (m_framebufferWidth == lastWidth &&
+				m_framebufferHeight == lastHeight) {
+			if (++stable >= kStableSamples && waited >= kStableSeconds) {
+				break;
+			}
+		} else {
+			stable = 0;
+			lastWidth = m_framebufferWidth;
+			lastHeight = m_framebufferHeight;
+		}
+	}
+
+	if (m_framebufferWidth != initialWidth ||
+			m_framebufferHeight != initialHeight) {
+		std::fprintf(stderr,
+								 "[vv] window: settled to %ux%u framebuffer pixels after "
+								 "%d ms (the maximize request was answered by the "
+								 "window manager)\n",
+								 m_framebufferWidth, m_framebufferHeight,
+								 static_cast<int>(waited * 1000.0 + 0.5));
 	}
 }
 

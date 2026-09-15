@@ -97,7 +97,12 @@ cmake --build build
 
 The window opens **maximized** (decorated, so the window manager keeps panels
 and the title bar usable) and un-maximizes to **half the monitor**. Both sizes
-are printed at startup (`[vv] window: ...`).
+are printed at startup (`[vv] window: ...`), together with the size the
+swapchain was created for (`[vv] swapchain: ...`). Before the swapchain is
+created the app waits for the window manager to answer the maximize request and
+keeps re-checking the window size on every frame, so the first frame is already
+the size the window really has (no stretched or mis-sized launch frame on X11
+or Wayland, with or without an explicit resize afterwards).
 
 A small pure-logic test suite (noise, terrain layering, chunked world, key
 bindings, the PNG decoder) builds alongside by default — run it with

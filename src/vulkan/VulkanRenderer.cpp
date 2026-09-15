@@ -161,6 +161,8 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
 
   const uint32_t width = std::max(1u, info.width);
   const uint32_t height = std::max(1u, info.height);
+  m_requestedWidth = width;
+  m_requestedHeight = height;
   if (!createSwapchain(width, height, outError) ||
       !createCommandBuffers(outError) || !createSyncObjects(outError)) {
     cleanup();
@@ -176,9 +178,16 @@ void VulkanRenderer::resize(uint32_t width, uint32_t height) {
     return;
   }
 
+  m_requestedWidth = width;
+  m_requestedHeight = height;
   m_framebufferResized = true;
   std::string error;
-  (void)recreateSwapchain(width, height, error);
+  if (recreateSwapchain(width, height, error)) {
+    // The swapchain was rebuilt for this size right here, so the flag must not
+    // cause a second, redundant rebuild at present time (it stays set when the
+    // rebuild failed, so the present path retries).
+    m_framebufferResized = false;
+  }
 }
 
 void VulkanRenderer::drawFrame() {
@@ -217,6 +226,18 @@ void VulkanRenderer::drawFrame() {
                         glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
                                   m_sdfShadows ? 1.0f : 0.0f, 0.0f));
 
+  if (m_swapchain == VK_NULL_HANDLE) {
+    // A recreate failed above and left no swapchain to acquire from. Retry;
+    // once the surface can provide one again the loop presents normally. The
+    // frame loop keeps pumping events while this happens, so a window that is
+    // being resized or un-minimized recovers on its own.
+    std::string recreateError;
+    if (!recreateSwapchain(requestedWidth(), requestedHeight(),
+                           recreateError)) {
+      return;
+    }
+  }
+
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
       m_device, m_swapchain, UINT64_MAX,
@@ -224,8 +245,7 @@ void VulkanRenderer::drawFrame() {
 
   if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
     std::string error;
-    (void)recreateSwapchain(m_swapchainExtent.width, m_swapchainExtent.height,
-                            error);
+    (void)recreateSwapchain(requestedWidth(), requestedHeight(), error);
     return;
   }
   if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
@@ -274,8 +294,10 @@ void VulkanRenderer::drawFrame() {
       m_framebufferResized) {
     m_framebufferResized = false;
     std::string error;
-    (void)recreateSwapchain(m_swapchainExtent.width, m_swapchainExtent.height,
-                            error);
+    // Present says the swapchain no longer matches the surface, so rebuild it
+    // for the window size we were last told about. Using the previous extent
+    // here recreated the swapchain at the OLD size (pass 45).
+    (void)recreateSwapchain(requestedWidth(), requestedHeight(), error);
   } else if (present != VK_SUCCESS) {
     setDeviceLost("vkQueuePresentKHR failed (" +
                   utils::vkResultToString(present) + ").");
@@ -1911,6 +1933,14 @@ void VulkanRenderer::cleanupSwapchain() {
   }
   m_swapchainImages.clear();
   m_swapchainImageLayouts.clear();
+}
+
+uint32_t VulkanRenderer::requestedWidth() const {
+  return m_requestedWidth != 0 ? m_requestedWidth : 1;
+}
+
+uint32_t VulkanRenderer::requestedHeight() const {
+  return m_requestedHeight != 0 ? m_requestedHeight : 1;
 }
 
 bool VulkanRenderer::recreateSwapchain(uint32_t width, uint32_t height,

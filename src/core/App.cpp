@@ -30,10 +30,7 @@ bool App::init(std::string& outError) {
 	hooks.user = this;
 	hooks.onFramebufferSize = [](void* user, std::uint32_t width,
 	                             std::uint32_t height) {
-		auto* self = static_cast<App*>(user);
-		if (self->m_renderer != nullptr) {
-			self->m_renderer->resize(width, height);
-		}
+		static_cast<App*>(user)->syncRendererSize(width, height);
 	};
 	hooks.onKey = [](void* user, int key, int scancode, int action, int mods) {
 		static_cast<App*>(user)->handleKey(key, scancode, action, mods);
@@ -55,6 +52,12 @@ bool App::init(std::string& outError) {
 	if (!m_window.init(hooks, outError)) {
 		return false;
 	}
+
+	// The window manager answers the maximize request asynchronously, so wait
+	// for the window's size to settle BEFORE the swapchain is created for it
+	// (pass 45: creating it for the restore size and fixing it on the next
+	// resize callback left a stretched launch frame).
+	m_window.settleFramebufferSize();
 
 	vv::platform::NativeWindow native =
 	    vv::platform::resolveNativeWindow(m_window.handle(), outError);
@@ -93,6 +96,13 @@ bool App::init(std::string& outError) {
 		m_renderer.reset();
 		return false;
 	}
+	m_rendererWidth = init.width;
+	m_rendererHeight = init.height;
+	// Both numbers in the log: a swapchain that does not match the window is a
+	// rendering report's first suspect, and this makes it visible immediately.
+	std::fprintf(stderr, "[vv] swapchain: %ux%u (window reports %ux%u)\n",
+	             m_renderer->swapchainWidth(), m_renderer->swapchainHeight(),
+	             m_window.framebufferWidth(), m_window.framebufferHeight());
 
 	// Spawn above the terrain at the center of chunk (0,0), looking out over
 	// the world.
@@ -125,6 +135,27 @@ void App::setMouseLocked(bool locked) {
 		resetActionStates();
 	}
 	m_haveLastCursor = false;
+}
+
+void App::syncRendererSize(std::uint32_t width, std::uint32_t height) {
+	if (m_renderer == nullptr || width == 0 || height == 0) {
+		// Before the renderer exists the window's size is read again for its
+		// creation (see init), so there is nothing to chase here.
+		return;
+	}
+	if (width == m_rendererWidth && height == m_rendererHeight) {
+		return;
+	}
+	std::fprintf(stderr, "[vv] swapchain: %ux%u -> %ux%u\n", m_rendererWidth,
+	             m_rendererHeight, width, height);
+	m_rendererWidth = width;
+	m_rendererHeight = height;
+	m_renderer->resize(width, height);
+	// Report the size the driver actually gave us: a swapchain that does not
+	// match the window is the first thing to look at in a render report.
+	std::fprintf(stderr, "[vv] swapchain: now %ux%u (window %ux%u)\n",
+	             m_renderer->swapchainWidth(), m_renderer->swapchainHeight(),
+	             width, height);
 }
 
 void App::handleFocusLost() {
@@ -275,6 +306,11 @@ void App::tick() {
 	if (!m_window.canPresent()) {
 		return;
 	}
+	// The framebuffer-size callback is the fast path; this is the guarantee.
+	// A window manager is free to change the size without the callback having
+	// been delivered before the next frame (and a missed callback used to
+	// leave the swapchain on the pre-maximize size).
+	syncRendererSize(m_window.framebufferWidth(), m_window.framebufferHeight());
 	m_renderer->drawFrame();
 
 	// 1 Hz debug title refresh (build id + live state + fps).
