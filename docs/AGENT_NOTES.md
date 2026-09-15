@@ -67,10 +67,12 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 - VV_SDF_SHADOWS=1: SDF soft-shadow experiment (pass 33: the exact
   march's traversal + an extended-sun-disk penumbra estimate -
   iquilezles.org/articles/rmshadows/ family. Pass 34 removed the Aaltonen
-  two-sphere refinement (it projected a hard "clamped edge" stripe); pass
-  35 replaced the plain k*h/t with the unified circle-segment - the
-  fraction of the sun disk above each column's top plane, continuous
-  (0.5) at the top, so every heightfield shadow edge gets a soft penumbra.
+  two-sphere refinement (it projected a hard "clamped edge" stripe) and
+  settled on the plain Quilez k*h/t. Pass 35 tried a unified circle-segment
+  but was REVERTED in pass 36 - it fixed k*h/t's over-darkening of lit
+  penumbra but the owner read that as "bright spots", and it did not soften
+  the steep-cliff side edges (a 1D top-plane limitation). Current state =
+  pass 34: k*h/t in the clear branch, hard 0 in the below-top/solid branch.
   kShadowSharpness in the shader tunes the sun's angular size / softness).
   Exact binary shadows remain the default reference.
   The SDF marcher keeps occupancy/material policy in shadowOpacity() so
@@ -302,12 +304,15 @@ the penumbra is now a SMOOTH MONOTONIC ramp (1.0 -> 0.93 -> 0.77 -> 0.59 ->
 and the shadow is fully dark under the wall top. Wall penumbra shape pinned:
 1.0, 1.0, 0.409, 0.0, 0.0 (lit, lit, partial, hard, hard).
 
-Pass 35 (DONE, owner green-lit the full fix): THE UNIFIED CIRCLE-SEGMENT
-PENUMBRA - soft on every edge a heightfield top can cast. Owner: "sides of
-the SDF shadow right now are completely sharp... limitation or can be
-fixed?" -> it IS fixable, and this is the fix. GOAL met: the penumbra is
-soft on the top/leading edge AND the side/vertical edge of a heightfield,
-no hard 0->1 jumps. SDF experimental path only (VV_SDF_SHADOWS /
+Pass 35 (REVERTED in pass 36 - owner rejected on-device): THE UNIFIED
+CIRCLE-SEGMENT PENUMBRA. Owner: "sides of the SDF shadow right now are
+completely sharp... limitation or can be fixed?" This pass attempted the fix
+with the extended-sun-disk circle-segment sampled in BOTH branches. It was
+committed (0ba0fee) and pushed, but the owner's on-device screenshot showed
+the sides STILL sharp AND new "weird bright spots". Pass 36 diagnosed the
+bright spots (k*h/t over-darkening, see below) and REVERTED the functional
+files to the pass-34 plain k*h/t state. The circle-segment design notes are
+kept below for reference only. SDF experimental path only (VV_SDF_SHADOWS /
 scene.misc.w > 0.5); the exact binary sunRayEscapes is untouched and stays
 the bit-identical reference.
 
@@ -360,5 +365,41 @@ ICD in the sandbox).
 
 NOTE (stale section above replaced): the earlier "trailing-edge = CONFIRMED
 CORRECT MECHANISM / TUNING TODO" text in this pass's draft was WRONG
-(contradicted by diag15/16) and has been removed; the correct fix is the
-top-plane unified circle-segment described here.
+(contradicted by diag15/16) and was removed. (The circle-segment fix itself
+was then reverted in pass 36 - see below.)
+
+Pass 36 (owner rejected pass 35 on-device -> diagnose + REVERT): OWNER
+SCREENSHOT ("looks like it did not affect sides at all, only produces weird
+bright spots now. could you debug this?"). Two CPU diagnostics (diag36/37,
+a 96x96x64 heightfield with rolling hills + a cliff, and a finite MESA, all
+checked against the exact binary march) pinned the bright spots down:
+
+ROOT CAUSE OF THE BRIGHT SPOTS: pass-34 plain k*h/t OVER-DARKENS LIT
+PENUMBRA PIXELS. The min over the DDA columns lands on the grazing column
+(where (y0-bound)/t is tiny), so k*h/t -> ~0 even though the ray CLEARS the
+terrain (exact march = lit). On the real terrain that is ~16% of lit
+pixels. The circle-segment "fixed" that over-darkening by lighting those
+same pixels to 0.5-0.95 - and that is exactly the change the owner saw as
+"weird bright spots" (pixels that were near-black in pass 34 are now half-
+to nearly-lit). It is a physically-correct correction of a k*h/t artifact,
+but it is NOT the look the owner wants, and it did not soften the sides.
+
+WHY THE SIDES DID NOT SOFTEN: the owner's sharp "sides" are the shadow
+edges that run along the steep/vertical cliff faces. The 1D top-plane SDF
+has no data for a vertical face, so those edges are unchanged by any
+top-plane penumbra (circle-segment OR k*h/t) - the mesa z-edges that ARE
+soft are a different, already-soft feature. Softening a true vertical
+caster needs a proper 3D voxel SDF (distance to the actual surface,
+including side faces) - a larger rewrite, not a penumbra-term change.
+
+DECISION: revert the functional files (pixels_rgba.comp,
+terrain_world_tests.cpp, README.md, VulkanRenderer.hpp) to the pass-34
+plain k*h/t state (git checkout 7ea15fd) to remove the bright spots and
+restore the last owner-verified look. The circle-segment math stays in the
+pass-35 section above for reference. The sides remain a documented
+limitation of the 1D top-plane SDF; a 3D voxel SDF is the parked next step
+if the owner wants true-soft vertical casters.
+
+VALIDATED: after the revert, CPU tests green (plain k*h/t expectations),
+shader compiles to valid SPIR-V, release build clean, ctest green,
+offscreen smoke: no crash.
