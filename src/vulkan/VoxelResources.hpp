@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "voxel/Chunk.hpp"
+#include "voxel/SdfHandover.hpp"  // kSdfHalves
 #include "voxel/VoxelConfig.hpp"
 #include "voxel/VoxelTextures.hpp"
 
@@ -119,30 +120,50 @@ class VoxelResources final {
 	// box geometry (origin in world voxels + dims in cells) is published
 	// via a small host-visible uniform (binding 13) with writeSdfBox -
 	// the async build can lag the camera, so the shader must NOT derive
-	// the box from the current region. The SDF buffer is SDF-HALVES
-	// buffered like the far field: the writer targets the inactive half,
-	// the renderer flips a uniform half index (in the box uniform's w,
-	// repurposed to -1/0/1 when no field is active).
+	// the box from the current region.
+	//
+	// HALVES (pass 42). The buffer holds kSdfHalves copies of the field and
+	// the uniform says which one to read (dims.w, the shader's seed base).
+	// That is what lets the copy go out WITHOUT a frame wait: the shader
+	// resolves "which cell" from the box and indexes the seeds with it, so a
+	// box that went live next to the previous field would shade a frame out
+	// of terrain that is not there (the owner's one-frame dark chunks). With
+	// two halves the pairing is always one of (old box, old half) or (new
+	// box, new half): the copy targets the half no box points at, and the box
+	// is published with that half's index only once the copy's fence says it
+	// landed - so no frame can ever mix the two.
 	// The SDF box is 2*kSdfHalfChunks chunks wide on each axis (6x6) and
 	// the full world height tall; its cell dims are
 	// (2*kSdfHalfChunks*chunkSizeX, worldHeight, 2*kSdfHalfChunks*chunkSizeZ).
 	static constexpr std::uint32_t kSdfHalfChunks = 3;  // box = 2*kSdfHalfChunks chunks
-	// Uploads a complete SDF (the argmin seed per cell) into the buffer.
-	// Staging + fence (no device/queue waits); waits for its own copy to
-	// land before returning, so the caller can publish the box uniform
-	// immediately. `boxX/boxY/boxZ` are the box origin in world voxels,
-	// `nx/ny/nz` the box size in cells (== kSdfCells).
-	bool uploadSdf(VkDevice device, VkPhysicalDevice physicalDevice,
+	// Starts the copy of a complete SDF (the argmin seed per cell) into the
+	// buffer: staging fill + one transfer submit, and RETURNS WITHOUT WAITING
+	// (pass 42 - the wait used to be a frame hitch). The caller publishes the
+	// box uniform only once sdfUploadComplete() says the copy has landed, so
+	// the box never selects cells of a seed buffer that is still the previous
+	// build. `boxX/boxY/boxZ` are the box origin in world voxels, `nx/ny/nz`
+	// the box size in cells (== kSdfCells).
+	bool beginSdfUpload(VkDevice device, VkPhysicalDevice physicalDevice,
 			VkCommandPool commandPool, VkQueue queue,
-			const std::vector<std::uint32_t>& seeds,
+			const std::vector<std::uint32_t>& seeds, std::uint32_t half,
 			std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
 			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
 			std::string& outError);
+	// False while a begun copy is still in flight. Polled (never waited):
+	// the frame that sees it true publishes the box, and by then the copy -
+	// queued behind every frame that read the old box - has landed, so no
+	// in-flight dispatch can be resolving cells against the wrong pairing.
+	bool sdfUploadComplete(VkDevice device);
 	// Publishes the SDF box geometry (binding 13): box.xyz = origin in
 	// world voxels, box.w = 1 when active / -1 when no field; dims.xyz =
-	// box size in cells, dims.w = 0 when no field. Plain mapped write.
+	// box size in cells, dims.w = the half the shader must read (the seed
+	// base is dims.w * nx * ny * nz), 0 when no field. Plain mapped write,
+	// but the payload goes out BEFORE the active word: a reader that catches
+	// the write (the GPU samples this buffer while a dispatch is running)
+	// must never see "active" next to a half-updated origin or half index.
 	void writeSdfBox(std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
-			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool active);
+			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool active,
+			std::uint32_t half);
 	void clearSdfBox();
 
 	// Async partial upload into the given half: cellRuns are (cellOffset,

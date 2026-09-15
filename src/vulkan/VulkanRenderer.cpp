@@ -19,6 +19,7 @@
 #include "vulkan/VulkanUtils.hpp"
 #include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
+#include "voxel/SdfHandover.hpp"
 #include "voxel/VoxelTypes.hpp"
 
 namespace vv::vulkan {
@@ -1012,9 +1013,13 @@ void VulkanRenderer::finishRegionMove() {
 
   // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): the region is complete and
   // fully published, so the world chunks under the camera-centered box are
-  // installed - launch the background build. The old field keeps rendering
-  // until the new one uploads (ensureSdfField), so there is no gap.
-  launchSdfBuild(m_streamTarget.x, m_streamTarget.z);
+  // installed - tell the frame loop which chunk the field should cover.
+  // ensureSdfField launches the build (and retries if one is already
+  // running), and the old field keeps rendering until the new one is
+  // published, so there is no gap.
+  m_sdfWantValid = true;
+  m_sdfWantCenterX = m_streamTarget.x;
+  m_sdfWantCenterZ = m_streamTarget.z;
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1248,55 +1253,116 @@ void VulkanRenderer::ensureSdfField() {
   if (!m_sdfShadows || !m_world) {
     return;
   }
-  // A finished build is waiting: join, upload, publish the box uniform.
-  if (m_sdfBuildRunning.load() && m_sdfPendingReady.load()) {
-    if (m_sdfThread.joinable()) {
-      m_sdfThread.join();
-    }
-    m_sdfBuildRunning = false;
+  // The box uniform and the seed buffer are a PAIR (pass 42): the shader
+  // resolves "which cell is this" from the box and indexes the seeds with it,
+  // so a box published next to another build's seeds shades a frame out of a
+  // field that describes different terrain - the owner's one-frame "chunks go
+  // dark". vv::voxel::SdfHandover owns the ordering (copy submitted without a
+  // wait, box published only once that copy's fence signals, field retried
+  // until it covers the camera's chunk); this is its driver.
+  vv::voxel::SdfHandover hand;
+  hand.buildRunning = m_sdfBuildRunning.load();
+  hand.buildReady = m_sdfPendingReady.load();
+  hand.uploadInFlight = m_sdfUploadInFlight;
+  hand.copyComplete =
+      m_sdfUploadInFlight && m_voxelResources.sdfUploadComplete(m_device);
+  hand.haveField = m_sdfFieldActive;
+  hand.wantValid = m_sdfWantValid;
+  hand.activeCenterX = m_sdfActiveCenterX;
+  hand.activeCenterZ = m_sdfActiveCenterZ;
+  hand.wantCenterX = m_sdfWantCenterX;
+  hand.wantCenterZ = m_sdfWantCenterZ;
+  hand.liveHalf = m_sdfLiveHalf;
 
-    // Same geometry the build used - a build from another config (or a
-    // half-installed world) can never publish a mismatched field.
-    const auto& cfg = m_voxelConfig;
-    const vv::voxel::SdfBoxGeometry box = vv::voxel::SdfBoxGeometry::centeredOn(
-        m_sdfPending.centerChunkX, m_sdfPending.centerChunkZ,
-        vv::vulkan::VoxelResources::kSdfHalfChunks, cfg.chunkSizeX,
-        cfg.chunkSizeZ, cfg.worldHeight);
-    const uint32_t nx = box.nx;
-    const uint32_t ny = box.ny;
-    const uint32_t nz = box.nz;
-    if (m_sdfPending.nx == nx && m_sdfPending.ny == ny &&
-        m_sdfPending.nz == nz &&
-        m_sdfPending.seeds.size() ==
-            static_cast<std::size_t>(nx) * ny * nz) {
-      std::string uploadError;
-      if (!m_voxelResources.uploadSdf(m_device, m_physicalDevice, m_commandPool,
-                                      m_graphicsQueue, m_sdfPending.seeds,
-                                      m_sdfPending.boxX, m_sdfPending.boxY,
-                                      m_sdfPending.boxZ, nx, ny, nz,
-                                      uploadError)) {
-        std::fprintf(stderr, "[vulkan] SDF upload failed: %s\n",
-                     uploadError.c_str());
-      } else {
-        // Publish the box geometry AFTER the copy has landed (the upload
-        // waited its fence), so a frame that sees active=1 always sees the
-        // matching field.
-        m_voxelResources.writeSdfBox(m_sdfPending.boxX, m_sdfPending.boxY,
-                                     m_sdfPending.boxZ, nx, ny, nz, true);
-        std::fprintf(stderr,
-                     "[vulkan] 3D voxel SDF active: %ux%ux%u cells at "
-                     "(%d,%d,%d) (%u x %u chunks of %ux%ux%u)\n",
-                     nx, ny, nz, m_sdfPending.boxX, m_sdfPending.boxY,
-                     m_sdfPending.boxZ, box.chunksPerSide, box.chunksPerSide,
-                     box.chunkSizeX, box.worldHeight, box.chunkSizeZ);
+  switch (hand.step()) {
+    case vv::voxel::SdfHandover::Step::JoinAndUpload: {
+      // The build is done (ready is only set at the end, so this join returns
+      // immediately) and its copy goes onto the queue WITHOUT a wait: it rides
+      // behind every frame that resolved cells against the old box, which is
+      // what makes the publish below safe. Waiting here was the frame hitch
+      // the owner felt as "big latency when the SDFs get recomputed".
+      if (m_sdfThread.joinable()) {
+        m_sdfThread.join();
       }
-    } else {
-      std::fprintf(stderr,
-                   "[vulkan] SDF build rejected (dims %ux%ux%u vs %ux%ux%u)\n",
-                   m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz, nx, ny,
-                   nz);
+      m_sdfBuildRunning = false;
+
+      // Same geometry the build used - a build from another config (or a
+      // half-installed world) can never publish a mismatched field.
+      const auto& cfg = m_voxelConfig;
+      const vv::voxel::SdfBoxGeometry box =
+          vv::voxel::SdfBoxGeometry::centeredOn(
+              m_sdfPending.centerChunkX, m_sdfPending.centerChunkZ,
+              vv::vulkan::VoxelResources::kSdfHalfChunks, cfg.chunkSizeX,
+              cfg.chunkSizeZ, cfg.worldHeight);
+      const uint32_t nx = box.nx;
+      const uint32_t ny = box.ny;
+      const uint32_t nz = box.nz;
+      if (m_sdfPending.nx == nx && m_sdfPending.ny == ny &&
+          m_sdfPending.nz == nz &&
+          m_sdfPending.seeds.size() ==
+              static_cast<std::size_t>(nx) * ny * nz) {
+        std::string uploadError;
+        // The SPARE half: whatever the published box points at keeps holding
+        // exactly the seeds it describes until the new box goes live.
+        const std::uint32_t half = hand.uploadHalf();
+        if (!m_voxelResources.beginSdfUpload(
+                m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+                m_sdfPending.seeds, half, m_sdfPending.boxX, m_sdfPending.boxY,
+                m_sdfPending.boxZ, nx, ny, nz, uploadError)) {
+          std::fprintf(stderr, "[vulkan] SDF upload failed: %s\n",
+                       uploadError.c_str());
+        } else {
+          m_sdfUploadInFlight = true;
+          m_sdfUploadBox.boxX = m_sdfPending.boxX;
+          m_sdfUploadBox.boxY = m_sdfPending.boxY;
+          m_sdfUploadBox.boxZ = m_sdfPending.boxZ;
+          m_sdfUploadBox.nx = nx;
+          m_sdfUploadBox.ny = ny;
+          m_sdfUploadBox.nz = nz;
+          m_sdfUploadBox.centerChunkX = m_sdfPending.centerChunkX;
+          m_sdfUploadBox.centerChunkZ = m_sdfPending.centerChunkZ;
+          m_sdfUploadBox.half = half;
+        }
+      } else {
+        std::fprintf(
+            stderr, "[vulkan] SDF build rejected (dims %ux%ux%u vs %ux%ux%u)\n",
+            m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz, nx, ny, nz);
+      }
+      m_sdfPendingReady = false;
+      break;
     }
-    m_sdfPendingReady = false;
+    case vv::voxel::SdfHandover::Step::Publish: {
+      // The copy's fence signalled, and because that copy was queued behind
+      // them, so did every frame that read the old box: no dispatch can be
+      // resolving cells while the new pairing goes live.
+      m_sdfUploadInFlight = false;
+      m_voxelResources.writeSdfBox(
+          m_sdfUploadBox.boxX, m_sdfUploadBox.boxY, m_sdfUploadBox.boxZ,
+          m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz, true,
+          m_sdfUploadBox.half);
+      m_sdfLiveHalf = m_sdfUploadBox.half;
+      m_sdfFieldActive = true;
+      m_sdfActiveCenterX = m_sdfUploadBox.centerChunkX;
+      m_sdfActiveCenterZ = m_sdfUploadBox.centerChunkZ;
+      std::fprintf(stderr,
+                   "[vulkan] 3D voxel SDF active: %ux%ux%u cells at "
+                   "(%d,%d,%d) (chunk %d,%d)\n",
+                   m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+                   m_sdfUploadBox.boxX, m_sdfUploadBox.boxY,
+                   m_sdfUploadBox.boxZ, m_sdfUploadBox.centerChunkX,
+                   m_sdfUploadBox.centerChunkZ);
+      break;
+    }
+    case vv::voxel::SdfHandover::Step::Relaunch: {
+      // No field yet, or a build the camera moved away from: the field must
+      // follow the camera's chunk instead of waiting for the next region move
+      // (that wait is what kept the newly streamed chunks on the hard 2.5D
+      // look for up to a crossing before the SDF shadows "appeared").
+      launchSdfBuild(m_sdfWantCenterX, m_sdfWantCenterZ);
+      break;
+    }
+    case vv::voxel::SdfHandover::Step::Idle:
+      break;
   }
 }
 
@@ -2230,6 +2296,11 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   }
 
   m_regionCenter = vv::voxel::ChunkCoord{centerChunkX, centerChunkZ};
+  // Same for the synchronous path (initial region, teleport fallback): the
+  // SDF field must follow the new center too, not only streamed moves.
+  m_sdfWantValid = true;
+  m_sdfWantCenterX = centerChunkX;
+  m_sdfWantCenterZ = centerChunkZ;
 
   // Rewrite the whole chunk table for the new region grid.
   std::vector<uint32_t> table(static_cast<size_t>(gridW) * gridH,

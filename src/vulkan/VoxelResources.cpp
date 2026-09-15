@@ -1,6 +1,7 @@
 #include "vulkan/VoxelResources.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -143,8 +144,9 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 		const std::uint64_t sdfNz =
 				2u * kSdfHalfChunks * static_cast<std::uint64_t>(config.chunkSizeZ);
 		m_sdfCells = sdfNx * sdfNy * sdfNz;
+		// Two halves (pass 42): the copy fills the one no live box points at.
 		const VkDeviceSize sdfBytes =
-				static_cast<VkDeviceSize>(m_sdfCells) * 4u;
+				static_cast<VkDeviceSize>(m_sdfCells) * 4u * vv::voxel::kSdfHalves;
 		if (!utils::createBuffer(device, physicalDevice, sdfBytes,
 								VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 								VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1234,10 +1236,11 @@ bool VoxelResources::ensureSdfUploadResources(
 	return true;
 }
 
-bool VoxelResources::uploadSdf(
+bool VoxelResources::beginSdfUpload(
 		VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool commandPool,
 		VkQueue queue, const std::vector<std::uint32_t>& seeds,
-		std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
+		std::uint32_t half, std::int32_t boxX, std::int32_t boxY,
+		std::int32_t boxZ,
 		std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
 		std::string& outError) {
 	(void)boxX; (void)boxY; (void)boxZ; (void)nx; (void)ny; (void)nz;
@@ -1249,12 +1252,19 @@ bool VoxelResources::uploadSdf(
 		outError = "SDF size does not match the SDF buffer.";
 		return false;
 	}
+	if (half >= vv::voxel::kSdfHalves) {
+		outError = "SDF half index out of range.";
+		return false;
+	}
 	if (!ensureSdfUploadResources(device, physicalDevice, commandPool,
 								 outError)) {
 		return false;
 	}
-	// Wait for the previous SDF copy (one build old - always retired by the
-	// time the next region build completes).
+	// The staging buffer may only be rewritten once the previous copy out of
+	// it has landed. The caller never starts a new upload before the last one
+	// was published, and publishing requires this fence, so this wait is
+	// retired by construction - it is here for the safety of the invariant,
+	// not as a frame cost.
 	if (m_sdfFencePending) {
 		vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
 		vkResetFences(device, 1, &m_sdfFence);
@@ -1277,7 +1287,9 @@ bool VoxelResources::uploadSdf(
 	}
 	VkBufferCopy region{};
 	region.srcOffset = 0;
-	region.dstOffset = 0;
+	// The spare half: the live one keeps holding exactly the seeds the
+	// published box describes for as long as any frame can read them.
+	region.dstOffset = static_cast<VkDeviceSize>(half) * m_sdfCells * 4u;
 	region.size = static_cast<VkDeviceSize>(seeds.size()) * 4u;
 	vkCmdCopyBuffer(m_sdfCmd, m_sdfStaging, m_sdfBuffer, 1, &region);
 	r = vkEndCommandBuffer(m_sdfCmd);
@@ -1294,35 +1306,47 @@ bool VoxelResources::uploadSdf(
 		outError = "Failed to submit SDF upload.";
 		return false;
 	}
-	// Wait for THIS copy so the caller can publish the box uniform
-	// immediately (a frame reading the field must not race the copy).
-	vkWaitForFences(device, 1, &m_sdfFence, VK_TRUE, UINT64_MAX);
-	vkResetFences(device, 1, &m_sdfFence);
+	// Pass 42: hand back with the copy in flight. The frame polls
+	// sdfUploadComplete() and only then publishes the box, so nothing waits
+	// here - the copy rides the queue behind the frames that read the old
+	// pairing and lands on its own.
+	m_sdfFencePending = true;
 	return true;
+}
+
+bool VoxelResources::sdfUploadComplete(VkDevice device) {
+	if (!m_sdfFencePending || m_sdfFence == VK_NULL_HANDLE) {
+		return false;
+	}
+	return vkGetFenceStatus(device, m_sdfFence) == VK_SUCCESS;
 }
 
 void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
 		std::int32_t boxZ, std::uint32_t nx, std::uint32_t ny,
-		std::uint32_t nz, bool active) {
+		std::uint32_t nz, bool active, std::uint32_t half) {
 	if (m_mappedSdfBox == nullptr) {
 		return;
 	}
 	std::uint32_t* w = static_cast<std::uint32_t*>(m_mappedSdfBox);
+	// Payload first, `box.w` (the active word the shader tests) LAST: a
+	// dispatch that samples this buffer mid-write must not see "active"
+	// next to an origin that is still the previous build's (pass 42).
 	w[0] = static_cast<std::uint32_t>(boxX);
 	w[1] = static_cast<std::uint32_t>(boxY);
 	w[2] = static_cast<std::uint32_t>(boxZ);
-	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
 	w[4] = active ? nx : 0u;
 	w[5] = active ? ny : 0u;
 	w[6] = active ? nz : 0u;
-	w[7] = active ? 1u : 0u;
+	w[7] = active ? half : 0u;  // dims.w = the half the seeds live in
+	std::atomic_thread_fence(std::memory_order_release);
+	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
 }
 
 void VoxelResources::clearSdfBox() {
 	if (m_mappedSdfBox == nullptr) {
 		return;
 	}
-	writeSdfBox(0, 0, 0, 0, 0, 0, false);
+	writeSdfBox(0, 0, 0, 0, 0, 0, false, 0);
 }
 
 bool VoxelResources::writeChunkTable(

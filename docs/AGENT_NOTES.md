@@ -662,3 +662,94 @@ build/release and build/debug (the first in-tree build of SdfBox.hpp and the
 renderer's box geometry logging) with ctest green in both and the offscreen
 smoke run (QT_QPA_PLATFORM=offscreen) exiting cleanly. On-device rendering is
 still the owner's gate.
+
+## Pass 42: the box and the seeds are a PAIR - handover order + no frame stall
+
+OWNER, after pass 41 shipped: "flicker is still there, so i don't know what you
+fixed. it looks like it only exaggerated shadow bands. by flicker i meant that
+chunks become dark for one frame just before sdf shadows become visible. so i'd
+revert and target that + latency."
+
+Pass 41 was reverted first (its own commit): the fixed 64-voxel hand-off made
+the field-to-2.5D model switch land ~26 voxels of horizontal travel from the
+shaded surface, which reads as harder bands exactly where pass 40 looked soft.
+The 8x8 window only bought value-accuracy the symptom never needed. The probes
+are kept (tracked) and the measurement is recorded in the revert message.
+
+WHAT WAS ACTUALLY WRONG - three things about WHEN the field is allowed to move.
+None of them is the shadow *shape*; all of them are the *handover*:
+
+1. THE BOX AND THE SEEDS ARE A PAIR. The shader resolves "which cell is this
+   point in" from the box uniform and indexes the seed buffer with it. A single
+   pair cannot be swapped in place while a dispatch that resolved cells against
+   the OLD box is still executing, and the GPU reads the box at EXECUTION time,
+   not at record time - so there is no moment where rewriting the box in place
+   is free. Pass 40 dealt with that by waiting for the copy's fence inside the
+   frame (the copy is queued behind those frames, so waiting means they have
+   retired); that is correct, and it is also a hitch of a 75 MB host->device
+   copy (18.9 M cells x 4 B) plus a queue wait - the owner's "big latency when
+   the SDFs get recomputed".
+
+2. THE PUBLISH ORDER INSIDE THE BOX. writeSdfBox wrote origin, then the active
+   word, then the dims. A dispatch that caught the write could therefore see
+   box.w = 1 (active) next to dims of 0 - the shader then rejects every cell
+   and the ray "escapes", i.e. the frame it lands in shades differently from
+   both the old and the new field.
+
+3. THE DROPPED LAUNCH. launchSdfBuild early-returns while a build is running,
+   and the only call site was finishRegionMove. A region move that completed
+   while a build was running lost its launch COMPLETELY: the field stayed
+   centered on the chunk the camera had already left until the NEXT region move
+   (a whole crossing later - up to a second of streaming, plus the build). For
+   that whole time the chunks that had just streamed in were outside the live
+   box, so they kept the hard 2.5D shadow look, and when the field finally
+   caught up the SDF shadows "appeared".
+
+FIX (one pass, one problem: "the field must change only as a consistent pair,
+and it must not cost the frame or lag the camera"):
+
+- The seed buffer is double-buffered (kSdfHalves = 2 copies of the field) and
+  the uniform says which half to read (dims.w, the shader's seed base). The
+  copy targets the SPARE half, so the live half keeps holding exactly the seeds
+  its box describes, and the pairing is always (old box, old half) or (new box,
+  new half) - never a mix.
+- beginSdfUpload submits the copy and RETURNS; sdfUploadComplete() polls the
+  fence. The frame publishes the box in a later frame, once the fence has
+  signalled: the copy was queued behind every frame that read the old box, so
+  by then none of them can be executing. No wait, no stall, and the invariant
+  is the same one pass 40 got by waiting.
+- writeSdfBox writes the payload (origin, dims, half index) first and the
+  active word last, behind a release fence.
+- The retry loop: vv::voxel::SdfHandover (voxel/SdfHandover.hpp) is the step
+  decision - join+submit, publish when the copy lands, and RELAUNCH while the
+  field does not cover the camera's chunk. finishRegionMove (and the
+  synchronous region path) now only record which chunk the field should cover;
+  ensureSdfField drives the policy every frame. A swallowed launch is retried
+  the moment the pipeline is idle, so the soft shadows follow the camera
+  instead of waiting for the next crossing.
+
+TEST: testSdfHandoverPolicy walks the state machine: no build before a region
+move has been seen; the first region starts one; a running build is waited for,
+never duplicated; a finished build is picked up; the box is NOT published while
+the copy is in flight and IS published once it lands; the copy targets the
+spare half and the halves alternate; a swallowed launch is retried; a field
+that covers the camera is not rebuilt. The CPU field/pack layout contracts stay
+pinned by testSdfBoxBuild / testSdfBoxHandoff / testSdfSoftShadow3d.
+
+NOT PROVEN HERE: the sandbox has no Vulkan device, so the frame-level handover
+is reasoned (single-queue ordering + the polling predicate) and built, not run.
+If the dark frame survives this pass, the next suspects are the STREAMING path
+rather than the SDF: the triple-buffered chunk table can be published twice in
+one frame (the incremental pump publish plus the final publish in
+finishRegionMove advance the half index twice), the slot cooldown guard is
+frame-counted rather than fence-counted, and the fade-in compositing of a
+newly installed chunk shows whatever is behind it. The diagnostic that splits
+these: does the dark frame also happen with VV_SDF_SHADOWS=0 (streaming, i.e.
+not the SDF at all), and is it the whole screen or a chunk-wide patch.
+
+VERIFIED IN THE SANDBOX (deps /home/user/.cache/vv-deps): build/release and
+build/debug build warning-free, ctest green in both, glslangValidator -V
+resources/shaders/pixels_rgba.comp exits 0, the offscreen smoke run exits
+cleanly, and the suite prints the new
+`sdf handover: box/seed pairing pinned either side of the copy ...` line.
+On-device rendering is the owner's gate.

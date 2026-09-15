@@ -83,11 +83,14 @@ The full-detail terrain region is the default. Set `VV_FAR_LOD=1` to enable
 the optional coarse terrain field beyond it; without that variable LOD is off,
 so no far-field build or seam ring is generated. Set `VV_SDF_SHADOWS=1` to try
 the SDF soft-shadow marcher: a 3D voxel SDF of the near terrain (a
-camera-centered 6x6-chunk box over the full world height, rebuilt on a
-background thread on every region change) is sphere-traced toward the sun with
-the plain Quilez `k*h/t` penumbra estimate, so shadow edges are soft on
-vertical / side casters too and not just on flat tops (`kShadowSharpness` in
-the shader tunes the softness). Only the box is
+camera-centered 6x6-chunk box over the full world height, kept on the camera's
+chunk by a background build) is sphere-traced toward the sun with the plain
+Quilez `k*h/t` penumbra estimate, so shadow edges are soft on vertical / side
+casters too and not just on flat tops (`kShadowSharpness` in the shader tunes
+the softness). The field lives in two halves and the box uniform says which one
+to read, so the copy never blocks a frame and a box only goes live together
+with the seeds it describes; a launch that a running build swallows is retried
+until the field covers the camera's chunk. Only the box is
 field-aware: a shadow ray that leaves it hands over to the 2.5D penumbra
 traversal (keeping the distance already marched and the visibility so far), so
 casters outside the box still shadow the frame; until the first box lands the

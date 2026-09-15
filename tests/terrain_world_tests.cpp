@@ -18,6 +18,7 @@
 #include "voxel/Chunk.hpp"
 #include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
+#include "voxel/SdfHandover.hpp"
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
@@ -2418,6 +2419,73 @@ void testSdfBoxHandoff() {
 			darkened);
 }
 
+// Pass 42: the handover rules that keep the box uniform and the seed buffer
+// consistent - a box published next to another build's seeds shades a frame
+// out of a field describing different terrain, which is the owner's one-frame
+// "chunks go dark just before the SDF shadows come back" - and that make the
+// field follow the camera instead of waiting for the next region move.
+void testSdfHandoverPolicy() {
+	using vv::voxel::SdfHandover;
+
+	SdfHandover h;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: no build before a region move has been seen");
+	h.wantValid = true;  // the first region move completed
+	check(h.step() == SdfHandover::Step::Relaunch,
+			"sdf handover: the first complete region starts a build");
+
+	h.buildRunning = true;  // the build is on the worker
+	h.wantCenterX = 1;      // the camera crosses a chunk while it builds
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: a running build is waited for, never duplicated");
+	h.buildReady = true;
+	check(h.step() == SdfHandover::Step::JoinAndUpload,
+			"sdf handover: a finished build is picked up");
+
+	// The renderer joins and SUBMITS the copy (no wait); the box has to stay
+	// unpublished until that copy's fence signals.
+	h.buildRunning = false;
+	h.buildReady = false;
+	h.uploadInFlight = true;
+	h.copyComplete = false;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: the box is NOT published while the copy is in flight");
+	h.copyComplete = true;
+	check(h.step() == SdfHandover::Step::Publish,
+			"sdf handover: the box is published once the copy has landed");
+
+	// The copy must target the SPARE half: the live one has to keep holding
+	// exactly the seeds its published box describes for as long as a frame can
+	// still read them. After a publish they swap.
+	check(h.uploadHalf() == 1u,
+			"sdf handover: the copy targets the half no live box points at");
+	h.liveHalf = h.uploadHalf();
+	check(h.uploadHalf() == 0u,
+			"sdf handover: the halves alternate, so the live half is never the "
+			"one being filled");
+
+	// The renderer publishes (center 0) while the camera is already on chunk
+	// 1: the launch the running build swallowed must be retried, or the soft
+	// shadows stay a whole crossing behind the camera.
+	h.uploadInFlight = false;
+	h.copyComplete = false;
+	h.haveField = true;
+	h.activeCenterX = 0;
+	check(h.step() == SdfHandover::Step::Relaunch,
+			"sdf handover: a swallowed launch is retried once the pipeline is idle");
+
+	// That build lands too: the field now covers the camera, nothing to do.
+	h.buildRunning = false;
+	h.buildReady = false;
+	h.activeCenterX = 1;
+	h.wantCenterX = 1;
+	check(h.step() == SdfHandover::Step::Idle,
+			"sdf handover: a field that covers the camera is not rebuilt");
+	std::printf("sdf handover: box/seed pairing pinned either side of the copy "
+			"(spare half, payload before active); the field follows the "
+			"camera's chunk instead of waiting for the next region move\n");
+}
+
 void testSdfSoftShadow3d() {
 	ShadowWorld w = makeSdfTestWorld();
 	double sun[3] = {0, 0, 0};
@@ -3103,6 +3171,7 @@ int main() {
 	testSdfSoftShadow3d();
 	testSdfBoxBuild();
 	testSdfBoxHandoff();
+	testSdfHandoverPolicy();
 	testStreamPriority();
 	testVoxelTextures();
 

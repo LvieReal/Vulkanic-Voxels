@@ -136,7 +136,7 @@ layout(set = 0, binding = 12) readonly buffer SdfField {
 
 layout(std140, set = 0, binding = 13) uniform SdfBox {
     ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
-    uvec4 dims;   // xyz = box size in cells (== sdfDim), w = 0 when no SDF
+    uvec4 dims;   // xyz = box size in cells, w = the seed half to read
 } sdfBox;
 
 
@@ -610,7 +610,8 @@ float shadowPenumbra(float h, float t)
 // side face (a vertical cliff) HAS data, so the sphere trace softens the
 // shadow edges running along vertical/steep casters. sdfBox.box.xyz is the
 // box origin in world voxels (w < 0 = no field yet); sdfBox.dims is the box
-// size in cells (w == 0 when no field). sdfField.seed is one u32 per cell
+// size in cells (w == which half of the double-buffered seed buffer the
+// live box reads). sdfField.seed holds kSdfHalves copies of one u32 per cell
 // (x + y*nx + z*nx*ny), 0xFFFFFFFF = no solid in the box's view.
 float sdfCubeDistance(vec3 p, vec3 v)
 {
@@ -635,6 +636,11 @@ float sampleSdf3d(vec3 p)
     uint nx = sdfBox.dims.x;
     uint ny = sdfBox.dims.y;
     uint nz = sdfBox.dims.z;
+    // Pass 42: the field is double-buffered and dims.w says which half the
+    // live box was published with, so a frame always reads the seeds that
+    // belong to the box it is resolving cells against - even while the next
+    // field is already being copied into the other half.
+    uint seedBase = sdfBox.dims.w * nx * ny * nz;
     float best = 1e30;
     for (int dz = -1; dz <= 1; ++dz) {
         int zc = c.z + dz;
@@ -645,7 +651,7 @@ float sampleSdf3d(vec3 p)
             for (int dx = -1; dx <= 1; ++dx) {
                 int xc = c.x + dx;
                 if (xc < 0 || xc >= int(nx)) continue;
-                uint s = sdfField.seed[uint(xc) + uint(yc) * nx +
+                uint s = sdfField.seed[seedBase + uint(xc) + uint(yc) * nx +
                                        uint(zc) * nx * ny];
                 if (s == 0xFFFFFFFFu) continue;
                 vec3 v = vec3(float(s % nx),

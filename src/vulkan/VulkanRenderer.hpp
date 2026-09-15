@@ -341,6 +341,36 @@ class VulkanRenderer final {
     std::int32_t centerChunkZ = 0;
   };
   SdfBuild m_sdfPending;
+  // --- SDF handover state (pass 42) ---
+  // The box uniform and the seed buffer are a PAIR (the shader resolves
+  // "which cell" from the box and indexes the seeds with it), so the publish
+  // order matters: vv::voxel::SdfHandover (voxel/SdfHandover.hpp) owns the
+  // rules, ensureSdfField drives them. m_sdfUploadInFlight: a copy is on the
+  // queue and the box has NOT been published for it; m_sdfUploadBox: the
+  // geometry to publish when it lands; m_sdf*Center*: the chunk the LIVE
+  // field was built for vs the chunk the camera is on now (the retry lever -
+  // a launch swallowed by a running build used to be lost until the next
+  // region move, leaving the soft shadows a whole crossing behind).
+  struct SdfBoxUpload {
+    std::int32_t boxX = 0;
+    std::int32_t boxY = 0;
+    std::int32_t boxZ = 0;
+    std::uint32_t nx = 0, ny = 0, nz = 0;
+    std::int32_t centerChunkX = 0;
+    std::int32_t centerChunkZ = 0;
+    std::uint32_t half = 0;  // seed half this build was copied into
+  };
+  bool m_sdfUploadInFlight = false;
+  // The seed half the live box points at (the shader's dims.w). The copy
+  // fills the other one; vv::voxel::SdfHandover::uploadHalf owns that rule.
+  std::uint32_t m_sdfLiveHalf = 0;
+  SdfBoxUpload m_sdfUploadBox;
+  bool m_sdfFieldActive = false;
+  bool m_sdfWantValid = false;
+  std::int32_t m_sdfActiveCenterX = 0;
+  std::int32_t m_sdfActiveCenterZ = 0;
+  std::int32_t m_sdfWantCenterX = 0;
+  std::int32_t m_sdfWantCenterZ = 0;
 
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
