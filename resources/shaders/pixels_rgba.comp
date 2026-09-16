@@ -8,9 +8,9 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(push_constant) uniform Push {
     uvec4 screen;   // x=width, y=height, z=bgra, w=frame
     vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance);
-                    // w = VV_SHADOW_JITTER, the pass-56 shadow-ray jitter
-                    // offset in pixel footprints (< 0 = unset -> the shader's
-                    // kShadowJitterDefault, 0 = off)
+                    // w = VV_SHADOW_JITTER: the shadow-ray jitter's CONE
+                    // SLOPE (< 0 = unset, so kShadowJitterDefault applies;
+                    // 0 = jitter off, bit-identical to the un-jittered ray)
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
     ivec4 region;   // x,z = region origin (min corner) in chunk coords;
@@ -587,54 +587,75 @@ float shadowOpacity(uint type)
 // it for harder shadows (32 ~= 2 degrees), lower it for softer.
 const float kShadowSharpness = 8.0;
 
-// Pass 56: jitter the shadow ray's ORIGIN per pixel, by up to a pixel's
-// footprint, perpendicular to the sun.
+// Pass 57: jitter the shadow ray - a CONE for the penumbra, a fixed world
+// displacement for the contact.
 //
-// This is the "jitter the ray" fix for the two artifacts pass 54 tried to cap
-// away (rmshadows / the ray-traced-SDF papers, arXiv 2210.06160). The penumbra
-// is a min over DISCRETE samples, so its error is a coherent function of where
-// the shaded point is: neighbouring pixels walk almost the same samples, the
-// error correlates across the surface, and it reads as bands sweeping a
-// penumbra and as stepped contacts. A per-pixel jitter decorrelates it - the
-// same error becomes noise at one pixel's scale, which the eye integrates,
-// instead of structure.
+// The penumbra estimate is a min over DISCRETE samples, so its error is a
+// coherent function of where the shaded point is: neighbouring pixels walk
+// almost the same samples, the error correlates across the surface, and it
+// reads as bands sweeping a penumbra and as a stepped contact (the ray-traced
+// SDF shadow papers, arXiv 2210.06160 and 2210.04449). A per-pixel jitter
+// decorrelates it: the same error becomes noise at one pixel's scale, which
+// the eye integrates, instead of structure.
 //
-// Pass 55 tilted the sun DIRECTION instead, and the owner's report on it was
-// the mechanism showing through: "noticeable at 0.02-0.04, and 0.01 is still
-// too high", "in small squares" (a 1/8-voxel hash cell is several pixels wide
-// at range), and "at contacts (small penumbra) there's no jitter at all" - at
-// a contact the caster is at t ~= 0, so a direction tilt moves the ray by
-// angle*t ~= 0 there, while its noise is a uniform k*angle everywhere else.
+// The jitter has to be normalized WHERE THE SHADOW IS FORMED, which is at the
+// caster, a distance t up the ray - not at the shaded point. Pass 56 displaced
+// the origin by one PIXEL OF THE SHADED POINT'S OWN FOOTPRINT, and the owner
+// found the flaw on-device: "noise scales with distance, so up close it's
+// still not enough, and too far it's too much". The footprint grows with the
+// camera distance, so the offset did, and the visibility it feeds moved by
+// k*offset/t - a 22x spread across the 5..400 unit range of the terrain probe
+// (mean |dvis| 0.008 -> 0.167). Tilting the DIRECTION instead moves the sample
+// by slope*t, so the estimate moves by ~k*slope wherever the caster is: the
+// same noise at every distance (the probe measures 0.02-0.03, flat, over that
+// same range). That is pass 55's mechanism with pass 55's handicap removed -
+// pass 55 hashed a FIXED 1/8-voxel cell (the owner: "in small squares"), this
+// hashes the pixel's own footprint, which is one pixel wide at any distance.
 //
-// Displacing the ORIGIN has the opposite and wanted response: the sample moves
-// by a fixed distance regardless of t, so the visibility changes by
-// k*offset/t. Near a contact (small t) that is a large change, which is what
-// dithers an edge sharper than a pixel; across a wide penumbra (large t) it is
-// a ~1% change, which is all a band needs to stop reading as a band. And the
-// offset is one PIXEL of footprint, so the noise is one pixel of the picture
-// at every distance - it is the pixel's own size, not a taste in magnitude.
+// A cone alone can never move a contact: there the caster is at t ~= 0, so
+// slope*t ~= 0 (the owner's pass-55 report: "at contacts (small penumbra)
+// there's no jitter at all"). The origin therefore keeps a displacement of its
+// own - kShadowJitterFloor VOXELS, a FIXED world distance, deliberately NOT
+// scaled by the footprint, because a repeat of that scaling is the bug above.
+// It is what breaks the contact marching pattern, and it is also what pass 56
+// got right: the displacement slides along the surface, so the displaced
+// origin stays outside it and the ray keeps its t.
 //
-// The hash is the world position quantised in FOOTPRINT-sized cells: the grain
-// is a pixel across at any distance AND stays glued to the surface (a
-// screen-space hash crawls under the picture as the camera moves; a fixed
-// world cell - pass 55's 1/8 voxel - was several pixels of squares).
+// Why one lever for both: they fix the two ends of the same gradient. The
+// owner's "0.5 is too small, 5 is enough" was the pass-56 lever, a footprint
+// scale - at a typical view its "5" is ~one VOXEL of displacement, so the
+// floor's default is half a voxel with the lever taking it to the cap, and the
+// cone rides along at the same strength.
 //
-// The magnitude is a LEVER (VV_SHADOW_JITTER = the offset in pixel
-// footprints, pc.camera.w) so it can be A/B'd on-device without a rebuild: 0
-// reproduces the un-jittered picture exactly, 0.5 (default) is half a pixel,
-// 1.0 a full pixel, up to 4 to overshoot, and the cap below keeps a grazing
-// footprint from throwing the ray off its own surface. Half a pixel is the
-// default because the estimate is not perfectly unbiased in the offset: the
-// terrain probe held the mean visibility within 1% of the un-jittered
-// estimate at a 0.05-voxel offset and 2.6% at 0.1, so the shipped amount stays
-// on the small side of a pixel. Cost: two hashes and a handful of ALU per
-// shadow RAY, against ~174 taps.
-const float kShadowJitterDefault = 0.5;  // offset, in pixel footprints
-const float kShadowJitterMax = 1.0;      // ... and never more than a voxel
+// Cost: two hashes (hash13) and a handful of ALU per shadow RAY, against ~174
+// taps; the march's samples, the penumbra form and the exact path below are
+// untouched.
+//
+// VV_SHADOW_JITTER (pc.camera.w) = the CONE SLOPE, so it A/Bs without a
+// rebuild: 0 turns the jitter off and is bit-identical to the un-jittered
+// picture, kShadowJitterDefault (0.05) is the shipped slope, and the floor
+// scales with it linearly (0.5 voxel at the default, 1.0 at 0.10) so one
+// number moves both.
+const float kShadowJitterDefault = 0.05;  // cone slope, tan of the tilt
+const float kShadowJitterFloor = 0.50;    // contact displacement, voxels
+const float kShadowJitterFloorMax = 1.0;  // ... and never more than a voxel
 
-float shadowJitterAmount()
+float shadowJitterSlope()
 {
     return (pc.camera.w >= 0.0) ? pc.camera.w : kShadowJitterDefault;
+}
+
+// The contact displacement for the current lever: linear in the slope so that
+// 0 stays exactly off, and capped so a large lever cannot throw the ray off
+// its own surface.
+float shadowJitterFloorVox()
+{
+    const float slope = shadowJitterSlope();
+    if (slope <= 0.0) {
+        return 0.0;
+    }
+    return min(kShadowJitterFloor * (slope / kShadowJitterDefault),
+               kShadowJitterFloorMax);
 }
 
 // Hash13 (Dave Hoskins' "hash without sine"): cheap, deterministic, well
@@ -647,43 +668,53 @@ float shadowJitterHash(vec3 p)
     return fract((p.x + p.y) * p.z);
 }
 
-// The shadow ray's origin: displaced disc-uniformly by up to `amount` pixel
-// footprints WITHIN the surface's tangent plane, so the sample slides inside
-// its own pixel instead of leaving the surface it is shading. sunV keeps its
-// direction and its LENGTH (the march's t is a distance): only the RAY moves,
-// so the traversal is unchanged in nature - it is just asked about another
-// point of the pixel instead of its centre. footprintVox is that pixel's world
-// size at the hit; this renderer's voxels are 1 world unit, so that is the
-// position's own unit too.
-//
-// Tangent plane, not the plane facing the sun, and the probe is why: on 3721
-// terrain rays a pixel of surface-tangent offset moved 14.7% of the shadow
-// values while holding the mean visibility within 1% of the un-jittered
-// estimate, where lifting the origin off the surface by the same distance
-// thinned every shadow by 6% (a lifted ray escapes casters it should hit).
-// The offset's component along the sun is wasted - it is the same ray - and
-// the rest is what moves the sample.
-vec3 shadowRayOrigin(vec3 hitPosVox, vec3 n, vec3 sunV, float footprintVox)
+// The shadow ray, jittered: returns the DIRECTION to march (the same length as
+// sunV, because the march's t is a distance) and writes the ORIGIN to start
+// from. The hash cell is the pixel's footprint, so the grain is one pixel
+// across at any distance and stays glued to the surface (a screen-space hash
+// would crawl under the picture as the camera moves; pass 55's fixed 1/8 voxel
+// was several pixels of squares at range). Both components share the drawn
+// azimuth, so this is one jittered ray, not two independent perturbations.
+vec3 shadowRayJitter(vec3 hitPosVox, vec3 n, vec3 sunV, float footprintVox,
+                     out vec3 outOrigin)
 {
-    const vec3 liftedOrigin = hitPosVox + n * 1e-3 + sunV * 1e-2;
-    const float amount = shadowJitterAmount();
-    if (amount <= 0.0 || footprintVox <= 0.0) {
-        return liftedOrigin;
+    const float slope = shadowJitterSlope();
+    const float floorVox = shadowJitterFloorVox();
+    outOrigin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    if (slope <= 0.0 || footprintVox <= 0.0) {
+        return sunV;
     }
-    // Orthonormal frame in the surface, picking the axis the normal is least
-    // aligned with so the cross product never degenerates.
-    const vec3 helper = (abs(n.y) < 0.9) ? vec3(0.0, 1.0, 0.0)
-                                         : vec3(1.0, 0.0, 0.0);
-    const vec3 tangentA = normalize(cross(helper, n));
-    const vec3 tangentB = cross(n, tangentA);
+    const float len = length(sunV);
+    const vec3 dir = sunV / max(len, 1e-6);
+    // The pass-56 azimuth: a direction that SLIDES along the surface (the
+    // tangent plane), so a displaced origin can never start inside the solid
+    // it was standing on, and the ray it is added to keeps its t.
+    vec3 tangent = cross(n, dir);
+    if (dot(tangent, tangent) < 1e-8) {
+        tangent = cross(n, vec3(0.0, 0.0, 1.0));
+    }
+    tangent = normalize(tangent);
+    const vec3 bitangent = cross(n, tangent);
     const vec3 cell = floor(hitPosVox / max(footprintVox, 1e-5));
     const float u1 = shadowJitterHash(cell);
     const float u2 = shadowJitterHash(cell + vec3(17.0, 31.0, 7.0));
-    const float r = min(amount * footprintVox * sqrt(u1), kShadowJitterMax);
-    const float phi = 6.2831853 * u2;  // sqrt + uniform angle = disc-uniform
-    const vec3 off = (tangentA * cos(phi) + tangentB * sin(phi)) * r;
-    return liftedOrigin + off;
+    const float magnitude = sqrt(u1);  // sqrt = uniform inside the disc
+    const float phi = 6.2831853 * u2;
+    const vec3 slide = tangent * cos(phi) + bitangent * sin(phi);
+    // The contact displacement: a fixed world distance, along the surface.
+    outOrigin += slide * (floorVox * magnitude);
+    // The cone: the sample moves by `slope * t` at distance t, i.e. the
+    // estimate moves by ~k * slope wherever the caster is - one noise
+    // amplitude for the whole picture instead of one per camera distance. The
+    // tilt is the same azimuth, projected perpendicular to the sun (a tilt
+    // along the sun would only change t, not where the ray points).
+    vec3 tilt = slide - dir * dot(slide, dir);
+    if (dot(tilt, tilt) < 1e-8) {
+        tilt = tangent - dir * dot(tangent, dir);
+    }
+    return normalize(dir + normalize(tilt) * (slope * magnitude)) * len;
 }
+
 
 // One penumbra sample of the SDF soft shadow (technique:
 // iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t.
@@ -1017,10 +1048,10 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
 // visibility. Far-LOD hits shadow through the same march: from beyond the
 // region it self-selects the cheap far-cell path.
 //
-// Pass 56: the soft paths start from a per-pixel DISPLACED origin
-// (shadowRayOrigin), so the estimate's sampling error decorrelates across the
-// surface instead of banding. The exact path below keeps the un-jittered
-// origin, bit for bit (1.0 lit / 0.0 shadowed, unchanged by any of this).
+// Pass 57: the soft paths march a per-pixel JITTERED ray (shadowRayJitter), so
+// the estimate's sampling error decorrelates across the surface instead of
+// banding. The exact path below keeps the un-jittered ray, bit for bit (1.0
+// lit / 0.0 shadowed, unchanged by any of this).
 float sunShadow(vec3 hitPosVox, vec3 n, float footprintVox)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);
@@ -1033,18 +1064,20 @@ float sunShadow(vec3 hitPosVox, vec3 n, float footprintVox)
     // self-shadow acne; the hit face's outward cell is air by construction.
     const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
     if (scene.misc.w > 0.5) {
-        // Pass 56: the soft paths start from a per-pixel displaced origin, so
-        // their sampling error decorrelates across the surface instead of
-        // banding. The exact path below keeps the un-jittered origin (and
-        // stays bit-identical).
-        const vec3 softOrigin = shadowRayOrigin(hitPosVox, n, sunV, footprintVox);
+        // Pass 57: the soft paths march a cone-jittered ray from a slightly
+        // displaced origin, so their sampling error decorrelates across the
+        // surface instead of banding (see shadowRayJitter). The exact path
+        // below keeps the un-jittered ray and stays bit-identical.
+        vec3 softOrigin;
+        const vec3 softDir =
+            shadowRayJitter(hitPosVox, n, sunV, footprintVox, softOrigin);
         // Pass 38: the proper 3D voxel SDF sphere trace when a field is
         // uploaded (sdfBox.box.w >= 0). The 2.5D top-plane penumbra is the
         // fallback until the background build lands (and if it ever stalls).
         if (sdfBox.box.w >= 0) {
-            return sunRayEscapesSdf3d(softOrigin, sunV);
+            return sunRayEscapesSdf3d(softOrigin, softDir);
         }
-        return sunRayEscapesSdf(softOrigin, sunV, 0.0, 1.0);
+        return sunRayEscapesSdf(softOrigin, softDir, 0.0, 1.0);
     }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }

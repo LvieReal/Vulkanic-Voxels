@@ -10,8 +10,8 @@ namespace vv::render {
 struct PushConstants final {
 	glm::uvec4 screen{};    // x=width, y=height, z=bgra, w=frame
 	glm::vec4 camera{};     // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance;
-													// see VulkanRenderer::fogCutDistance); w = pass-56
-													// shadow-ray jitter in pixel footprints
+													// see VulkanRenderer::fogCutDistance); w = pass-57
+													// shadow-ray jitter CONE SLOPE
 													// (VV_SHADOW_JITTER, <0 = unset)
 	glm::uvec4 chunkSize{}; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
 	glm::vec4 voxelSize{};  // xyz=voxel size in world units

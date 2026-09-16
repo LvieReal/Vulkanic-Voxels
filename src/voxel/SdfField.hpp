@@ -486,35 +486,69 @@ private:
 // 3D SDF). March the ray toward the sun, step by the SDF distance
 // (conservatively scaled, so an approximate SDF can never skip a surface).
 //
-// Pass 56 (shader mirror): the soft shadow paths start from a per-pixel
-// DISPLACED origin - up to `kShadowJitterDefault` pixel footprints of
-// displacement inside the shaded point's surface tangent plane, hashed from
-// the world position in footprint-sized cells - and the exact path does not.
+// Pass 57 (shader mirror): the soft shadow path marches a per-pixel JITTERED
+// ray - a CONE for the penumbra plus a fixed world displacement for contacts -
+// while the exact path marches the plain one, bit for bit.
 //
-// Pass 55 tilted the sun DIRECTION per shaded point instead, and the owner's
-// verdict on it was the mechanism showing through: "in small squares"
-// (a fixed 1/8-voxel hash cell is several pixels wide at range), "0.01 is
-// still too high", and "at contacts (small penumbra) there's no jitter at
-// all" - at a contact the caster is at t ~= 0, so a tilt moves the ray by
-// angle*t ~= 0 there, while its noise is a uniform k*angle everywhere else.
-// Displacing the ORIGIN moves the sample by a fixed distance instead, so the
-// visibility changes by k*offset/t: large at contacts (which is what dithers
-// an edge sharper than a pixel) and ~1% across a wide penumbra (which is all a
-// band needs to stop reading as one).
+// Two mechanism fixes over the passes before it, both forced by the owner's
+// on-device reports:
+//  - pass 55 tilted the sun DIRECTION per shaded point with a FIXED 1/8-voxel
+//    hash cell: "in small squares", and "at contacts (small penumbra) there's
+//    no jitter at all" (a tilt moves the ray by slope*t, and a contact has
+//    t ~= 0).
+//  - pass 56 displaced the ORIGIN by one pixel of the SHADED POINT'S footprint:
+//    "noise scales with distance, so up close it's still not enough, and too
+//    far it's too much". The footprint grows with the camera distance, so the
+//    offset did, and the estimate moves by k*offset/t - a 22x spread across
+//    the probe's 5..400 unit range (mean |dvis| 0.008 -> 0.167).
+// A cone moves the sample by slope*t at the caster, i.e. by k*slope of
+// visibility wherever the shadow is formed, so the noise is the same at every
+// distance (probe: flat 0.02 over that range). A cone can never reach a
+// contact (t ~= 0 again), so the origin keeps a displacement of
+// kShadowJitterFloor VOXELS - a fixed world distance, deliberately NOT scaled
+// by the footprint - which is what flips the grazing rays an edge is made of.
+// One lever moves both: the floor is linear in the slope (0.5 voxel at the
+// default, one at 0.10), because the owner's "0.5 is too small, 5 is enough"
+// was pass 56's footprint lever, whose "5" is about a VOXEL of displacement at
+// a typical view - and the shipped default sits between the two.
 //
-// The displacement is in the SURFACE's tangent plane - a disc of paint inside
-// the pixel, not a lift off the surface - because lifting biases the picture:
-// on 3721 terrain rays a pixel of surface-tangent offset moved 14.7% of the
-// shadow values with the mean visibility within 1% of the un-jittered
-// estimate, while the same distance of lift thinned every shadow by 6%.
-//
-// The shader derives the offset per pixel (shadowRayJitterOffset below mirrors
-// it bit for bit, including hash13), and testSdfShaderMirrorConstants holds
-// the constants, the shader text and this arithmetic together.
-inline constexpr float kShadowJitterDefault = 0.5f;  // in pixel footprints
-inline constexpr float kShadowJitterMax = 1.0f;      // ... capped at a voxel
+// The shader hashes both components per PIXEL-FOOTPRINT cell of the world
+// position, and drives them from ONE hashed azimuth (one jittered ray, not two
+// independent perturbations); the mirror does the same, so a test can walk the
+// same arithmetic the GPU runs. testSdfShaderMirrorConstants holds the
+// constants and the shader's text together.
+inline constexpr float kShadowJitterDefault = 0.05f;  // cone slope
+inline constexpr float kShadowJitterFloor = 0.50f;    // displacement, voxels
+inline constexpr float kShadowJitterFloorMax = 1.0f;  // ... capped at a voxel
+
+// The contact displacement for a given lever, the shader's
+// shadowJitterFloorVox: linear in the slope so 0 is exactly off, and capped.
+inline float shadowJitterFloorVox(float slope) {
+    if (slope <= 0.0f) {
+        return 0.0f;
+    }
+    return std::min(kShadowJitterFloor * (slope / kShadowJitterDefault),
+                    kShadowJitterFloorMax);
+}
+
+// The un-jittered (all-zero) displacement, so callers can read as prose.
+inline constexpr float kNoOffset[3] = {0.0f, 0.0f, 0.0f};
+
+// p = shaded point, n = surface normal, sun = voxel-space sun direction,
+// offset = a displacement to add to the start point (all-zero for the
+// un-jittered ray; shadowRayJitter below adds the contact floor through it).
+inline void shadowRayOrigin(const float p[3], const float n[3],
+                            const float sun[3], const float offset[3],
+                            float out[3]) {
+    for (int a = 0; a < 3; ++a) {
+        out[a] = p[a] + n[a] * 1e-3f + sun[a] * 1e-2f + offset[a];
+    }
+}
 
 // Hash13 (Dave Hoskins' "hash without sine"), the shader's shadowJitterHash.
+// It is the per-pixel draw that decides both the azimuth and the magnitude of
+// the jitter, and it lives here too so the tests drive the same per-cell
+// arithmetic the GPU runs.
 inline float shadowJitterHash(float x, float y, float z) {
     float px = x * 0.1031f, py = y * 0.1031f, pz = z * 0.1031f;
     px -= std::floor(px);
@@ -529,69 +563,104 @@ inline float shadowJitterHash(float x, float y, float z) {
     return h - std::floor(h);
 }
 
-// The displacement the shader builds for one shaded point: a disc of radius
-// min(amount * footprintVox, kShadowJitterMax) in the surface tangent plane,
-// hashed from the world position quantised in footprint-sized cells (so the
-// noise is one pixel of the picture at any distance and stays glued to the
-// surface instead of crawling over it as the camera moves). amount <= 0 (the
-// default when VV_SHADOW_JITTER is unset is 0 here, the shader's is
-// kShadowJitterDefault) leaves the origin alone.
-inline void shadowRayJitterOffset(const float p[3], const float n[3],
-                                  float footprintVox, float amount,
-                                  float outOffset[3]) {
-    outOffset[0] = outOffset[1] = outOffset[2] = 0.0f;
-    if (amount <= 0.0f || footprintVox <= 0.0f) {
+// One shaded point's jitter, exactly as the shader's shadowRayJitter draws it:
+// the direction to march (same LENGTH as sun, because t is a distance) and the
+// displaced origin. `footprintVox` is the pixel's world size at the hit and it
+// sets ONLY the hash cell - the cone scales with the caster's distance and the
+// floor is a fixed world distance, so neither depends on the camera (that
+// dependence was pass 56's bug: "noise scales with distance").
+//
+// The displacement direction slides along the surface (the tangent plane), so
+// a displaced origin can never start inside the solid it was standing on, and
+// the ray it is added to keeps its t. The tilt is that same azimuth projected
+// perpendicular to the sun: a tilt along the sun would only change t, not
+// where the ray points.
+inline void shadowRayJitter(const float p[3], const float n[3],
+                            const float sun[3], float footprintVox, float slope,
+                            float outDir[3], float outOrigin[3]) {
+    shadowRayOrigin(p, n, sun, kNoOffset, outOrigin);
+    const float len =
+        std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    for (int a = 0; a < 3; ++a) {
+        outDir[a] = sun[a];
+    }
+    if (slope <= 0.0f || footprintVox <= 0.0f || len <= 1e-6f) {
         return;
     }
-    const float ix = 1.0f / std::max(n[0] * n[0] + n[1] * n[1] + n[2] * n[2],
-                                     1e-12f);
-    const float nx = n[0] * std::sqrt(ix), ny = n[1] * std::sqrt(ix),
-                nz = n[2] * std::sqrt(ix);
-    const float helperX = (std::abs(ny) < 0.9f) ? 0.0f : 1.0f;
-    const float helperY = (std::abs(ny) < 0.9f) ? 1.0f : 0.0f;
-    float ax = helperY * nz - 0.0f * ny;
-    float ay = 0.0f * nx - helperX * nz;
-    float az = helperX * ny - helperY * nx;
-    const float alen = std::sqrt(ax * ax + ay * ay + az * az);
-    if (alen <= 1e-9f) {
-        return;
+    const float floorVox = shadowJitterFloorVox(slope);
+    const float dx = sun[0] / len, dy = sun[1] / len, dz = sun[2] / len;
+    // Tangent frame: `tangent` is perpendicular to the normal AND the sun, so
+    // it lies in the surface and is never parallel to the sun's own tilt.
+    float tx = n[1] * dz - n[2] * dy;
+    float ty = n[2] * dx - n[0] * dz;
+    float tz = n[0] * dy - n[1] * dx;
+    float tlen = std::sqrt(tx * tx + ty * ty + tz * tz);
+    if (tlen <= 1e-9f) {  // the sun is along the normal: any surface direction
+        tx = n[1] * 1.0f - n[2] * 0.0f;
+        ty = n[2] * 0.0f - n[0] * 1.0f;
+        tz = n[0] * 0.0f - n[1] * 0.0f;
+        tlen = std::sqrt(tx * tx + ty * ty + tz * tz);
+        if (tlen <= 1e-9f) {
+            return;
+        }
     }
-    ax /= alen;
-    ay /= alen;
-    az /= alen;
-    const float bx = ny * az - nz * ay;
-    const float by = nz * ax - nx * az;
-    const float bz = nx * ay - ny * ax;
-    const float gx = std::floor(p[0] / std::max(footprintVox, 1e-5f));
-    const float gy = std::floor(p[1] / std::max(footprintVox, 1e-5f));
-    const float gz = std::floor(p[2] / std::max(footprintVox, 1e-5f));
-    const float u1 = shadowJitterHash(gx, gy, gz);
-    const float u2 = shadowJitterHash(gx + 17.0f, gy + 31.0f, gz + 7.0f);
-    const float r = std::min(amount * footprintVox * std::sqrt(u1),
-                             kShadowJitterMax);
+    tx /= tlen;
+    ty /= tlen;
+    tz /= tlen;
+    const float bx = n[1] * tz - n[2] * ty;
+    const float by = n[2] * tx - n[0] * tz;
+    const float bz = n[0] * ty - n[1] * tx;
+    const float cellX = std::floor(p[0] / std::max(footprintVox, 1e-5f));
+    const float cellY = std::floor(p[1] / std::max(footprintVox, 1e-5f));
+    const float cellZ = std::floor(p[2] / std::max(footprintVox, 1e-5f));
+    const float u1 = shadowJitterHash(cellX, cellY, cellZ);
+    const float u2 = shadowJitterHash(cellX + 17.0f, cellY + 31.0f,
+                                      cellZ + 7.0f);
+    const float magnitude = std::sqrt(u1);  // sqrt = uniform inside the disc
     const float phi = 6.2831853f * u2;
     const float cp = std::cos(phi), sp = std::sin(phi);
-    outOffset[0] = (ax * cp + bx * sp) * r;
-    outOffset[1] = (ay * cp + by * sp) * r;
-    outOffset[2] = (az * cp + bz * sp) * r;
-}
-
-// p = shaded point, n = surface normal, sun = voxel-space sun direction,
-// offset = the displacement above (all-zero for the un-jittered origin; the
-// shader's shadowRayOrigin adds it to the same lifted point).
-inline void shadowRayOrigin(const float p[3], const float n[3],
-                            const float sun[3], const float offset[3],
-                            float out[3]) {
-    for (int a = 0; a < 3; ++a) {
-        out[a] = p[a] + n[a] * 1e-3f + sun[a] * 1e-2f + offset[a];
+    const float sx = tx * cp + bx * sp;
+    const float sy = ty * cp + by * sp;
+    const float sz = tz * cp + bz * sp;
+    // The contact displacement: a fixed world distance, along the surface.
+    const float r = floorVox * magnitude;
+    outOrigin[0] += sx * r;
+    outOrigin[1] += sy * r;
+    outOrigin[2] += sz * r;
+    // The cone: tilt by slope*magnitude along the same azimuth, projected into
+    // the plane perpendicular to the sun, and renormalized to the sun's length.
+    float ix = sx - dx * (sx * dx + sy * dy + sz * dz);
+    float iy = sy - dy * (sx * dx + sy * dy + sz * dz);
+    float iz = sz - dz * (sx * dx + sy * dy + sz * dz);
+    float ilen = std::sqrt(ix * ix + iy * iy + iz * iz);
+    if (ilen <= 1e-9f) {
+        ix = tx - dx * (tx * dx + ty * dy + tz * dz);
+        iy = ty - dy * (tx * dx + ty * dy + tz * dz);
+        iz = tz - dz * (tx * dx + ty * dy + tz * dz);
+        ilen = std::sqrt(ix * ix + iy * iy + iz * iz);
+        if (ilen <= 1e-9f) {
+            return;
+        }
     }
+    ix /= ilen;
+    iy /= ilen;
+    iz /= ilen;
+    float nx = dx + ix * (slope * magnitude);
+    float ny = dy + iy * (slope * magnitude);
+    float nz = dz + iz * (slope * magnitude);
+    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    const float sc = len / nlen;
+    outDir[0] = nx * sc;
+    outDir[1] = ny * sc;
+    outDir[2] = nz * sc;
 }
 
 
-// Pass 56: the caller builds `o` with shadowRayOrigin() when the soft path is
-// jittered (the shader does, the exact path does not) - this function marches
-// whatever ray it is given. `outSteps` reports how many samples the field
-// phase took, so a test can pin that cost.
+
+// Pass 57: the caller hands in whatever ray it wants marched - the shader
+// builds a jittered one with shadowRayJitter (cone + contact floor) for the
+// soft paths and the plain one for the exact path. `outSteps` reports how many
+// samples the field phase took, so a test can pin that cost.
 inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
                                     const float d[3], float outExit[3],
                                     float* outExitT, float* outVisibility,
@@ -608,9 +677,8 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         }
         return false;
     }
-    // Pass 56 (shader mirror): `o` is whatever origin the caller built - the
-    // shader's shadowRayOrigin() when the soft path is jittered, the plain
-    // lifted point in the exact path.
+    // `o` is whatever origin the caller built: the jittered one for the soft
+    // paths, the plain lifted point for the exact path.
     float dir[3] = {d[0], d[1], d[2]};
     // Pass 40 (shader mirror): hand the ray over at the box CROSSING, not at
     // the first sample past it, so a step (up to 0.7 * h) cannot skip a

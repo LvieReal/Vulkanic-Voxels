@@ -176,38 +176,44 @@ out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
 0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
 corners is what keeps the current penumbra dark, and no bias brings that back.
 
-Pass 56 jitters the shadow ray's ORIGIN per pixel, by half a pixel of world
-space inside the shaded point's surface tangent plane - which is what the
-owner's directive ("jittering the actual rays") turned out to need. The penumbra
-estimate is a min over discrete samples, so its error is a coherent function of
-where the shaded point is: neighbouring points walk almost the same samples, and
-it reads as bands sweeping a penumbra and as a stepped contact. Pass 55 tilted
-the sun's DIRECTION instead, and the owner's on-device verdict pinpointed the
-mechanism: the noise arrived "in small squares" (a fixed 1/8-voxel hash cell is
-several pixels wide at range), 0.01 was still too much, and "at contacts (small
-penumbra) there's no jitter at all" - at a contact the caster sits at t ~= 0, so
-a tilt moves the ray by angle*t ~= 0 there, while its noise is a uniform k*angle
-everywhere else. Displacing the ORIGIN moves the sample by a fixed distance
-regardless of t, so the visibility moves by k*offset/t: strong exactly where an
-edge is sharper than a pixel, ~1% across a wide penumbra. The offset is measured
-in PIXEL FOOTPRINTS - the same footprint the texture LOD uses - so the noise is
-one pixel of the picture at any distance instead of a fixed world cell, and the
-hash cell is that footprint too, so the grain stays glued to the surface instead
-of crawling over it as the camera moves. It is zero-mean by construction (a
-disc-uniform offset in the tangent plane; the probe held the mean visibility
-within 1% of the un-jittered estimate at a 0.05-voxel offset and 2.6% at 0.1,
-which is why half a pixel rather than a whole one is the default) and it never
-lifts the sample off the surface it is shading (a lifted origin escaped casters
-it should have hit and thinned every shadow by 6%). At a contact the hard step
-becomes a band of partial samples: the edge profile's worst 0.02-voxel step goes
-0.037 -> 0.080 at half a pixel and 0.136 at a full pixel, while the mean
-visibility of 400 random surface rays moves by 0.0000. It costs two hashes per
-shadow ray against ~174 taps and leaves the march's samples untouched; the exact
-binary path (`VV_SDF_SHADOWS=0`) keeps the un-jittered origin, bit for bit.
-`VV_SHADOW_JITTER=<pixel footprints>` is the on-device lever (0 = off and
-bit-identical to the un-jittered picture, 0.5 = default, up to 4; the startup
-log prints what was chosen).
+Pass 57 jitters the shadow ray per pixel as a CONE plus a fixed world
+displacement, so the noise is the same at every camera distance. The ray's
+direction is tilted by a hashed slope inside a cone (the sun's LENGTH is kept,
+because the march's t is a distance), and the origin slides along the surface by
+a fixed `kShadowJitterFloor` voxels, never by a footprint. It answers the two
+defects the owner found on-device in pass 56, whose per-pixel ORIGIN jitter he
+had verified ("looks correct now"): its strength, where "0.5 is too small, 5 is
+enough to eliminate banding and stepping", and - the real find - its distance
+dependence, "noise scales with distance, so up close it's still not enough, and
+too far it's too much". That second one was pass 56's rule itself: the offset was
+scaled by the shaded point's PIXEL FOOTPRINT, the one quantity in the shader that
+grows with the camera, and the estimate moves by k*offset/t, t being the
+distance to the caster. On the 3721-ray terrain probe the mean |dvis| ran 0.008
+-> 0.167 (22x) over camera distances 5 -> 400; the same rays under a cone hold
+0.021, flat. A cone can never move a contact (t ~= 0 there, the pass-55 finding),
+so the origin keeps its own displacement - a fixed world distance, in the surface
+tangent plane so a displaced origin cannot start inside the solid it stands on -
+and the two share one hashed azimuth, so it stays one jittered ray. The hash cell
+is still the pixel's footprint, pass 56's accepted per-pixel grain. At the shipped
+default (cone slope 0.05, floor 0.50 vox, reached at the renderer's `VV_SHADOW_JITTER`
+lever; 0 is bit-identical to the un-jittered estimate, the clamp is 0.5 and the
+startup log prints both numbers) the contact scan's grid-locked zigzag - the
+"stair-stepping" - drops from 0.162 to 0.063 voxel while its profile becomes
+per-sample grain (worst neighbour step 0.037 -> 0.957), the terrains' 18.2% of
+rays move by more than 1/255, and the mean visibility of the probe's terrain view
+goes 0.6556 -> 0.7122: the edge folds toward the light by half a voxel, the same
+trade pass 56 made at the offset the owner called "enough". Costs two hashes per
+shadow ray against ~174 field taps; the march's samples and the exact binary path
+(`VV_SDF_SHADOWS=0`) are untouched, bit for bit.
 
+Pass 56 jitters the ray's ORIGIN, one pixel of world, in the surface tangent
+plane - superseded by pass 57's rule for the reason above, but the mechanism it
+introduced (a per-pixel displacement hashed in footprint-sized cells, which is
+what "jitter per pixel" turned out to mean) is what pass 57 kept. Pass 55 tilted
+the sun's DIRECTION instead and the owner's verdict pinpointed the mechanism: the
+noise arrived "in small squares" (a fixed 1/8-voxel hash cell is several pixels
+wide at range), 0.01 was still too high, and "at contacts (small penumbra)
+there's no jitter at all".
 Pass 54's one-voxel step cap (`kMaxSdfStep`) was rejected on-device ("looks
 like it did not solve anything, only performs worse now") and is reverted. Its
 probe numbers still stand as measurements - the edge profile's summed second

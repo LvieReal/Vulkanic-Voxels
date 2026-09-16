@@ -154,15 +154,17 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
                  "covers %u)\n",
                  m_sdfMarginChunks,
                  vv::vulkan::VoxelResources::kSdfHalfChunks);
-    // Pass 56: the soft shadow ray starts from a per-pixel DISPLACED origin,
-    // which turns the discrete march's coherent sampling error (bands across a
-    // penumbra, stepped contacts) into noise at one pixel's scale. The lever
-    // is that displacement in pixel footprints (kShadowJitterDefault = 0.5
-    // when unset, 0 for the un-jittered estimate, up to 4 to overshoot on
-    // purpose). It rides pc.camera.w to the shader.
+    // Pass 57: the soft shadow ray is jittered per pixel as a CONE plus a
+    // fixed world displacement at the origin, which turns the discrete march's
+    // coherent sampling error (bands across a penumbra, stepped contacts) into
+    // noise at one pixel's scale. The lever is the CONE SLOPE
+    // (kShadowJitterDefault = 0.07 when unset, 0 for the un-jittered estimate,
+    // up to 0.5 = a 27-degree cone to overshoot on purpose; the contact
+    // displacement scales with it linearly). It rides pc.camera.w to the
+    // shader.
     if (const char* jitterEnv = std::getenv("VV_SHADOW_JITTER")) {
       const float parsed = std::strtof(jitterEnv, nullptr);
-      m_shadowJitter = std::clamp(parsed, 0.0f, 4.0f);
+      m_shadowJitter = std::clamp(parsed, 0.0f, 0.5f);
     }
     if (m_shadowJitter < 0.0f) {
       std::fprintf(stderr,
@@ -172,8 +174,11 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
       std::fprintf(stderr, "[vulkan] shadow ray jitter: off (un-jittered)\n");
     } else {
       std::fprintf(stderr,
-                   "[vulkan] shadow ray jitter: %.2f pixel footprints\n",
-                   static_cast<double>(m_shadowJitter));
+                   "[vulkan] shadow ray jitter: %.3f slope (contact floor "
+                   "%.3f vox)\n",
+                   static_cast<double>(m_shadowJitter),
+                   static_cast<double>(
+                       vv::voxel::shadowJitterFloorVox(m_shadowJitter)));
     }
   }
 

@@ -1993,3 +1993,104 @@ and it fails if the shader's `kShadowJitterDefault` stops being 0.5.
 its effect on the scan. The A/B lever is the point of the pass: the owner can
 sweep 0 / 0.25 / 0.5 / 1 / 2 without a rebuild and the startup log says what he
 is looking at.
+
+## Pass 57: the jitter is normalized where the shadow is formed
+
+**The verdict that set this up.** Pass 56's mechanism came back verified - the
+owner: "looks correct now" - with two defects named in one breath: its strength
+("0.5 is too small, 5 is enough to eliminate banding and stepping") and, the
+real find, its distance dependence: "noise scales with distance, so up close
+it's still not enough, and too far it's too much".
+
+**Diagnosis, before any code.** Pass 56 scaled the origin offset by the shaded
+point's PIXEL FOOTPRINT - the one quantity in the shader that grows with the
+camera - and the visibility the offset feeds moves by `k * offset / t`, where t
+is the distance to the caster. So the noise grew with the camera exactly as
+reported: on the 3721-ray terrain probe (footprint = d * 2 * tan35 / 1080) the
+mean |dvis| ran 0.0076 / 0.0181 / 0.0461 / 0.0798 / 0.1669 (22x) at camera
+distances 5 / 15 / 45 / 135 / 400, with the moved share creeping 17.7% -> 28.3%.
+Same probe, same rays: a direction CONE that moves the sample by `slope * t` at
+the caster holds 0.0210 - 0.0216 (flat) across that whole range, because
+`k * (slope * t) / t = k * slope` wherever the shadow is formed. That is also
+why a cone alone cannot fix a contact (the owner's pass-55 finding): at a contact
+the caster is at t ~= 0, so `slope * t` ~= 0 again.
+
+**The mechanism now.** `shadowRayJitter(hitPosVox, n, sunV, footprintVox,
+outOrigin)` returns the direction to march (the same LENGTH as `sunV`, since the
+march's t is a distance) and writes the origin, from ONE hashed azimuth
+(hash13, twice, in pixel-footprint-sized cells of the hit position - pass 56's
+accepted per-pixel grain):
+
+- *Cone*: `dir + normalize(tilt) * (slope * magnitude)`, where `tilt` is that
+  azimuth projected perpendicular to the sun (a tilt along the sun would change
+  t and nothing else) and `magnitude = sqrt(u1)` is uniform inside the cone.
+  The noise is one amplitude at every camera distance.
+- *Contact floor*: the origin slides along the SURFACE tangent plane by
+  `floorVox * magnitude`. A fixed world distance, deliberately not a footprint -
+  repeating that scaling is the bug above - and the tangent plane is pass 56's
+  accepted choice: a displaced origin can never start inside the solid it stands
+  on, and the ray keeps its t.
+- *Constants*: `kShadowJitterDefault = 0.05` (cone slope),
+  `kShadowJitterFloor = 0.50` voxel at that slope, linear in the lever and
+  capped by `kShadowJitterFloorMax = 1.0` (reached at slope 0.10). The owner's
+  "5" was pass 56's footprint lever, whose value at a typical view is about one
+  voxel of displacement; the shipped default sits between his "too small" (that
+  same lever at 0.5, ~0.1 voxel) and his "enough".
+- *Lever*: `VV_SHADOW_JITTER` is now the CONE SLOPE (renderer clamp [0, 0.5]),
+  and moves both terms; `0` is still bit-identical to the un-jittered estimate
+  (the early-out returns `sunV` and the plain lifted origin), and the startup
+  log prints the slope and the resolved floor in voxels.
+
+**Measured, at the shipped default (slope 0.05, floor 0.50).**
+
+- *Contacts* (60 rows of the staircase wall, 0.05-voxel x sampling, the
+  terminator's interpolated 0.5-crossing fitted per row). The exact reference's
+  edge is a STRAIGHT line - residual 0.000, parity-locked part 0.000, mean edge
+  48.260 - while the SDF march's edge sits ~1.0 voxel on the other side (47.293)
+  with a zigzag locked to the caster's voxel rows (parity mean 0.162 voxel: this
+  is the "stair-stepping"). The jitter cuts that locked part to 0.063 (2.6x) and
+  turns the profile into per-sample grain (summed |2nd difference| 0.29 -> 6.42,
+  worst neighbour step 0.037 -> 0.957), at the price of moving the mean edge
+  0.485 voxel further from the reference (47.293 -> 46.808): the edge folds
+  toward the lit side, i.e. contacts read marginally lighter and noisier, which
+  is the same trade pass 56 made at his "5".
+- *Terrain* (3721 rays): 18.2% of rays change by more than 1/255, mean |dvis|
+  0.068, mean visibility 0.6556 -> 0.7122 (+0.057) and the blocked share 19.2% ->
+  25.4%. A binary hit is not a smooth ramp, so a symmetric perturbation does not
+  leave the mean alone; pass 56 documented the same asymmetry (19.2% -> 24.0% at
+  a 0.05-voxel offset) and the lever is the answer, not the form.
+- *Penumbra* (the pillar's top-corner scan at 0.02 voxel): the deep-penumbra
+  mean goes 0.028 -> 0.109 (partial samples replace the clamped floor), the
+  flat-plateau share 77.6% -> 77.1% and the profile's roughness 2.02 -> 15.9.
+- *Cost*: two hash13 and a handful of ALU per shadow RAY against ~174 field taps
+  - below the probe's timing noise. The march's samples and the exact
+  `sunRayEscapes` path are untouched.
+
+**Honest limits.** The jitter does not fix the SDF's ~1-voxel contact creep; it
+makes the edge noisier and, measured above, folds its mean by half a voxel
+toward the light. The tangential slide can start inside a step-up that shares
+the point's voxel-face normal (a face normal is axis-aligned, so a horizontal
+slide on a floor can enter the next column), which produces occasional dark
+specks at contacts - present since pass 56 at its largest offsets, bounded here
+by the 1-voxel cap. A field-validated origin (one extra sample: if `h(origin)`
+is under the lift, keep the un-displaced origin) is the pass-58 candidate if it
+shows on screen. And the grain is a footprint cell, so at a grazing view it
+projects to many pixels: pass 56's accepted choice, unchanged.
+
+**Verification.** `glslangValidator` exit 0. Release + debug `ctest` 100%
+(release 6.73 s, debug 28.66 s) with the runtime `.spv` copies refreshed
+(release `18995e91048ca1bf434eb3332625d698`, debug
+`9d806f59f501d736aef9e878dbc56a2a`). `testSdfShaderMirrorConstants` pins the
+shader's *text* for this mechanism (the tangent-plane slide, the tilt projected
+perpendicular to the sun, the footprint hash cell, the `pc.camera.w` slope, the
+`t += max(h * 0.7, 0.05)` step pass 54's cap must not return through) and its
+constants against the CPU mirror (`0.05 / 0.50 / 1.0`), then drives 400 random
+terrain rays through the mirror's own arithmetic: the march's defaults are still
+8.0 / 160, 99 of 400 rays move, and the mean visibility moves 0.033 - the bound
+is 0.06 now, documented in the test, because pass 56's "does not move the mean"
+(0.0000) was measured at a *smaller* default and any jitter that acts on an edge
+moves that edge. `testSdfSoftShadow3d` block 4 pins the floor's arithmetic (0
+implies exactly 0, linear in the lever, capped), the footprint-independence of
+the displacement bound, the tangent-slide property (the normal component of the
+offset is 0) and the 181-ray mesa scan (42 rays move, mean shift 0.024 with the
+scan window crossing the edge).
