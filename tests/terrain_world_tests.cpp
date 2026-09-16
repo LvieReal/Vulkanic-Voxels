@@ -1,5 +1,5 @@
-// Pure-logic tests for the terrain/world modules - plus, since the windowing
-// library replaced Qt (pass 43), the input bindings and the image decoder,
+// Pure-logic tests for the terrain/world modules - plus, since the toolkit
+// removal (pass 43), the input bindings and the image decoder,
 // which are pure functions over plain data. No window is opened here and no
 // Vulkan device is touched: this suite also runs in restricted sandboxes
 // where the game itself cannot.
@@ -4271,7 +4271,7 @@ static void testVoxelTextures() {
 // stuck at the front forever while progressively worse top-ups were
 // generated first; the nearest in-frustum chunks came dead last.
 // ---------------------------------------------------------------------------
-// --- pass 43: the Qt-free input bindings -----------------------------------
+// --- pass 43: the toolkit-free input bindings ------------------------------
 //
 // The key numbers below are the evdev scancodes GLFW reports on X11/Wayland
 // (Linux keycodes), i.e. what an X11/Wayland build sees for those physical
@@ -4404,7 +4404,7 @@ void testKeyBindings() {
 	    bindings.size());
 }
 
-// --- pass 43: the Qt-free image decoder ------------------------------------
+// --- pass 43: the toolkit-free image decoder -------------------------------
 //
 // Builds a PNG byte for byte (uncompressed deflate blocks, CRC32 computed
 // here) so the test does not depend on the game's own art: the decoder must

@@ -23,9 +23,9 @@ function(vv_enable_packaging target_name)
     endif()
 
     # Nothing to deploy for the windowing library: GLFW is either linked
-    # statically (the fetched build) or already present on the target system
-    # as a shared library its package manager owns. Qt's deployment script
-    # (qt_generate_deploy_app_script) went away with Qt in pass 43.
+    # statically (the vendored subproject) or already present on the target
+    # system as a shared library its package manager owns. The toolkit's
+    # deployment script went away with the toolkit (pass 43).
 
     set(default_config "${CMAKE_BUILD_TYPE}")
     if(NOT default_config)

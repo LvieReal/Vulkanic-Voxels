@@ -16,11 +16,11 @@
 #   - glslang 16.5.0              (glslangValidator for the shader pipeline)
 #
 # GLFW and glm are NOT built here any more: pass 58 vendored them into
-# third_party/, so they arrive with the checkout. Since pass 43 the game needs
-# no toolkit at all (GLFW replaced Qt), so this script is a few minutes instead
-# of half an hour - and with the vendored pair gone it needs neither their
-# headers nor a display to produce a build that walks the game's headless
-# path end to end.
+# third_party/, so they arrive with the checkout. The game has needed no
+# windowing toolkit since pass 43, so this script is a few minutes instead of
+# half an hour - and with the vendored pair it needs neither their headers nor
+# a display to produce a build that walks the game's headless path end to
+# end.
 #
 # Usage:   scripts/build-linux-toolchain.sh [prefix-dir]
 # Default prefix: ~/.cache/vv-deps (PERSISTS across sandbox /tmp resets,

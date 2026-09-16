@@ -18,8 +18,9 @@ class VulkanRenderer;
 namespace vv::core {
 
 // The game: owns the window, the renderer, the camera, the frame loop and the
-// input state. Replaces the Qt widget (pass 43): AppWindow + VulkanWidget +
-// QTimer were three objects doing what one loop does here.
+// input state. Replaces the toolkit-era arrangement (removed in pass 43): a
+// window object, a render widget and a frame timer were three objects doing
+// what one loop does here.
 //
 // Input model (unchanged): the mouse is locked to the window while playing
 // and the camera follows relative motion; Escape releases it and pauses;
