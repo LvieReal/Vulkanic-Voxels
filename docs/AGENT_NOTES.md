@@ -69,11 +69,21 @@ it is the canonical look.
 - Streaming: generation on a worker thread (pump installs + fence-scoped
   uploads only); released slots have a 2-frame cooldown; region swaps are
   wait-free (no device/queue waits); teleport fallback stays synchronous.
-- Terrain: density = clamp(g·(target−y)) + fbm3·amp, folds (overhangs) in
-  mountains; defaults in `TerrainGenerator.hpp` (lift 36, ceiling 100,
+- Terrain: density = clamp(g·(target−y)) + fbm3·amp; the warp folds the
+  SURFACE (cliffs and slopes), it does not put rock over air - measured at pass
+  62: every column is solid-below/air-above (56k+ columns, six regions, plus a
+  +/-1200 sweep), so the world has no caves, overhangs or tunnels to test cave
+  lighting on. Defaults in `TerrainGenerator.hpp` (lift 36, ceiling 100,
   window (0.92, 0.995), snowLine 82). `maxHeightVoxels()` must stay ≤ 127.
+- Ambient sky visibility (pass 62): the shader derives it from the SAME height
+  atlas the marches use (binding 5, `resolveColumn` -> `columnHeightAt`, 6
+  azimuths x 6 distances 1..32 voxels) plus two 32-voxel SDF rays, in one mean
+  of eight; `scene.ambient.x` = the switch, `scene.ambient.y` = the floor
+  (`< 0` = the shader's `kAmbientFloorDefault`). The CPU mirror is
+  `tests/ambient_mirror.hpp`; the tests pin the shader's text AND the mirror's
+  numbers, so a change on one side without the other fails.
 
-## Switches (command line, pass 61)
+## Switches (command line, passes 61-62)
 
 Parsed once in `main()` from `argv` by `src/core/CommandLine.cpp` into one
 `vv::core::GameOptions` (`src/core/CommandLine.hpp`), read by the consumers
