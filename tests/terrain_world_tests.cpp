@@ -2658,102 +2658,142 @@ void testSdfSoftShadow3d() {
 			"sdf3d overhang: underside stays at most half-lit");
 	}
 
-	// (4) Pass 55: the sphere trace jitters the shadow ray's DIRECTION per
-	// shaded point (kshadow mirror: shadowRayJitter). The penumbra estimate is
-	// a min over discrete samples, so its error is a coherent function of
-	// where the shaded point is - neighbouring points walk almost the same
-	// samples, the error correlates across the surface, and it reads as bands
-	// sweeping a penumbra and as stepped contacts. A disc-uniform jitter of
-	// the direction decorrelates it into noise of the same magnitude.
+	// (4) Pass 56: the soft shadow ray starts from a per-pixel DISPLACED
+	// origin (the shader's shadowRayOrigin), by up to kShadowJitterDefault
+	// pixel footprints WITHIN the surface tangent plane of the shaded point.
 	//
-	// Pinned here, on a 0.05-voxel scan across the mesa's west shadow edge on
-	// the ground at z=28:
-	//   - the jittered profile's MEAN equals the un-jittered profile's mean
-	//     (the offset is disc-uniform, i.e. zero mean: no bias, no darkened
-	//     picture), while individual samples do move (>= 5% of them),
-	//   - the tilt stays inside the slope and the direction keeps its length
-	//     (a direction that changed length would rescale the penumbra),
-	//   - jitter = 0 is bit-identical to the pre-pass-55 estimate, and the
-	//     shipped default is not,
-	//   - the jitter costs no march samples (it is 2 hashes per ray).
+	// Pass 55 tilted the sun DIRECTION per shaded point instead, and the
+	// owner's verdict on it was the mechanism showing through: "in small
+	// squares" (a fixed 1/8-voxel hash cell is several pixels wide at range),
+	// "0.01 is still too high", and "at contacts (small penumbra) there's no
+	// jitter at all" - at a contact the caster sits at t ~= 0, so a tilt moves
+	// the ray by angle*t ~= 0 there, while a displacement moves the sample by a
+	// fixed distance and therefore moves the visibility by k*offset/t:
+	// strongest exactly where the edge is sharper than a pixel, ~1% across a
+	// wide penumbra.
+	//
+	// Pinned here: the offset's own properties on a grid of footprint cells
+	// (hashed per cell, inside its disc, zero-mean), then its effect on a
+	// 0.05-voxel scan across the mesa's west shadow edge on the ground at z=28
+	// (the edge moves, the profile's MEAN does not).
 	{
-		const double scanZ = 28.0;
-		const float kSharp = 8.0f;  // kShadowSharpness
-		double sumPlain = 0.0, sumJit = 0.0, maxDiff = 0.0;
-		long samples = 0, differing = 0, stepsPlain = 0, stepsJit = 0;
-		double maxTilt = 0.0, maxLenErr = 0.0;
+		const float kFootprint = 0.25f;  // voxels per pixel: a close-in view
+		const float kAmount = vv::voxel::kShadowJitterDefault;
+		const float kRadius = kAmount * kFootprint;
+		const float nUp[3] = {0.0f, 1.0f, 0.0f};
+		int sameCell = 0, neighbourDiffer = 0;
+		double sum[3] = {0.0, 0.0, 0.0}, maxRadius = 0.0;
+		float prev[3] = {0.0f, 0.0f, 0.0f};
+		bool havePrev = false, insideDisc = true, zeroIsZero = true;
+		for (int cx = 0; cx < 32; ++cx) {
+			for (int cz = 0; cz < 32; ++cz) {
+				const float p[3] = {float(cx) * kFootprint + 0.1f * kFootprint,
+					12.0f,
+					float(cz) * kFootprint + 0.1f * kFootprint};
+				float off[3], again[3], none[3];
+				vv::voxel::shadowRayJitterOffset(p, nUp, kFootprint, kAmount,
+					off);
+				// 0.3 footprints further along x and z is still the same cell.
+				const float q[3] = {p[0] + 0.3f * kFootprint, p[1],
+					p[2] + 0.3f * kFootprint};
+				vv::voxel::shadowRayJitterOffset(q, nUp, kFootprint, kAmount,
+					again);
+				sameCell += (off[0] == again[0] && off[1] == again[1] &&
+					off[2] == again[2]) ? 1 : 0;
+				const double r = std::sqrt(double(off[0]) * off[0] +
+					double(off[1]) * off[1] + double(off[2]) * off[2]);
+				maxRadius = std::max(maxRadius, r);
+				insideDisc = insideDisc && r <= double(kRadius) * 1.0001 + 1e-6;
+				for (int a = 0; a < 3; ++a) {
+					sum[a] += double(off[a]);
+				}
+				if (havePrev) {
+					neighbourDiffer +=
+						(off[0] != prev[0] || off[2] != prev[2]) ? 1 : 0;
+				}
+				prev[0] = off[0];
+				prev[1] = off[1];
+				prev[2] = off[2];
+				havePrev = true;
+				vv::voxel::shadowRayJitterOffset(p, nUp, kFootprint, 0.0f, none);
+				zeroIsZero = zeroIsZero && none[0] == 0.0f && none[1] == 0.0f &&
+					none[2] == 0.0f;
+			}
+		}
+		const int cells = 32 * 32;
+		const double meanLen = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] +
+			sum[2] * sum[2]) / double(cells);
+		check(sameCell == cells,
+			"sdf3d pass56: the offset is hashed per footprint cell, not per "
+			"sample");
+		check(neighbourDiffer >= cells - 40,
+			"sdf3d pass56: neighbouring footprint cells get different offsets");
+		check(insideDisc && maxRadius > 0.4 * double(kRadius),
+			"sdf3d pass56: every offset is inside its disc (and the disc is "
+			"actually used)");
+		check(meanLen <= 0.10 * double(kRadius),
+			"sdf3d pass56: the disc is zero-mean, so the offset adds no bias");
+		check(zeroIsZero,
+			"sdf3d pass56: amount = 0 leaves the origin alone (the A/B lever)");
+		std::printf("sdf3d pass56 grid: %d cells at %.3f vox footprint, %d "
+			"neighbours differ, max offset %.4f of %.4f vox, |mean| %.5f vox\n",
+			cells, double(kFootprint), neighbourDiffer, maxRadius,
+			double(kRadius), meanLen);
+
+		double sumPlain = 0.0, sumJit = 0.0, maxDiff = 0.0, shiftDist = 0.0;
+		long samples = 0, moved = 0;
+		bool originMatches = true;
 		for (double x = 5.0; x <= 14.0 + 1e-9; x += 0.05) {
 			const unsigned b = w.near.boundAt(int(std::floor(x)), 28);
-			double p[3] = {x, b == 0xFFFFu ? 10.0 : double(b), scanZ + 0.5};
+			double p[3] = {x, b == 0xFFFFu ? 10.0 : double(b), 28.5};
 			double n[3] = {0.0, 1.0, 0.0};
 			double o[3];
 			originOf(p, n, o);
 			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 			const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
-			// Explicit jitter = 0 is the pre-pass-55 estimate.
-			const float plain =
-				vv::voxel::sphereTracedShadow(sdf, of, sf, kSharp, 160, 0.0f);
-			// Default call = whatever the shipped mirror jitters at.
-			const float jit = vv::voxel::sphereTracedShadow(sdf, of, sf);
-			// The direction itself: length kept, tilt inside the slope.
-			float jd[3];
-			for (int a = 0; a < 3; ++a)
-				jd[a] = sf[a];
-			vv::voxel::shadowRayJitter(of, jd);
-			{
-				double l0 = 0.0, l1 = 0.0, dot = 0.0;
-				for (int a = 0; a < 3; ++a) {
-					l0 += double(sf[a]) * double(sf[a]);
-					l1 += double(jd[a]) * double(jd[a]);
-					dot += double(sf[a]) * double(jd[a]);
+			float off[3];
+			vv::voxel::shadowRayJitterOffset(of, nUp, kFootprint, kAmount, off);
+			float jittered[3];
+			vv::voxel::shadowRayOrigin(of, nUp, sf, off, jittered);
+			// The lifted origin plus the offset, exactly.
+			for (int a = 0; a < 3; ++a) {
+				const float want =
+					of[a] + nUp[a] * 1e-3f + sf[a] * 1e-2f + off[a];
+				if (std::abs(jittered[a] - want) > 1e-6f) {
+					originMatches = false;
 				}
-				l0 = std::sqrt(l0);
-				l1 = std::sqrt(l1);
-				maxLenErr = std::max(maxLenErr, std::abs(l1 - l0) / l0);
-				const double cosTilt = dot / (l0 * l1);
-				maxTilt = std::max(
-					maxTilt, std::acos(std::min(1.0, std::max(-1.0, cosTilt))));
 			}
-			int usedPlain = 0, usedJit = 0;
-			float vis = 1.0f;
-			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
-				&vis, 8.0f, 160, 0.0f, &usedPlain);
-			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
-				&vis, 8.0f, 160, vv::voxel::kShadowJitterDefault, &usedJit);
-			stepsPlain += usedPlain;
-			stepsJit += usedJit;
+			shiftDist += std::sqrt(double(off[0]) * off[0] +
+				double(off[2]) * off[2]);
+			const float plain = vv::voxel::sphereTracedShadow(sdf, of, sf);
+			const float jit = vv::voxel::sphereTracedShadow(sdf, jittered, sf);
 			sumPlain += plain;
 			sumJit += jit;
-			const double diff = std::abs(double(jit) - double(plain));
-			maxDiff = std::max(maxDiff, diff);
-			differing += (diff > 1e-6) ? 1 : 0;
+			maxDiff = std::max(maxDiff, std::abs(double(jit) - double(plain)));
+			moved += (jit != plain) ? 1 : 0;
 			++samples;
 		}
 		const double meanPlain = sumPlain / double(samples);
 		const double meanJit = sumJit / double(samples);
-		const double stepsDelta =
-			std::abs(double(stepsJit) - double(stepsPlain)) / double(samples);
-		std::printf("sdf3d pass55 scan: %ld rays at 0.05 vox, mean vis %.4f "
-			"jittered / %.4f plain (|d| %.4f), %ld samples moved (max %.3f), "
-			"max tilt %.4f rad, length error %.2e, %.2f vs %.2f samples/ray\n",
-			samples, meanJit, meanPlain, std::abs(meanJit - meanPlain),
-			differing, maxDiff, maxTilt, maxLenErr,
-			double(stepsJit) / double(samples),
-			double(stepsPlain) / double(samples));
-		check(differing * 20 >= samples,
-			"sdf3d pass55: the jitter moves at least 5% of the scan");
+		std::printf("sdf3d pass56 scan: %ld rays at 0.05 vox, %.3f vox mean "
+			"surface offset, mean vis %.4f displaced / %.4f plain (|d| %.4f), "
+			"%ld moved (max %.3f)\n",
+			samples, shiftDist / double(samples), meanJit, meanPlain,
+			std::abs(meanJit - meanPlain), moved, maxDiff);
+		check(originMatches,
+			"sdf3d pass56: shadowRayOrigin is the lifted origin plus the "
+			"offset");
+		check(moved * 20 >= samples,
+			"sdf3d pass56: the offset moves at least 5% of the scan");
 		check(std::abs(meanJit - meanPlain) <= 0.02,
-			"sdf3d pass55: the disc-uniform jitter does not bias the mean");
-		check(maxTilt <= double(vv::voxel::kShadowJitterDefault) * 1.01,
-			"sdf3d pass55: the tilt stays inside the jitter slope");
-		check(maxLenErr <= 1e-5,
-			"sdf3d pass55: the jittered direction keeps its length");
-		check(stepsDelta <= 1.0,
-			"sdf3d pass55: the jitter costs no march samples");
+			"sdf3d pass56: the offset does not bias the profile's mean");
+		check(maxDiff >= 0.1,
+			"sdf3d pass56: it can flip a grazing ray - the edge itself moves, "
+			"which is what pass 55 could not do at a contact");
 	}
 }
 
-// Pass 54/55: the shader's shadow constants and the CPU mirror's defaults are
+// Pass 54/56: the shader's shadow constants and the CPU mirror's arithmetic are
 // ONE contract. Nothing in this suite can run the GPU path, so every claim
 // made here about the SDF shadow is only as true as that pairing - and pass 51
 // is what an unpaired constant costs (the shader read a uniform word nobody
@@ -2761,17 +2801,21 @@ void testSdfSoftShadow3d() {
 //
 // Two pins, one per side:
 //   - the shader file (resources/shaders/pixels_rgba.comp, VV_SHADER_DIR) must
-//     still declare the constants below and still apply them where the mirror
-//     assumes they are applied (the soft path jitters the sun, the exact path
-//     does not, and the renderer is the side that writes pc.camera.w), and
-//   - the mirror's DEFAULT arguments must BE those numbers, proven by
-//     behaviour rather than by repeating the literal: a default call and an
-//     explicit-constant call agree bit for bit.
+//     still declare kShadowSharpness / kShadowJitterDefault / kShadowJitterMax
+//     and still do what the mirror assumes: displace the SOFT path's origin,
+//     leave the exact path un-jittered, keep the 160-step budget and the plain
+//     max(0.7h, 0.05) step (pass 54's cap is reverted, not re-shipped) - and
+//     the renderer must still be the side that writes pc.camera.w, or the
+//     lever is a shader input nobody writes, which is pass 51 again, and
+//   - the mirror's arithmetic must BE that: spot-check shadowRayOrigin's
+//     displacement, and show that a displaced origin really does move the
+//     estimate (the tests that characterise the shadow march itself use the
+//     un-displaced origin, i.e. the exact path's).
 // VV_SHADER_DIR / VV_SRC_DIR come from cmake/Tests.cmake; without them (a
 // standalone compile) only the behavioural half runs, so the suite cannot
 // silently pass a check it never made.
 void testSdfShaderMirrorConstants() {
-	double sharp = 8.0, jitterDefault = 0.02, jitterGrain = 8.0;
+	double sharp = 8.0, jitterDefault = 1.0, jitterMax = 1.0;
 #ifdef VV_SHADER_DIR
 	{
 		std::ifstream in(std::string(VV_SHADER_DIR) + "/pixels_rgba.comp");
@@ -2792,30 +2836,32 @@ void testSdfShaderMirrorConstants() {
 				numberAfter("const float kShadowSharpness", &sharp);
 			const bool hasJitter =
 				numberAfter("const float kShadowJitterDefault", &jitterDefault);
-			const bool hasGrain =
-				numberAfter("const float kShadowJitterGrain", &jitterGrain);
+			const bool hasMax =
+				numberAfter("const float kShadowJitterMax", &jitterMax);
 			check(hasSharp, "shader mirror: kShadowSharpness is declared");
-			check(hasJitter,
-				"shader mirror: kShadowJitterDefault is declared (pass 55)");
-			check(hasGrain,
-				"shader mirror: kShadowJitterGrain is declared (pass 55)");
+			check(hasJitter, "shader mirror: kShadowJitterDefault is declared");
+			check(hasMax, "shader mirror: kShadowJitterMax is declared");
 			check(src.find("for (int i = 0; i < 160; ++i)") != std::string::npos,
 				"shader mirror: the 3D field march keeps its 160-step budget");
 			check(src.find("t += max(h * 0.7, 0.05);") != std::string::npos,
 				"shader mirror: the march steps by max(0.7h, 0.05) - pass 54's "
 				"cap is reverted, not re-shipped");
-			// Pass 55 reaches the soft paths only: the exact binary march
-			// keeps the true sun (and stays bit-identical).
-			check(src.find(
-					"const vec3 sunJittered = shadowRayJitter(sunV, hitPosVox);") !=
-					std::string::npos,
-				"shader mirror: sunShadow jitters the sun for the soft paths");
+			// Pass 56: the SOFT paths start from a displaced origin, the exact
+			// path keeps the plain one (and stays bit-identical), and the
+			// displacement is hashed per PIXEL FOOTPRINT (not per fixed world
+			// cell), which is what the owner's "in small squares" asked for.
+			check(src.find("const vec3 softOrigin = shadowRayOrigin(hitPosVox, n, "
+					"sunV, footprintVox);") != std::string::npos,
+				"shader mirror: sunShadow displaces the soft paths' origin");
 			check(src.find("return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;") !=
 					std::string::npos,
-				"shader mirror: the exact binary path keeps the un-jittered sun");
+				"shader mirror: the exact path keeps the un-jittered origin");
+			check(src.find("const vec3 cell = floor(hitPosVox / "
+					"max(footprintVox, 1e-5));") != std::string::npos,
+				"shader mirror: the jitter is hashed per footprint cell");
 			check(src.find("(pc.camera.w >= 0.0) ? pc.camera.w : "
 					"kShadowJitterDefault") != std::string::npos,
-				"shader mirror: the jitter slope is read from pc.camera.w");
+				"shader mirror: the jitter magnitude is read from pc.camera.w");
 #ifdef VV_SRC_DIR
 			// The other half of the pass-51 lesson: a shader input nobody
 			// writes is worth exactly nothing.
@@ -2830,7 +2876,7 @@ void testSdfShaderMirrorConstants() {
 						std::string::npos,
 					"shader mirror: the renderer reads VV_SHADOW_JITTER");
 				check(rsrc.find("m_shadowJitter);") != std::string::npos,
-					"shader mirror: the renderer pushes the slope (camera.w)");
+					"shader mirror: the renderer pushes it (pc.camera.w)");
 			}
 #endif
 		}
@@ -2839,14 +2885,15 @@ void testSdfShaderMirrorConstants() {
 	check(true, "shader mirror: VV_SHADER_DIR is not defined, file pins skipped");
 #endif
 	check(sharp == 8.0, "shader mirror: kShadowSharpness is the mirror's 8.0");
-	check(jitterDefault == 0.02,
-		"shader mirror: kShadowJitterDefault is the mirror's 0.02");
-	check(jitterGrain == 8.0,
-		"shader mirror: kShadowJitterGrain is the mirror's 8.0");
+	check(jitterDefault == 0.5,
+		"shader mirror: kShadowJitterDefault is the mirror's 0.5 footprint");
+	check(jitterMax == 1.0,
+		"shader mirror: kShadowJitterMax is the mirror's 1.0 voxel");
 
-	// The other half of the pairing, read through behaviour: a default call
-	// and an explicit (8.0, 160, kShadowJitterDefault) call must agree
-	// exactly, and jitter = 0 must be the pre-pass-55 estimate.
+	// The mirror's defaults, read through behaviour: a default call and an
+	// explicit (8.0, 160) call must agree exactly, and a footprint-sized
+	// displacement must move the estimate on some rays while the 400-ray mean
+	// stays where it was.
 	ShadowWorld w = makeSdfTestWorld();
 	double sun[3] = {0, 0, 0};
 	shadowSun(sun);
@@ -2861,10 +2908,11 @@ void testSdfShaderMirrorConstants() {
 		rng ^= rng >> 27;
 		return double(rng >> 11) / double(1ull << 53);
 	};
-	const float jf = float(jitterDefault);
+	const float kFootprint = 0.1f;  // voxels per pixel: a mid-distance view
+	const float nUp[3] = {0.0f, 1.0f, 0.0f};
 	int rays = 0, differing = 0, jitterMoved = 0;
 	long long steps = 0;
-	float sumDefault = 0.0f, sumPlain = 0.0f;
+	float sumDisplaced = 0.0f, sumPlain = 0.0f;
 	for (int i = 0; i < 400; ++i) {
 		const double x = next01() * 64.0;
 		const double z = next01() * 64.0;
@@ -2875,35 +2923,38 @@ void testSdfShaderMirrorConstants() {
 		}
 		const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+		float off[3], displaced[3];
+		vv::voxel::shadowRayJitterOffset(of, nUp, kFootprint,
+			vv::voxel::kShadowJitterDefault, off);
+		vv::voxel::shadowRayOrigin(of, nUp, sf, off, displaced);
 		const float byDefault = vv::voxel::sphereTracedShadow(sdf, of, sf);
 		const float explicitCall =
-			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, jf);
-		const float plain =
-			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 0.0f);
+			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160);
+		const float jit = vv::voxel::sphereTracedShadow(sdf, displaced, sf);
 		differing += (byDefault != explicitCall) ? 1 : 0;
-		jitterMoved += (byDefault != plain) ? 1 : 0;
-		sumDefault += byDefault;
-		sumPlain += plain;
+		jitterMoved += (jit != byDefault) ? 1 : 0;
+		sumDisplaced += jit;
+		sumPlain += byDefault;
 		int used = 0;
 		float vis = 1.0f;
 		vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr, &vis,
-			8.0f, 160, jf, &used);
+			8.0f, 160, &used);
 		steps += used;
 		++rays;
 	}
 	const double meanDelta =
-		std::abs(double(sumDefault) - double(sumPlain)) / double(rays);
+		std::abs(double(sumDisplaced) - double(sumPlain)) / double(rays);
 	check(rays > 0 && differing == 0,
-		"shader mirror: the march's defaults ARE 8.0 / 160 / kShadowJitterDefault");
+		"shader mirror: the march's defaults ARE 8.0 / 160");
 	check(jitterMoved > 0,
-		"shader mirror: the shipped default jitters (not a silent jitter = 0)");
-	check(meanDelta <= 0.01,
-		"shader mirror: the default jitter leaves the mean visibility alone");
-	std::printf("shader mirror: kShadowSharpness %.1f, jitter %.3f (grain %.1f), "
-		"%d rays default == explicit (%.1f samples/ray); jitter moves %d/%d "
-		"rays, mean visibility |d| %.4f\n",
-		sharp, jitterDefault, jitterGrain, rays,
-		double(steps) / double(rays), jitterMoved, rays, meanDelta);
+		"shader mirror: a footprint-sized displacement moves the estimate");
+	check(meanDelta <= 0.02,
+		"shader mirror: the displacement leaves the 400-ray mean alone");
+	std::printf("shader mirror: kShadowSharpness %.1f, jitter %.1f footprint "
+		"(cap %.1f vox), %d rays default == explicit (%.1f samples/ray); the "
+		"displacement moves %d/%d rays, mean visibility |d| %.4f\n",
+		sharp, jitterDefault, jitterMax, rays, double(steps) / double(rays),
+		jitterMoved, rays, meanDelta);
 }
 
 // ---------------------------------------------------------------------------

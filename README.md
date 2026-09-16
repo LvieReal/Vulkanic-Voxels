@@ -176,25 +176,37 @@ out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
 0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
 corners is what keeps the current penumbra dark, and no bias brings that back.
 
-Pass 55 jitters the shadow ray's DIRECTION per shaded point - the owner's
-corrected directive ("by dithering i meant jittering the actual rays, not the
-output image; that's different, color banding"). The penumbra estimate is a min
-over discrete samples, so its error is a coherent function of where the shaded
-point is: neighbouring points walk almost the same samples, the error
-correlates across the surface, and it reads as bands sweeping a penumbra and as
-stepped contacts. Tilting the sun by a disc-uniform offset of slope 0.02
-(~1.1 degrees, 16% of the 0.125-radian sun disc `kShadowSharpness` models)
-decorrelates that error into noise of the same magnitude instead of structure.
-The hash is the shaded point's world position quantised to 1/8 voxel, so the
-grain is fixed in the world rather than crawling when the camera moves, and the
-direction keeps its LENGTH (the march's `t` is a distance, so a rescaled
-direction would rescale the penumbra). It costs two hashes per shadow ray
-against ~174 taps; the samples the march takes are unchanged, the mean
-visibility is unchanged to 0.0007 on a 0.05-voxel contact scan (36 of 181
-samples moved, max 0.135), and 13% of random surface rays move. The exact
-binary path (`VV_SDF_SHADOWS=0`) keeps the true sun, bit for bit, and
-`VV_SHADOW_JITTER=<slope>` overrides the magnitude on-device (0 = the
-pre-pass-55 estimate, bit-identical; the startup log prints what was chosen).
+Pass 56 jitters the shadow ray's ORIGIN per pixel, by half a pixel of world
+space inside the shaded point's surface tangent plane - which is what the
+owner's directive ("jittering the actual rays") turned out to need. The penumbra
+estimate is a min over discrete samples, so its error is a coherent function of
+where the shaded point is: neighbouring points walk almost the same samples, and
+it reads as bands sweeping a penumbra and as a stepped contact. Pass 55 tilted
+the sun's DIRECTION instead, and the owner's on-device verdict pinpointed the
+mechanism: the noise arrived "in small squares" (a fixed 1/8-voxel hash cell is
+several pixels wide at range), 0.01 was still too much, and "at contacts (small
+penumbra) there's no jitter at all" - at a contact the caster sits at t ~= 0, so
+a tilt moves the ray by angle*t ~= 0 there, while its noise is a uniform k*angle
+everywhere else. Displacing the ORIGIN moves the sample by a fixed distance
+regardless of t, so the visibility moves by k*offset/t: strong exactly where an
+edge is sharper than a pixel, ~1% across a wide penumbra. The offset is measured
+in PIXEL FOOTPRINTS - the same footprint the texture LOD uses - so the noise is
+one pixel of the picture at any distance instead of a fixed world cell, and the
+hash cell is that footprint too, so the grain stays glued to the surface instead
+of crawling over it as the camera moves. It is zero-mean by construction (a
+disc-uniform offset in the tangent plane; the probe held the mean visibility
+within 1% of the un-jittered estimate at a 0.05-voxel offset and 2.6% at 0.1,
+which is why half a pixel rather than a whole one is the default) and it never
+lifts the sample off the surface it is shading (a lifted origin escaped casters
+it should have hit and thinned every shadow by 6%). At a contact the hard step
+becomes a band of partial samples: the edge profile's worst 0.02-voxel step goes
+0.037 -> 0.080 at half a pixel and 0.136 at a full pixel, while the mean
+visibility of 400 random surface rays moves by 0.0000. It costs two hashes per
+shadow ray against ~174 taps and leaves the march's samples untouched; the exact
+binary path (`VV_SDF_SHADOWS=0`) keeps the un-jittered origin, bit for bit.
+`VV_SHADOW_JITTER=<pixel footprints>` is the on-device lever (0 = off and
+bit-identical to the un-jittered picture, 0.5 = default, up to 4; the startup
+log prints what was chosen).
 
 Pass 54's one-voxel step cap (`kMaxSdfStep`) was rejected on-device ("looks
 like it did not solve anything, only performs worse now") and is reverted. Its

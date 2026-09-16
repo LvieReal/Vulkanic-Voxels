@@ -484,23 +484,37 @@ private:
 
 // Sphere-traced soft shadow (iquilezles.org/articles/rmshadows/ with a proper
 // 3D SDF). March the ray toward the sun, step by the SDF distance
-// (conservatively scaled, so an approximate SDF can never skip a surface),
-// Pass 55 (shader mirror): the shadow ray's DIRECTION is jittered per shaded
-// point, hashed from the world position quantised to 1/8 voxel, so the discrete
-// march's sampling error decorrelates across the surface instead of banding.
-// Mirrors shadowRayJitter/hash13 in resources/shaders/pixels_rgba.comp: a
-// disc-uniform offset of slope `jitter` (zero mean), with the direction's
-// LENGTH preserved, because the march's t is a distance. `jitter = 0` is the
-// pre-pass-55 estimate, which is what the tests below characterise; the
-// shipped magnitude lives in the shader (kShadowJitter) and
-// testSdfShaderMirrorConstants holds the two together.
-// The shipped jitter, i.e. the shader's kShadowJitterDefault /
-// kShadowJitterGrain (testSdfShaderMirrorConstants holds the pairing). A
-// slope, not an angle in degrees: 0.02 ~= 1.1 degrees, 16% of the 0.125
-// radian sun disc that kShadowSharpness = 8 models.
-inline constexpr float kShadowJitterDefault = 0.02f;
-inline constexpr float kShadowJitterGrain = 8.0f;  // hash cell = 1/8 voxel
+// (conservatively scaled, so an approximate SDF can never skip a surface).
+//
+// Pass 56 (shader mirror): the soft shadow paths start from a per-pixel
+// DISPLACED origin - up to `kShadowJitterDefault` pixel footprints of
+// displacement inside the shaded point's surface tangent plane, hashed from
+// the world position in footprint-sized cells - and the exact path does not.
+//
+// Pass 55 tilted the sun DIRECTION per shaded point instead, and the owner's
+// verdict on it was the mechanism showing through: "in small squares"
+// (a fixed 1/8-voxel hash cell is several pixels wide at range), "0.01 is
+// still too high", and "at contacts (small penumbra) there's no jitter at
+// all" - at a contact the caster is at t ~= 0, so a tilt moves the ray by
+// angle*t ~= 0 there, while its noise is a uniform k*angle everywhere else.
+// Displacing the ORIGIN moves the sample by a fixed distance instead, so the
+// visibility changes by k*offset/t: large at contacts (which is what dithers
+// an edge sharper than a pixel) and ~1% across a wide penumbra (which is all a
+// band needs to stop reading as one).
+//
+// The displacement is in the SURFACE's tangent plane - a disc of paint inside
+// the pixel, not a lift off the surface - because lifting biases the picture:
+// on 3721 terrain rays a pixel of surface-tangent offset moved 14.7% of the
+// shadow values with the mean visibility within 1% of the un-jittered
+// estimate, while the same distance of lift thinned every shadow by 6%.
+//
+// The shader derives the offset per pixel (shadowRayJitterOffset below mirrors
+// it bit for bit, including hash13), and testSdfShaderMirrorConstants holds
+// the constants, the shader text and this arithmetic together.
+inline constexpr float kShadowJitterDefault = 0.5f;  // in pixel footprints
+inline constexpr float kShadowJitterMax = 1.0f;      // ... capped at a voxel
 
+// Hash13 (Dave Hoskins' "hash without sine"), the shader's shadowJitterHash.
 inline float shadowJitterHash(float x, float y, float z) {
     float px = x * 0.1031f, py = y * 0.1031f, pz = z * 0.1031f;
     px -= std::floor(px);
@@ -515,30 +529,29 @@ inline float shadowJitterHash(float x, float y, float z) {
     return h - std::floor(h);
 }
 
-inline void shadowRayJitter(const float o[3], float d[3],
-                            float jitter = kShadowJitterDefault,
-                            float grain = kShadowJitterGrain) {
-    if (jitter <= 0.0f) {
+// The displacement the shader builds for one shaded point: a disc of radius
+// min(amount * footprintVox, kShadowJitterMax) in the surface tangent plane,
+// hashed from the world position quantised in footprint-sized cells (so the
+// noise is one pixel of the picture at any distance and stays glued to the
+// surface instead of crawling over it as the camera moves). amount <= 0 (the
+// default when VV_SHADOW_JITTER is unset is 0 here, the shader's is
+// kShadowJitterDefault) leaves the origin alone.
+inline void shadowRayJitterOffset(const float p[3], const float n[3],
+                                  float footprintVox, float amount,
+                                  float outOffset[3]) {
+    outOffset[0] = outOffset[1] = outOffset[2] = 0.0f;
+    if (amount <= 0.0f || footprintVox <= 0.0f) {
         return;
     }
-    const float cx = std::floor(o[0] * grain);
-    const float cy = std::floor(o[1] * grain);
-    const float cz = std::floor(o[2] * grain);
-    const float u1 = shadowJitterHash(cx, cy, cz);
-    const float u2 = shadowJitterHash(cx + 17.0f, cy + 31.0f, cz + 7.0f);
-    const float r = jitter * std::sqrt(u1);  // sqrt = area-uniform in the disc
-    const float phi = 6.2831853f * u2;
-    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    if (len <= 1e-6f) {
-        return;
-    }
-    const float ix = 1.0f / len;
-    const float dx = d[0] * ix, dy = d[1] * ix, dz = d[2] * ix;
-    const float hx = (std::abs(dy) < 0.9f) ? 0.0f : 1.0f;
-    const float hy = (std::abs(dy) < 0.9f) ? 1.0f : 0.0f;
-    float ax = hy * dz - 0.0f * dy;
-    float ay = 0.0f * dx - hx * dz;
-    float az = hx * dy - hy * dx;
+    const float ix = 1.0f / std::max(n[0] * n[0] + n[1] * n[1] + n[2] * n[2],
+                                     1e-12f);
+    const float nx = n[0] * std::sqrt(ix), ny = n[1] * std::sqrt(ix),
+                nz = n[2] * std::sqrt(ix);
+    const float helperX = (std::abs(ny) < 0.9f) ? 0.0f : 1.0f;
+    const float helperY = (std::abs(ny) < 0.9f) ? 1.0f : 0.0f;
+    float ax = helperY * nz - 0.0f * ny;
+    float ay = 0.0f * nx - helperX * nz;
+    float az = helperX * ny - helperY * nx;
     const float alen = std::sqrt(ax * ax + ay * ay + az * az);
     if (alen <= 1e-9f) {
         return;
@@ -546,51 +559,43 @@ inline void shadowRayJitter(const float o[3], float d[3],
     ax /= alen;
     ay /= alen;
     az /= alen;
-    const float bx = dy * az - dz * ay;
-    const float by = dz * ax - dx * az;
-    const float bz = dx * ay - dy * ax;
-    const float off = r;
-    const float ox = (ax * std::cos(phi) + bx * std::sin(phi)) * off;
-    const float oy = (ay * std::cos(phi) + by * std::sin(phi)) * off;
-    const float oz = (az * std::cos(phi) + bz * std::sin(phi)) * off;
-    const float nx = dx + ox, ny = dy + oy, nz = dz + oz;
-    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
-    if (nlen <= 1e-9f) {
-        return;
-    }
-    const float s = len / nlen;
-    d[0] = nx * s;
-    d[1] = ny * s;
-    d[2] = nz * s;
+    const float bx = ny * az - nz * ay;
+    const float by = nz * ax - nx * az;
+    const float bz = nx * ay - ny * ax;
+    const float gx = std::floor(p[0] / std::max(footprintVox, 1e-5f));
+    const float gy = std::floor(p[1] / std::max(footprintVox, 1e-5f));
+    const float gz = std::floor(p[2] / std::max(footprintVox, 1e-5f));
+    const float u1 = shadowJitterHash(gx, gy, gz);
+    const float u2 = shadowJitterHash(gx + 17.0f, gy + 31.0f, gz + 7.0f);
+    const float r = std::min(amount * footprintVox * std::sqrt(u1),
+                             kShadowJitterMax);
+    const float phi = 6.2831853f * u2;
+    const float cp = std::cos(phi), sp = std::sin(phi);
+    outOffset[0] = (ax * cp + bx * sp) * r;
+    outOffset[1] = (ay * cp + by * sp) * r;
+    outOffset[2] = (az * cp + bz * sp) * r;
 }
 
-// and fold k*h/t into the running min. h is the 3D distance to the nearest
-// solid surface, so every shadow edge shares the same continuous penumbra.
-// o/d are in voxel units (field-local); d must be a unit vector with
-// d.y > ~0 (the sun is up).
-//
-// This variant reports where the march STOPPED when it leaves the field (or
-// spends `steps`) without hitting anything: outExit/outExitT/outVisibility
-// (all optional) receive the exit point, the distance travelled and the
-// accumulated visibility, and the return value is true - the caller MUST
-// continue the ray with a wider traversal. outExit is the point where the
-// ray crosses the field boundary (not the first sample past it), so the
-// continuation starts exactly where the field stops. On the GPU the field
-// covers only the 6x6 chunks around the camera, so leaving it is NOT open
-// space: the shader hands the ray to its whole-region 2.5D march (see
-// sunRayEscapesSdf3d, pass 40). Returns false when the field resolved the
-// ray itself (a hit, a low sun, or the march never left it): outVisibility
-// is then the final answer.
-//
-// Pass 55: `jitter` mirrors the shader's kShadowJitter (the ray's direction is
-// tilted per shaded point, so the sampling error decorrelates instead of
-// banding); 0 keeps the pre-pass-55 estimate. `outSteps` reports how many
-// samples the field phase took, so a test can pin that cost.
+// p = shaded point, n = surface normal, sun = voxel-space sun direction,
+// offset = the displacement above (all-zero for the un-jittered origin; the
+// shader's shadowRayOrigin adds it to the same lifted point).
+inline void shadowRayOrigin(const float p[3], const float n[3],
+                            const float sun[3], const float offset[3],
+                            float out[3]) {
+    for (int a = 0; a < 3; ++a) {
+        out[a] = p[a] + n[a] * 1e-3f + sun[a] * 1e-2f + offset[a];
+    }
+}
+
+
+// Pass 56: the caller builds `o` with shadowRayOrigin() when the soft path is
+// jittered (the shader does, the exact path does not) - this function marches
+// whatever ray it is given. `outSteps` reports how many samples the field
+// phase took, so a test can pin that cost.
 inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
                                     const float d[3], float outExit[3],
                                     float* outExitT, float* outVisibility,
                                     float sharpness = 8.0f, int steps = 160,
-                                    float jitter = kShadowJitterDefault,
                                     int* outSteps = nullptr) {
     if (outExitT != nullptr) {
         *outExitT = 0.0f;
@@ -603,10 +608,10 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         }
         return false;
     }
-    // Pass 55 (shader mirror): march the JITTERED direction; tExit and the
-    // exit point follow the same ray the samples were taken on.
+    // Pass 56 (shader mirror): `o` is whatever origin the caller built - the
+    // shader's shadowRayOrigin() when the soft path is jittered, the plain
+    // lifted point in the exact path.
     float dir[3] = {d[0], d[1], d[2]};
-    shadowRayJitter(o, dir, jitter);
     // Pass 40 (shader mirror): hand the ray over at the box CROSSING, not at
     // the first sample past it, so a step (up to 0.7 * h) cannot skip a
     // caster sitting in the strip just outside the box. 0 when the origin
@@ -681,14 +686,13 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
 // the voxels it was built from) and probes. Returns visibility in [0, 1].
 inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
                                 const float d[3], float sharpness = 8.0f,
-                                int steps = 160,
-                                float jitter = kShadowJitterDefault) {
+                                int steps = 160) {
     if (d[1] <= 0.05f) {
         return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
     }
     float visibility = 1.0f;
     sphereTracedShadowExits(sdf, o, d, nullptr, nullptr, &visibility,
-                            sharpness, steps, jitter, nullptr);
+                            sharpness, steps, nullptr);
     return visibility;
 }
 

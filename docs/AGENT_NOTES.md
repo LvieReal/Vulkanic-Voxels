@@ -1906,3 +1906,90 @@ visibility rises by the same token, i.e. the shadow *area* is preserved.
 `glslangValidator` exit 0 for the shader; the runtime `.spv` copies refreshed
 (release `da672af3e0184c981cf6a1dfd9384853`, debug `e63e2cdca70238319cdef4e87b5b4d60`)
 - a shader edit that never reaches `bin/resources` was a real failure mode here.
+
+## Pass 56: the jitter acts on the ray's ORIGIN, one pixel of world
+
+**The verdict that set this up.** Pass 55 (direction jitter) shipped and the
+owner ran it on the device: the noise came "in small squares", was "noticeable
+at 0.02-0.04" while "0.01 is still too high", and "at contacts (small penumbra)
+there's no jitter at all" - then the question that is the spec: "so, i think
+it's supposed to jitter per pixel?". Mechanism, not magnitude: he asked for the
+constant to move *below* 0.01 even though the visual artifact was already
+"too much", which is the signature of a wrong-shaped noise field, not a loud one.
+
+**What the three symptoms said, in order.** (1) "Small squares": the pass-55
+hash cell was a FIXED 1/8 voxel, i.e. ~2.5-5 screen pixels at typical
+20-40 px/voxel distances. The grain has to be one pixel of the *picture*, so the
+cell must be the pixel's own footprint (the same `voxelsPerPixel` the texture
+LOD already computes from `sTHit`, so it is free). (2) "0.01 is still too high"
+while the noise was already visible at 0.02-0.04: a direction tilt displaces the
+sample by `slope * t`, and the visibility it feeds (`kShadowSharpness * h / t`)
+responds by `kShadowSharpness * slope` = 0.08-0.16 at those slopes - a uniform
+8-16% brightness noise in every penumbra, independent of distance. (3) "At
+contacts there's no jitter at all": exactly the same equation, read at t ~= 0 -
+a tilt moves a contact ray by nothing, while a contact needs the *largest* move
+because its penumbra is sharper than a pixel.
+
+**The mechanism now.** `shadowRayOrigin()` starts the soft path from a per-pixel
+DISPLACED origin: a disc-uniform offset of radius `min(amount * footprintVox,
+1 voxel)` (amount = `pc.camera.w`, `VV_SHADOW_JITTER`, default
+`kShadowJitterDefault = 0.5` pixel footprints), hashed with hash13 from the
+shaded point quantised in FOOTPRINT-sized cells, applied in the SURFACE's
+tangent plane. Each choice was measured, not argued:
+
+- *Origin, not direction*: the sample moves by a fixed distance at every t, so
+  the visibility moves by `k * offset / t` - strongest at contacts, ~1% across a
+  wide penumbra. On the synthetic contact edge (0.02-voxel scan of the
+  staircase wall, 60 rows) the worst step in the edge profile goes 0.037 (base)
+  -> 0.042 (0.02 vox offset) -> 0.080 (0.05) -> 0.136 (0.1) -> 0.307 (0.25),
+  i.e. the hard step becomes a band of partial samples that grows with the
+  offset, and the mean edge position does not move (47.293 -> 47.291 at 0.05).
+- *Tangent plane, not the sun's plane*: a displacement perpendicular to the sun
+  with the origin's normal lift raised by the same distance looks harmless and
+  biases the picture - on 3721 terrain rays, mean visibility 0.6556 (base) ->
+  0.7173 at 0.25 voxels of lift (+6%), because a lifted origin clears casters
+  the surface point should still be blocked by. The same radius sliding ALONG
+  the surface keeps the mean in check (0.6631 at 0.05 vox, +1.1%; 0.6727 at
+  0.1, +2.6%) which is also why the default is half a pixel and not a whole one.
+- *Footprint cell, not a fixed world cell*: the grain is one pixel wide at any
+  distance; a screen-space hash (the literal reading of "per pixel") was
+  rejected because it would stick to the screen and crawl over the world as the
+  camera moves, and because the tangent-plane hash already decorrelates the
+  neighbours. The test pins the consequence: two probes 0.3 footprints apart in
+  the same cell get bit-identical offsets, 1023 of 1024 neighbouring cells get
+  different ones, every offset stays inside its disc (max 0.125 of 0.125 vox at
+  a 0.25-voxel footprint) and the disc is zero-mean (|mean| 0.004 vox, 3.2% of
+  the radius).
+- *Lever*: 0 is bit-identical to the un-jittered estimate (the offset vector is
+  all zeros, the march is byte-for-byte pass 53's), 0.5 is the default, 4 the
+  clamp. The renderer prints the resolved value at startup next to the SDF
+  margin line, and `push.camera.w` carries it to the shader.
+
+**Honest limits.** The jitter decorrelates the min-over-samples error into
+per-pixel noise; it does not move the terminator. The SDF contact edge still
+sits ~0.3-1 voxel wider than the exact geometry (the fake penumbra's creep) and
+still carries the +/-0.17-voxel sawtooth locked to the caster's voxel grid: on
+the 60-row contact scan the row-to-row residual stays 0.081 at every offset up
+to 0.1 voxels (it only scrambles at 0.25: 0.128). The exact path's own edge is a
+straight line with a 0.016-voxel ramp, i.e. genuinely harder than the SDF's, so
+what the jitter buys at a contact is the *look* of the edge (a band of partial
+samples instead of a clean, comb-like step), not its position. The terrain
+picture's mean visibility is preserved to 0.0000 on the mirror test's 400 rays
+and 0.0020 on the 181-ray mesa scan; the blocked share on the 3721-ray terrain
+probe still rises a little at larger offsets (19.2% -> 20.7% at 0.02 vox,
+24.0% at 0.05) because the sampling variance is not symmetric in a *hard* shadow.
+
+**Verification.** `glslangValidator` exit 0; release + debug `ctest` 100%
+(release 5.95 s, debug 25.28 s); the runtime `.spv` copies refreshed (release
+`3414d9c31630e0b65266ada9a45d306a`, debug `d5da838557627ad348d22eedc703d1ab`
+- see the file's own md5, a shader edit that never reaches `bin/resources` was a
+real failure mode here). `testSdfShaderMirrorConstants` now pairs the shader
+file (VV_SHADER_DIR) and the renderer writer (VV_SRC_DIR) with the CPU mirror's
+constants and pins the *text* of the mechanism (the displaced soft origin, the
+untouched exact origin, the footprint hash cell, the `pc.camera.w` lever, the
+`t += max(h * 0.7, 0.05)` step that pass 54's cap must not come back through),
+and it fails if the shader's `kShadowJitterDefault` stops being 0.5.
+`testSdfSoftShadow3d` block 4 pins the offset's arithmetic and properties plus
+its effect on the scan. The A/B lever is the point of the pass: the owner can
+sweep 0 / 0.25 / 0.5 / 1 / 2 without a rebuild and the startup log says what he
+is looking at.

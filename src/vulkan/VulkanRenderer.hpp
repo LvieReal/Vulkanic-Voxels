@@ -417,9 +417,10 @@ class VulkanRenderer final {
   // the box only covers kSdfHalfChunks in each direction. 0 = the pre-49
   // "every completed region move" cadence.
   std::uint32_t m_sdfMarginChunks = 1;
-  // Pass 55: the shadow-ray jitter slope handed to the shader each frame
-  // (VV_SHADOW_JITTER). < 0 = unset, so the shader's kShadowJitterDefault
-  // applies; 0 = jitter off, bit-identical to the pre-pass-55 estimate.
+  // Pass 56: the shadow-ray jitter handed to the shader each frame
+  // (VV_SHADOW_JITTER), in PIXEL FOOTPRINTS of origin displacement. < 0 =
+  // unset, so the shader's kShadowJitterDefault applies; 0 = jitter off,
+  // bit-identical to the un-jittered estimate.
   float m_shadowJitter = -1.0f;
   // Pass-49 bake bookkeeping for the VV_PERF line: how many bakes, when the
   // last one published (bakes/second), and what the render thread paid.
