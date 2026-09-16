@@ -41,19 +41,24 @@ startup log prints which position and which label each action got.
 The project uses CMake (≥ 3.26), C++23, [GLFW] and the Vulkan SDK (headers +
 loader). Shaders are compiled at build time by `glslangValidator`.
 
-GLFW is picked up from the system when a CMake package for it exists
-(`libglfw3-dev`, `mingw-w64-ucrt-x86_64-glfw`, `brew install glfw`); otherwise
-CMake fetches the pinned release once and builds it with the game, so the
-version is the same everywhere. Configure with `-DVV_GLFW_NULL_ONLY=ON` to
-build GLFW's headerless null backend instead - that is how restricted
-environments (no X11/Wayland development packages) get a compiling,
-window-less build; see `scripts/build-linux-toolchain.sh`.
+[GLFW] and [glm] are **vendored** in `third_party/` (GLFW 3.5.1, glm 1.0.1 -
+trimmed upstream sources, see `third_party/README.md`): a clone builds with a
+toolchain, the Vulkan headers/loader and `glslangValidator`, and nothing else -
+no `glfw`/`glm` package to install and no download at configure time. GLFW is
+compiled as part of the build. `-DVV_USE_SYSTEM_DEPS=ON` prefers a system
+`glfw3`/`glm` when one is installed (packagers); the same sources build either
+way.
+
+The only per-platform install left is what the window backend itself needs.
+`-DVV_GLFW_NULL_ONLY=ON` builds GLFW's headerless null backend instead - that
+is how restricted environments (no X11/Wayland development packages) get a
+compiling, window-less build; see `scripts/build-linux-toolchain.sh`.
 
 ### Windows (MSYS2 / MinGW-w64)
 
 ```sh
 pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
-          mingw-w64-ucrt-x86_64-glfw mingw-w64-ucrt-x86_64-vulkan-headers \
+          mingw-w64-ucrt-x86_64-vulkan-headers \
           mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-glslang
 cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -65,27 +70,33 @@ cmake --build build
 Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential cmake libglfw3-dev libvulkan-dev \
-                 glslang-tools libglm-dev libwayland-dev libxkbcommon-dev
+sudo apt install build-essential cmake libvulkan-dev glslang-tools
 ```
 
-(GLFW's X11 backend needs the X11/XRandR/Xinerama/Xcursor/XInput/XKB
-development packages; `libglfw3-dev` pulls them in. Without a system GLFW,
-CMake fetches one and needs the same headers.)
+For a *windowed* build add the backends' development packages - the vendored
+GLFW compiles whichever of the two are present:
+
+```sh
+sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+                 libxi-dev libxkbcommon-dev libwayland-dev
+```
+
+Without them the build still succeeds, GLFW gets its null backend and CMake
+says so - enough for the test suite and a headless (`VV_PLATFORM=null`) run.
 
 Fedora:
 
 ```sh
-sudo dnf install gcc-c++ cmake glfw-devel vulkan-headers \
-                 vulkan-loader-devel glslang-devel glm-devel \
+sudo dnf install gcc-c++ cmake vulkan-headers vulkan-loader-devel glslang \
                  libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel \
-                 libXi-devel libXkbcommon-devel wayland-devel
+                 libXi-devel libxkbcommon-devel wayland-devel
 ```
 
-> Both the X11 and Wayland backends are compiled in when GLFW was built with
-> them, and GLFW picks the right one at run time (it follows the session, and
-> `GLFW_PLATFORM` / `VV_PLATFORM=null` can override it). There is no XWayland
-> requirement and no private toolkit headers involved.
+> The vendored GLFW compiles the X11 and Wayland backends for whichever of the
+> two development packages is installed, and picks between them at run time (it
+> follows the session, and `GLFW_PLATFORM` / `VV_PLATFORM=null` can override
+> it). There is no XWayland requirement and no private toolkit headers
+> involved.
 
 Build and run:
 
@@ -274,7 +285,7 @@ Requires a Vulkan implementation with [MoltenVK]
 (VK_MVK_macos_surface) — e.g. the [Vulkan SDK] for macOS.
 
 ```sh
-brew install cmake glfw vulkan-sdk glslang
+brew install cmake vulkan-sdk glslang
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/release/bin/game.app/Contents/MacOS/game   # or use the build/package_folder target
@@ -296,16 +307,20 @@ the whole package.
   your Vulkan loader is too old or misconfigured. Update your GPU drivers /
   Vulkan runtime.
 - **"The X11 Vulkan surface backend was not compiled in"**: GLFW has no X11
-  backend in this build; install the X11 development packages (see above) and
-  delete the build directory so CMake re-runs its checks.
+  backend in this build; install the X11 development packages (see above),
+  delete the build directory and configure again (or pass
+  `-DVV_USE_SYSTEM_DEPS=ON` to use a system GLFW that has it).
 - **"glfwInit failed"** with "This binary only supports the Null platform": the
-  GLFW library has no windowing backend (a `-DVV_GLFW_NULL_ONLY=ON` build).
-  Configure without that option on a machine with a display server.
+  GLFW library has no windowing backend - the X11/Wayland development packages
+  were missing at configure time, or the build used `-DVV_GLFW_NULL_ONLY=ON`.
+  Install them (see above), delete the build directory so CMake re-runs its
+  checks, and configure again.
 - **Wrong movement keys**: the startup log prints one line per action
   (`[vv] key move forward: key 87 (w), scancode 17`), including the position
   and the label the windowing layer reported - that is the ground truth for
   "the keyboard behaves differently here" reports.
 
 [GLFW]: https://www.glfw.org/
+[glm]: https://github.com/g-truc/glm
 [Vulkan SDK]: https://vulkan.lunarg.com/sdk/home
 [MoltenVK]: https://github.com/KhronosGroup/MoltenVK

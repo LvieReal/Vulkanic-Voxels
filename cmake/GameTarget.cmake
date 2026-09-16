@@ -31,8 +31,8 @@ function(vv_add_game_target target_name)
     target_link_libraries(${target_name} PRIVATE ${VV_GLFW_TARGET} Vulkan::Vulkan)
     target_link_libraries(${target_name} PRIVATE Threads::Threads)
 
-    # Vendored single-header libraries (stb_image decodes the voxel textures;
-    # see third_party/README.md). Header-only: nothing extra to link.
+    # Vendored headers (stb_image decodes the voxel textures; see
+    # third_party/README.md). Header-only: nothing extra to link.
     target_include_directories(${target_name} SYSTEM PRIVATE
         "${CMAKE_SOURCE_DIR}/third_party")
 
@@ -66,29 +66,11 @@ function(vv_add_game_target target_name)
         # xcb_window_t) and Wayland (wl_display, wl_surface) types behind
         # GLFW_EXPOSE_NATIVE_X11 / _WAYLAND.
         #
-        # Which backend exists is GLFW's business (it picks one at run time);
-        # the definitions below only describe what the compiler has to see.
-        if(VV_GLFW_NULL_ONLY)
-            set(VV_GLFW_HAS_X11 OFF)
-            set(VV_GLFW_HAS_WAYLAND OFF)
-        elseif(glfw3_FOUND)
-            # System GLFW: probe the headers it was built against.
-            find_path(VV_GLFW_X11_HEADERS X11/Xlib.h)
-            find_path(VV_GLFW_WAYLAND_HEADERS wayland-client-core.h)
-            if(VV_GLFW_X11_HEADERS)
-                set(VV_GLFW_HAS_X11 ON)
-            endif()
-            if(VV_GLFW_WAYLAND_HEADERS)
-                set(VV_GLFW_HAS_WAYLAND ON)
-                target_include_directories(${target_name} SYSTEM PRIVATE
-                    "${VV_GLFW_WAYLAND_HEADERS}")
-            endif()
-        else()
-            # GLFW fetched from source builds both backends by default.
-            set(VV_GLFW_HAS_X11 ON)
-            set(VV_GLFW_HAS_WAYLAND ON)
-        endif()
-
+        # Which backend exists is decided in Dependencies.cmake: from the
+        # development headers that are actually installed (and, for the
+        # vendored GLFW, from the backends it was therefore told to build).
+        # The definitions below only describe what our own sources have to
+        # see - the warning for "neither backend" lives next to that probe.
         if(VV_GLFW_HAS_X11)
             message(STATUS "GLFW native-window backend: X11")
             target_compile_definitions(${target_name} PRIVATE VV_WINDOW_BACKEND_X11=1)
@@ -96,14 +78,10 @@ function(vv_add_game_target target_name)
         if(VV_GLFW_HAS_WAYLAND)
             message(STATUS "GLFW native-window backend: Wayland")
             target_compile_definitions(${target_name} PRIVATE VV_WINDOW_BACKEND_WAYLAND=1)
-        endif()
-        if(NOT VV_GLFW_HAS_X11 AND NOT VV_GLFW_HAS_WAYLAND AND NOT VV_GLFW_NULL_ONLY)
-            message(WARNING
-                "GLFW has neither the X11 nor the Wayland backend here, so "
-                "the game cannot create a window on this system. Install the "
-                "GLFW dependencies (libxcb/libxrandr/libxinerama/libxcursor/"
-                "libxi/libxkb + libwayland-dev + libxkbcommon-dev on "
-                "Debian/Ubuntu) and reconfigure.")
+            if(VV_GLFW_WAYLAND_HEADERS)
+                target_include_directories(${target_name} SYSTEM PRIVATE
+                    "${VV_GLFW_WAYLAND_HEADERS}")
+            endif()
         endif()
     endif()
 

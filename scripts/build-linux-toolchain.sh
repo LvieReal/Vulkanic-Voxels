@@ -10,18 +10,17 @@
 # script builds everything the project needs from GitHub tarballs:
 #
 #   - CMake 3.31 + Ninja          (pip wheels, into $PREFIX/venv)
-#   - GLFW 3.5.1                  (NULL platform only: no X11, no Wayland -
-#                                  the sandbox has neither their headers nor a
-#                                  display; the game then compiles and walks
-#                                  its headless path end to end)
 #   - Vulkan-Headers 1.4.357      (headers only)
 #   - Vulkan-Loader 1.4.357       (all WSI off; WSI entry points are resolved
 #                                  through vkGetInstanceProcAddr at run time)
-#   - glm 1.0.1                   (header-only)
 #   - glslang 16.5.0              (glslangValidator for the shader pipeline)
 #
-# Since pass 43 the game needs no toolkit at all (GLFW replaced Qt), so this
-# script is a few minutes instead of half an hour - the Qt build is gone.
+# GLFW and glm are NOT built here any more: pass 58 vendored them into
+# third_party/, so they arrive with the checkout. Since pass 43 the game needs
+# no toolkit at all (GLFW replaced Qt), so this script is a few minutes instead
+# of half an hour - and with the vendored pair gone it needs neither their
+# headers nor a display to produce a build that walks the game's headless
+# path end to end.
 #
 # Usage:   scripts/build-linux-toolchain.sh [prefix-dir]
 # Default prefix: ~/.cache/vv-deps (PERSISTS across sandbox /tmp resets,
@@ -35,7 +34,8 @@
 #   cmake --build build
 #
 # On a real Linux box (X11/Wayland development headers available) drop
-# -DVV_GLFW_NULL_ONLY=ON and install libglfw3-dev, or let CMake fetch GLFW.
+# -DVV_GLFW_NULL_ONLY=ON; the vendored GLFW then builds the backends whose
+# development packages are installed.
 # =============================================================================
 set -eu
 
@@ -92,20 +92,6 @@ EOF
 	chmod +x "$PREFIX/venv/bin/pkg-config"
 fi
 
-# --- GLFW (the windowing layer; null platform only here) ------------------------
-fetch glfw.tar.gz glfw/glfw 3.5.1
-if [ ! -f "$DEP_PREFIX/lib/libglfw3.a" ]; then
-	say "Building GLFW 3.5.1 (null platform: this box has no X11/Wayland headers)"
-	[ -d "$SRC/glfw-3.5.1" ] || tar xzf "$SRC/glfw.tar.gz" -C "$SRC"
-	cmake -S "$SRC/glfw-3.5.1" -B "$BUILD/glfw" -G Ninja \
-		-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEP_PREFIX" \
-		-DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF \
-		-DGLFW_BUILD_DOCS=OFF -DGLFW_BUILD_X11=OFF -DGLFW_BUILD_WAYLAND=OFF \
-		> /dev/null
-	cmake --build "$BUILD/glfw" > /dev/null && \
-		cmake --install "$BUILD/glfw" > /dev/null
-fi
-
 # --- Vulkan headers + loader ----------------------------------------------------
 fetch vulkan-headers.tar.gz KhronosGroup/Vulkan-Headers vulkan-sdk-1.4.357.0
 if [ ! -f "$DEP_PREFIX/include/vulkan/vulkan.h" ]; then
@@ -130,14 +116,6 @@ if [ ! -f "$DEP_PREFIX/lib/libvulkan.so" ]; then
 		-DBUILD_WSI_WAYLAND_SUPPORT=OFF > /dev/null
 	cmake --build "$BUILD/vulkan-loader" > /dev/null && \
 		cmake --install "$BUILD/vulkan-loader" > /dev/null
-fi
-
-# --- glm (header-only) -----------------------------------------------------------
-fetch glm.tar.gz g-truc/glm 1.0.1
-if [ ! -f "$DEP_PREFIX/include/glm/glm.hpp" ]; then
-	say "Installing glm 1.0.1"
-	[ -d "$SRC/glm-1.0.1" ] || tar xzf "$SRC/glm.tar.gz" -C "$SRC"
-	cp -r "$SRC/glm-1.0.1/glm" "$DEP_PREFIX/include/"
 fi
 
 # --- glslang (shader compiler) -----------------------------------------------------

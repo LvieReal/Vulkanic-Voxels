@@ -2043,7 +2043,8 @@ accepted per-pixel grain):
   (the early-out returns `sunV` and the plain lifted origin), and the startup
   log prints the slope and the resolved floor in voxels.
 
-**Measured, at the shipped default (slope 0.05, floor 0.50).**
+**Measured, at the 0.05 lever (25x the shipped default: cone slope 0.05,
+floor 0.50 vox).**
 
 - *Contacts* (60 rows of the staircase wall, 0.05-voxel x sampling, the
   terminator's interpolated 0.5-crossing fitted per row). The exact reference's
@@ -2126,3 +2127,76 @@ constants half still pins the shader's own default. Rebuilt and re-tested at tha
 commit: release + debug `ctest` 100% (6.84 s / 30.11 s), runtime `.spv` md5
 release `74ad055c3070a1a1d6eb168ae5e770a0`, debug
 `82dc95a2423f9a30d1692374d23be95b`.
+
+## Pass 58: glfw and glm are vendored, not installed
+
+**The report:** "we should vendor glfw and glm, someone complained that they should
+not have to install every dependency in their system." Pass 43 had chosen the
+other answer: use a system GLFW when CMake finds one, otherwise `FetchContent`
+the pinned 3.5.1 from GitHub at configure time. Both halves are gone - a clone
+now carries its dependencies, and the build needs no network.
+
+**What is in the tree.** `third_party/glfw` is upstream 3.5.1 (tag commit
+`d9d6f0f1f967807ffade6598ea9a631ebaf37a56`, tarball sha256 `5234f4f2…`) with
+`examples/`, `tests/`, `docs/` and the `deps/` files those use removed, and
+`deps/wayland/` kept (the Wayland backend generates its protocol code from those
+XMLs). `third_party/glm` is upstream 1.0.1 (commit `0af55cc…`, tarball
+`9f317456…`) reduced to the `glm/` headers plus its license - the 24 MB of
+`doc/`, `test/`, `cmake/` it ships are not part of anything we build.
+`stb_image.h` was already vendored. `third_party/README.md` records the upstreams,
+what was trimmed and why, and a tree digest for each directory so "did someone
+edit vendored code" is one command.
+
+**How they are wired.** `cmake/Dependencies.cmake` was rewritten around the
+vendored trees as the default and a system pair as the opt-in:
+
+- `VV_USE_SYSTEM_DEPS=OFF` (new, default) skips `find_package(glfw3)` entirely, so
+  a stale `glfw3_DIR` in an existing build directory cannot pull the system copy
+  back in, and `add_subdirectory(third_party/glfw … EXCLUDE_FROM_ALL)` builds it
+  as a subproject (static, examples/tests/docs/install off, output under
+  `build/.../third_party/glfw`).
+- `VV_USE_SYSTEM_DEPS=ON` restores the pass-43 preference for a packager's build.
+- The version is not taken on faith: the configure reads `GLFW_VERSION_*` out of
+  `third_party/glfw/include/GLFW/glfw3.h` and fails if it is not
+  `VV_GLFW_EXPECTED_VERSION` (3.5.1), so a partial re-vendor is a hard error
+  rather than a silently different library.
+- glm's include probe got a fresh variable name (`VV_GLM_INCLUDE_DIR` is `unset`
+  in the cache first): the pass-43 configure cached it as a PATH, and a stale
+  entry would otherwise shadow the vendored copy in an existing build directory.
+  `cmake/GameTarget.cmake` and `cmake/Tests.cmake` already consumed that variable,
+  so they only lost their dead `if()` guard's false branch.
+- Which native backends exist moved here from `GameTarget.cmake`: the vendored
+  GLFW is told to build X11/Wayland only for the development packages actually
+  installed (`X11/Xlib.h`, `wayland-client-core.h`), and with neither it is built
+  null-only and CMake warns with the package list instead of the old hard error.
+  `-DVV_GLFW_NULL_ONLY=ON` still forces null for restricted environments.
+- `scripts/build-linux-toolchain.sh` lost its GLFW and glm build steps (the
+  sandbox prefix is Vulkan + glslang now).
+
+**Verification.**
+
+- Three build directories, none of which had a system glfw/glm to find (this
+  sandbox has neither package nor X11/Wayland headers): `build/vendor` and
+  `build/fresh` configured from scratch (`glfw: vendored 3.5.1 (third_party/glfw)`,
+  `glm: vendored (third_party/glm, upstream 1.0.1)`), built and passed `ctest`
+  (6.70 s / 6.72 s); `build/release` and `build/debug` reconfigured and rebuilt
+  on the same CMake (100%, 6.77 s / 28.47 s).
+- The link is the vendored library: `build/*/third_party/glfw/src/libglfw3.a` is
+  built by this build and the game binary carries 283 glfw symbols.
+- The shaders are untouched by this pass: the runtime `.spv` md5s are the same as
+  at pass 57's pin (`74ad055c3070a1a1d6eb168ae5e770a0` release,
+  `82dc95a2423f9a30d1692374d23be95b` debug).
+- Headless smoke run on a null-only build prints the documented path
+  (`VV_PLATFORM=null`: window created, then "Failed to obtain a native window
+  handle … Unsupported GLFW platform 'null'").
+- `scripts/build-linux-toolchain.sh` passes `sh -n`.
+
+**Honest limits.** This box has no X11 or Wayland development headers, so only
+GLFW's null backend was compiled here; the X11/Wayland/win32 backends are the same
+upstream sources that were being fetched before, and the digests in
+`third_party/README.md` pin the tree. GLFW's X11/Wayland builds still need their
+platform development packages (they are the platform's ABI and cannot be
+vendored); the README now says exactly that, and lists what is no longer needed
+(`libglfw3-dev`, `mingw-w64-ucrt-x86_64-glfw`, `libglm-dev`, `glm-devel`,
+`brew install glfw`). Vulkan headers/loader and `glslangValidator` remain system
+requirements, unchanged by this pass.
