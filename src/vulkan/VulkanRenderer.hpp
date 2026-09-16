@@ -369,6 +369,9 @@ class VulkanRenderer final {
     std::int32_t boxZ = 0;
     std::uint32_t nx = 0, ny = 0, nz = 0;  // box size in cells (banded ny)
     std::uint32_t fullNy = 0;  // uncropped height (publish-path sanity check)
+    // Pass 50: the seed packing's bits per axis (vv::voxel::SdfField::SeedBits)
+    // - the shader needs them to decode a seed with shifts and masks.
+    std::uint32_t seedBitsX = 0, seedBitsY = 0, seedBitsZ = 0;
     std::int32_t centerChunkX = 0;  // the build's center (stale check)
     std::int32_t centerChunkZ = 0;
     // Pass 49 (VV_PERF): where a bake's time went. band/build are worker
@@ -393,6 +396,7 @@ class VulkanRenderer final {
     std::int32_t boxY = 0;
     std::int32_t boxZ = 0;
     std::uint32_t nx = 0, ny = 0, nz = 0;
+    std::uint32_t seedBitsX = 0, seedBitsY = 0, seedBitsZ = 0;
     std::int32_t centerChunkX = 0;
     std::int32_t centerChunkZ = 0;
     std::uint32_t half = 0;  // seed half this build was copied into

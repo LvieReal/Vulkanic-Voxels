@@ -2759,6 +2759,16 @@ void testSdfBoxBand() {
 	bool seedsDecode = true;
 	const std::vector<std::uint32_t>& fs = full.seeds();
 	const std::vector<std::uint32_t>& cs = crop.seeds();
+	// The seed decode the SHADER runs (pass 50): two shifts and two masks,
+	// mirroring sampleSdf3d in resources/shaders/pixels_rgba.comp.
+	const auto decodeSeed = [](std::uint32_t v,
+														 const vv::voxel::SdfField::SeedBits& b,
+														 std::uint32_t& outX, std::uint32_t& outY,
+														 std::uint32_t& outZ) {
+		outX = v & ((1u << b.x) - 1u);
+		outY = (v >> b.x) & ((1u << b.y) - 1u);
+		outZ = v >> (b.x + b.y);
+	};
 	for (std::uint32_t z = 0; z < box.nz; ++z) {
 		for (std::uint32_t y = 0; y < bandNy; ++y) {
 			for (std::uint32_t x = 0; x < box.nx; ++x) {
@@ -2771,10 +2781,9 @@ void testSdfBoxBand() {
 				const std::size_t iCrop = std::size_t(x) +
 						std::size_t(y) * banded.nx +
 						std::size_t(z) * banded.nx * banded.ny;
-				// Decode both exactly like the shader does. The seed is a cell
-				// index in the box's OWN layout, so a shorter box shifts every
-				// index above the first row - the ARGMIN CELL is what has to
-				// agree, and it has to name a cell of the box it came from.
+				// The ARGMIN CELL is what has to agree between the two boxes
+				// (the packed value is not comparable across different dims),
+				// and it has to name a cell of the box it came from.
 				const bool fullEmpty = fs[iFull] == vv::voxel::kSdfEmptySeed;
 				const bool cropEmpty = cs[iCrop] == vv::voxel::kSdfEmptySeed;
 				if (fullEmpty != cropEmpty) {
@@ -2785,19 +2794,17 @@ void testSdfBoxBand() {
 					continue;
 				}
 				++solidSeeds;
-				const std::uint32_t sx = cs[iCrop] % banded.nx;
-				const std::uint32_t sy =
-						(cs[iCrop] / banded.nx) % banded.ny;
-				const std::uint32_t sz =
-						cs[iCrop] / (banded.nx * banded.ny);
+				std::uint32_t sx = 0, sy = 0, sz = 0;
+				decodeSeed(cs[iCrop], crop.seedBits(), sx, sy, sz);
 				if (sx >= banded.nx || sy >= banded.ny || sz >= banded.nz) {
 					seedsDecode = false;  // decodes outside this box
 				}
-				const std::uint32_t fx = fs[iFull] % box.nx;
-				const std::uint32_t fy =
-						(fs[iFull] / box.nx) % box.ny;
-				const std::uint32_t fz =
-						fs[iFull] / (box.nx * box.ny);
+				// ... and the cell it names must really be solid.
+				if (!vv::voxel::sdfBoxCellSolid(banded, snapshots, sx, sy, sz)) {
+					seedsDecode = false;
+				}
+				std::uint32_t fx = 0, fy = 0, fz = 0;
+				decodeSeed(fs[iFull], full.seedBits(), fx, fy, fz);
 				if (fx != sx || fy != sy || fz != sz) {
 					seedsDecode = false;  // a different solid is the argmin
 				}
@@ -2847,6 +2854,92 @@ void testSdfBoxBand() {
 	std::printf("sdf band: %u of %d cells (margin %u), %zu seeded / %zu empty "
 							"cells, field identical inside the window\n",
 							bandNy, wh, margin, solidSeeds, emptySeeds);
+}
+
+// Pass 50: the seed packs the nearest-solid CELL into three bit fields,
+//   value = x | (y << bits.x) | (z << (bits.x + bits.y)),
+// so a fetch decodes with shifts and masks instead of three integer divisions.
+// Nsight put those divisions at the top of the frame's cost (up to 13%), and
+// sampleSdf3d runs the decode up to 27 times per sphere-trace step (~22 per
+// traced ray), so this is the hottest arithmetic in the SDF path.
+//
+// The packing is chosen per box (the smallest widths that hold its spans), so
+// the tests below are what keep the CPU encoder and the shader's decoder in
+// step - the shader's arithmetic is mirrored here verbatim.
+void testSdfSeedEncoding() {
+	using vv::voxel::SdfField;
+
+	// Widths: the smallest number of bits that holds the coordinates 0..n-1.
+	check(SdfField::bitsForDim(1) == 0 && SdfField::bitsForDim(2) == 1 &&
+					SdfField::bitsForDim(3) == 2 && SdfField::bitsForDim(4) == 2 &&
+					SdfField::bitsForDim(128) == 7 && SdfField::bitsForDim(192) == 8 &&
+					SdfField::bitsForDim(256) == 8 && SdfField::bitsForDim(257) == 9,
+			"sdf seed bits: the packing width of a span");
+	// The shipping box: 192 x 110 (the band) x 192 -> 8 + 7 + 8 = 23 bits,
+	// comfortably inside the 31 the empty sentinel leaves (so an encoded cell
+	// can never read as 0xFFFFFFFF).
+	const SdfField::SeedBits ship = SdfField::seedBitsFor(192, 110, 192);
+	check(ship.x == 8 && ship.y == 7 && ship.z == 8 && ship.fits(),
+			"sdf seed bits: the banded shipping box packs into 23 bits");
+	check(!SdfField::seedBitsFor(2048, 2048, 2048).fits(),
+			"sdf seed bits: a box too large to pack is refused, not mis-encoded");
+
+	// A field whose spans are NOT powers of two, with a single solid cell in
+	// the far corner: the packing must round-trip exactly, the encoded value
+	// must never collide with the sentinel, and sample() must agree with the
+	// cell the seed names.
+	const int nx = 200, ny = 3, nz = 5;
+	const int solidX = nx - 1, solidY = ny - 1, solidZ = nz - 2;
+	SdfField field;
+	field.build(nx, ny, nz, [&](int x, int y, int z) {
+		return x == solidX && y == solidY && z == solidZ;
+	});
+	const SdfField::SeedBits bits = field.seedBits();
+	check(bits.x == 8 && bits.y == 2 && bits.z == 3 && bits.fits(),
+			"sdf seed bits: non-power-of-two spans take their own widths");
+
+	std::size_t mismatches = 0, sentinels = 0, seeds = 0;
+	for (int z = 0; z < nz; ++z) {
+		for (int y = 0; y < ny; ++y) {
+			for (int x = 0; x < nx; ++x) {
+				const std::uint32_t v =
+						field.seeds()[std::size_t(x) + std::size_t(y) * nx +
+													std::size_t(z) * nx * ny];
+				if (v == vv::voxel::kSdfEmptySeed) {
+					++sentinels;
+					continue;
+				}
+				++seeds;
+				// The shader's decode, verbatim.
+				const std::uint32_t dx = v & ((1u << bits.x) - 1u);
+				const std::uint32_t dy = (v >> bits.x) & ((1u << bits.y) - 1u);
+				const std::uint32_t dz = v >> (bits.x + bits.y);
+				if (dx != std::uint32_t(solidX) || dy != std::uint32_t(solidY) ||
+						dz != std::uint32_t(solidZ)) {
+					++mismatches;
+				}
+			}
+		}
+	}
+	check(seeds > 0 && sentinels == 0,
+			"sdf seed bits: every cell of a one-solid box carries that solid");
+	check(mismatches == 0,
+			"sdf seed bits: every packed seed decodes to the solid cell");
+
+	// The distance the decode feeds: 0 inside the solid cube, and half a
+	// voxel off its -x face at the cell center next to it.
+	const float insideW = field.sample(float(solidX) + 0.5f,
+																		 float(solidY) + 0.5f,
+																		 float(solidZ) + 0.5f);
+	const float besideW = field.sample(float(solidX) - 0.5f,
+																		 float(solidY) + 0.5f,
+																		 float(solidZ) + 0.5f);
+	check(insideW == 0.0f, "sdf seed bits: a solid cell samples as 0");
+	check(std::abs(besideW - 0.5f) < 1e-5f,
+			"sdf seed bits: the decoded cell gives the cube distance");
+	std::printf("sdf seed bits: 200x3x5 packs at 8+2+3 bits; %zu encoded cells, "
+							"%zu mismatches, sample %.2f / %.2f\n",
+							seeds, mismatches, double(insideW), double(besideW));
 }
 
 void testSdfBoxBuild() {
@@ -3684,6 +3777,7 @@ int main() {
 	testSdfSoftShadow3d();
 	testSdfBoxBuild();
 	testSdfBoxBand();
+	testSdfSeedEncoding();
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();

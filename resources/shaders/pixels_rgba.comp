@@ -138,6 +138,11 @@ layout(std140, set = 0, binding = 13) uniform SdfBox {
     ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
     uvec4 dims;   // xyz = box size in cells, w = the live half's base cell
                   // offset in the seed buffer (pass 49)
+    uvec4 seedBits;  // xyz = bits per axis of the packed seed cell:
+                     // x | (y << seedBits.x) | (z << (seedBits.x + seedBits.y))
+                     // (pass 50 - the CPU picks the smallest widths that hold
+                     // the box's spans, and the three together always fit 31
+                     // bits, so an encoded cell can never be 0xFFFFFFFF)
 } sdfBox;
 
 
@@ -611,9 +616,10 @@ float shadowPenumbra(float h, float t)
 // side face (a vertical cliff) HAS data, so the sphere trace softens the
 // shadow edges running along vertical/steep casters. sdfBox.box.xyz is the
 // box origin in world voxels (w < 0 = no field yet); sdfBox.dims is the box
-// size in cells (w == which half of the double-buffered seed buffer the
-// live box reads). sdfField.seed holds kSdfHalves copies of one u32 per cell
-// (x + y*nx + z*nx*ny), 0xFFFFFFFF = no solid in the box's view.
+// size in cells (w == where the live half starts in the seed buffer).
+// sdfField.seed holds kSdfHalves copies of one u32 per cell; the cell is
+// packed as three bit fields (see sdfBox.seedBits), 0xFFFFFFFF = no solid in
+// the box's view.
 float sdfCubeDistance(vec3 p, vec3 v)
 {
     // L2 distance from p to the solid cube [v, v+1)^3 (box-local voxels).
@@ -657,9 +663,20 @@ float sampleSdf3d(vec3 p)
                 uint s = sdfField.seed[seedBase + uint(xc) + uint(yc) * nx +
                                        uint(zc) * nx * ny];
                 if (s == 0xFFFFFFFFu) continue;
-                vec3 v = vec3(float(s % nx),
-                              float((s / nx) % ny),
-                              float(s / (nx * ny)));
+                // Pass 50: shifts and masks instead of three integer
+                // divisions per fetch. The divisions were the hottest lines
+                // of the frame in the owner's Nsight capture (up to 13%), and
+                // this runs up to 27 times per sphere-trace step. The decode
+                // names exactly the cell the CPU packed, so nothing about the
+                // field or the picture changes; the masks are uniform-derived
+                // and hoisted out of the loop by the compiler.
+                uint seedMaskX = (1u << sdfBox.seedBits.x) - 1u;
+                uint seedMaskY = (1u << sdfBox.seedBits.y) - 1u;
+                uint seedShiftY = sdfBox.seedBits.x;
+                uint seedShiftZ = sdfBox.seedBits.x + sdfBox.seedBits.y;
+                vec3 v = vec3(float(s & seedMaskX),
+                              float((s >> seedShiftY) & seedMaskY),
+                              float(s >> seedShiftZ));
                 best = min(best, sdfCubeDistance(local, v));
             }
         }

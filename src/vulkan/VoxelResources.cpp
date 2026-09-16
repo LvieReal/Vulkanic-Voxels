@@ -155,11 +155,12 @@ bool VoxelResources::create(VkDevice device, VkPhysicalDevice physicalDevice,
 			cleanup(device);
 			return false;
 		}
-		// Box-geometry uniform (binding 13): ivec4 box + uvec4 dims (32
-		// bytes). HOST_VISIBLE + COHERENT: written from mapped memory.
+		// Box-geometry uniform (binding 13): ivec4 box + uvec4 dims +
+		// uvec4 seedBits (pass 50 added the seed packing bits).
+		// HOST_VISIBLE + COHERENT: written from mapped memory.
 		// Starts INACTIVE (box.w = -1) so the shader uses the 2.5D
 		// fallback until a field is uploaded.
-		const VkDeviceSize sdfBoxBytes = 2u * 16u;
+		const VkDeviceSize sdfBoxBytes = kSdfBoxUniformBytes;
 		if (!utils::createBuffer(device, physicalDevice, sdfBoxBytes,
 								VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 								VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -1351,7 +1352,8 @@ bool VoxelResources::sdfUploadComplete(VkDevice device) {
 
 void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
 		std::int32_t boxZ, std::uint32_t nx, std::uint32_t ny,
-		std::uint32_t nz, bool active, std::uint32_t half) {
+		std::uint32_t nz, std::uint32_t seedBitsX, std::uint32_t seedBitsY,
+		std::uint32_t seedBitsZ, bool active, std::uint32_t half) {
 	if (m_mappedSdfBox == nullptr) {
 		return;
 	}
@@ -1385,7 +1387,7 @@ void VoxelResources::clearSdfBox() {
 	if (m_mappedSdfBox == nullptr) {
 		return;
 	}
-	writeSdfBox(0, 0, 0, 0, 0, 0, false, 0);
+	writeSdfBox(0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0);
 }
 
 bool VoxelResources::writeChunkTable(

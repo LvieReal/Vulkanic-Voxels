@@ -142,6 +142,16 @@ traversal (keeping the distance already marched and the visibility so far), so
 casters outside the box still shadow the frame; until the first box lands the
 same 2.5D traversal runs from the surface.
 
+The seeds themselves are packed so the shader can decode them cheaply (pass
+50): each cell's nearest-solid cell is stored as three bit fields
+(`x | y << bits.x | z << (bits.x + bits.y)`, the widths picked per box - 23 bits
+for the default terrain) and decoded with two shifts and two masks. The old
+layout was a linear cell index, which cost three integer divisions per fetch;
+integer division is a long instruction sequence on a GPU, and the shader runs
+that decode up to 27 times per sphere-trace step, so it showed up as the
+hottest code in an Nsight capture. The decoded cell is identical - this is a
+pure arithmetic change, nothing about the field or the picture moves.
+
 Two things keep the rebake cheap (pass 49). The box's empty sky is cropped: the
 build keeps the highest solid cell of its footprint plus 16 voxels of penumbra
 margin, so a bake is 110 of the 128 rows on the default terrain (14% fewer

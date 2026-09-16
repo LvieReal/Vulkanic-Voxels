@@ -1267,6 +1267,24 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
                  box.chunkSizeZ);
     return;
   }
+  // Pass 50: the seed is packed into three bit fields, so the box's spans
+  // have to fit 31 bits together. (They do with room to spare for any sane
+  // config: the default box packs 8 + 7 + 8 = 23 bits. A body that big would
+  // also need a ~300 MB seed buffer.) Refuse it here with a reason rather
+  // than upload a field of empty seeds.
+  const vv::voxel::SdfField::SeedBits seedBits =
+      vv::voxel::SdfField::seedBitsFor(static_cast<int>(box.nx),
+                                       static_cast<int>(box.ny),
+                                       static_cast<int>(box.nz));
+  if (!seedBits.fits()) {
+    std::fprintf(stderr,
+                 "[vulkan] SDF build skipped: a %ux%ux%u box needs %d seed "
+                 "bits (max %d)\n",
+                 box.nx, box.ny, box.nz,
+                 seedBits.x + seedBits.y + seedBits.z,
+                 vv::voxel::kMaxSeedBits);
+    return;
+  }
   m_sdfPendingReady = false;
   m_sdfBuildRunning = true;
 
@@ -1341,6 +1359,11 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
         m_sdfPending.centerChunkX = centerChunkX;
         m_sdfPending.centerChunkZ = centerChunkZ;
         m_sdfPending.fullNy = box.ny;
+        // Pass 50: the packing the build used, so the shader can decode it.
+        const vv::voxel::SdfField::SeedBits bits = sdf.seedBits();
+        m_sdfPending.seedBitsX = static_cast<std::uint32_t>(bits.x);
+        m_sdfPending.seedBitsY = static_cast<std::uint32_t>(bits.y);
+        m_sdfPending.seedBitsZ = static_cast<std::uint32_t>(bits.z);
         m_sdfPending.snapshotMs = snapshotMs;
         m_sdfPending.bandMs = bandMs;
         m_sdfPending.buildMs = buildMs;
@@ -1425,6 +1448,13 @@ void VulkanRenderer::ensureSdfField() {
                           m_sdfPending.ny > 0 &&
                           m_sdfPending.ny <= box.ny &&
                           m_sdfPending.ny <= m_sdfPending.fullNy &&
+                          // Pass 50: the packing the shader will decode with
+                          // must be the one the field was built with.
+                          m_sdfPending.seedBitsX +
+                                  m_sdfPending.seedBitsY +
+                                  m_sdfPending.seedBitsZ <=
+                              static_cast<std::uint32_t>(
+                                  vv::voxel::kMaxSeedBits) &&
                           m_sdfPending.seeds.size() ==
                               static_cast<std::size_t>(m_sdfPending.nx) *
                                   m_sdfPending.ny * m_sdfPending.nz;
@@ -1456,6 +1486,9 @@ void VulkanRenderer::ensureSdfField() {
           m_sdfUploadBox.nx = m_sdfPending.nx;
           m_sdfUploadBox.ny = m_sdfPending.ny;
           m_sdfUploadBox.nz = m_sdfPending.nz;
+          m_sdfUploadBox.seedBitsX = m_sdfPending.seedBitsX;
+          m_sdfUploadBox.seedBitsY = m_sdfPending.seedBitsY;
+          m_sdfUploadBox.seedBitsZ = m_sdfPending.seedBitsZ;
           m_sdfUploadBox.centerChunkX = m_sdfPending.centerChunkX;
           m_sdfUploadBox.centerChunkZ = m_sdfPending.centerChunkZ;
           m_sdfUploadBox.half = half;
@@ -1478,8 +1511,9 @@ void VulkanRenderer::ensureSdfField() {
       m_sdfUploadInFlight = false;
       m_voxelResources.writeSdfBox(
           m_sdfUploadBox.boxX, m_sdfUploadBox.boxY, m_sdfUploadBox.boxZ,
-          m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz, true,
-          m_sdfUploadBox.half);
+          m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+          m_sdfUploadBox.seedBitsX, m_sdfUploadBox.seedBitsY,
+          m_sdfUploadBox.seedBitsZ, true, m_sdfUploadBox.half);
       m_sdfLiveHalf = m_sdfUploadBox.half;
       m_sdfFieldActive = true;
       m_sdfActiveCenterX = m_sdfUploadBox.centerChunkX;
@@ -2858,7 +2892,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorBufferInfo sdfBoxInfo{};
   sdfBoxInfo.buffer = m_voxelResources.sdfBoxBuffer();
   sdfBoxInfo.offset = 0;
-  sdfBoxInfo.range = 2u * 16u;  // ivec4 box + uvec4 dims
+  sdfBoxInfo.range = vv::vulkan::VoxelResources::kSdfBoxUniformBytes;
   writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[13].dstSet = m_descriptorSet;
   writes[13].dstBinding = 13;

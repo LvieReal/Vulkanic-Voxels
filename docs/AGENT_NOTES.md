@@ -1330,3 +1330,67 @@ must be invisible; a ray leaving the shorter box now runs the 2.5D hand-off for
 a few extra voxels of open sky, which is the same traversal that already covered
 everything above `y = 128`), and the real bake rate/bake-time on the owner's
 machine - that is what the VV_PERF line is for.
+
+## Pass 50: the seed decode - bit fields instead of integer divisions
+
+Owner report: after pass 49 the shadows were unchanged with no new artifacts,
+and an Nsight capture on his machine put the hottest lines of the frame (up to
+13%) at exactly this, inside `sampleSdf3d`:
+
+```glsl
+vec3 v = vec3(float(s % nx), float((s / nx) % ny), float(s / (nx * ny)));
+```
+
+Integer division and modulo have no instruction on any current GPU: the driver
+lowers each one to a long sequence (reciprocal/multiply-high style, ~10-20
+instructions). The decode ran up to 27 times per sphere-trace step (the 3x3x3
+seed gather) and ~22 steps per traced ray, so those lines were paying for four
+division sequences *per fetched seed*.
+
+### What changed
+
+- The seed is now THREE BIT FIELDS: `s = x | (y << bits.x) | (z << (bits.x +
+  bits.y))`, with the widths picked per box (`SdfField::seedBitsFor`, the
+  smallest that hold each span: 8 + 7 + 8 = 23 bits for the 192 x 110 x 192
+  banded shipping box). The shader decodes with
+  `uint maskX = (1u << seedBits.x) - 1u;` etc. - two shifts and two masks, all
+  uniform-derived and hoisted out of the loop.
+- The CELL is unchanged, and so is the chamfer result (only the solid cells'
+  seed writes and the decode changed; the relaxation propagates the packed
+  value verbatim). The picture cannot move.
+- `kMaxSeedBits = 31`: the packing has to stay below 2^31 so an encoded cell can
+  never collide with the empty sentinel 0xFFFFFFFF. A box that does not fit is
+  REFUSED with a reason in `launchSdfBuild` (and, defensively, `SdfField::build`
+  then produces a field of empty seeds = "open space", not a wrong field). Any
+  sane config packs in ~23 bits; a body that big would need a ~300 MB seed
+  buffer.
+- The box uniform (binding 13) grew a third `uvec4 seedBits` (48 bytes).
+  `VoxelResources::kSdfBoxUniformBytes` is now the ONE definition used by the
+  buffer, `writeSdfBox` and - the bug this caught - the descriptor write in
+  `VulkanRenderer`, which still had `range = 2u * 16u` hardcoded: with a 48-byte
+  block the shader's `seedBits` read would have been outside the descriptor
+  range (a validation error and undefined data on device).
+- The publish path additionally validates that the bits the shader will decode
+  with are the ones the build used (`seedBitsX + seedBitsY + seedBitsZ <=
+  kMaxSeedBits`), so a mismatched pairing can never go live.
+
+### Verification
+
+- SPIR-V, same shader, `glslangValidator -V -H` opcode census: the OLD module
+  has `UMod 2 + UDiv 2` in `sampleSdf3d` (glslang CSEs the three source divides
+  into two quotient/remainder pairs); the NEW module has **UMod 0, UDiv 0**
+  there (the only UDiv left in the whole module is an unrelated pre-existing
+  site), with `ShiftRightLogical` and `BitwiseAnd` each up by exactly 2. So the
+  divide/remainder sequences are gone from the hot loop, not just moved.
+- `testSdfSeedEncoding` (new): width per span (1 -> 0 bits, 192 -> 8, 257 -> 9),
+  the shipping box packing to 23 bits, a too-large box being refused rather than
+  mis-encoded, and a 200x3x5 field with one solid cell in the far corner whose
+  every packed seed decodes (shader arithmetic, mirrored verbatim) to that cell
+  with no sentinel collision.
+- `testSdfBoxBand` now decodes with the shader's bit arithmetic and also asserts
+  the named cell is really solid in the chunk data - the encoder/decoder pair is
+  pinned against the voxels, not just against itself.
+- Release + debug warning-free, `ctest` green (4.6 s / 22.6 s), `glslangValidator
+  -V` exit 0, `VV_PLATFORM=null` smoke unchanged (exit 1).
+- NOT PROVEN HERE: the actual frame-time win (no GPU in the sandbox) - the
+  owner's Nsight run on the same scene is the measurement that counts.

@@ -39,8 +39,41 @@ namespace vv::voxel {
 // a full 19 MB read/write traversal per bake for nothing.
 inline constexpr std::uint32_t kSdfEmptySeed = 0xFFFFFFFFu;
 
+// The three spans of a box must fit the packed seed together, and the packing
+// must stay below 2^31 so an encoded cell can never collide with the empty
+// sentinel (see below).
+inline constexpr int kMaxSeedBits = 31;
+
 class SdfField {
 public:
+    // Pass 50: the seed is THREE BIT FIELDS - x | (y << bits.x) |
+    // (z << (bits.x + bits.y)) - so a fetch decodes with two shifts and two
+    // masks instead of three integer divisions. Nsight put those divisions at
+    // the top of the frame's cost (up to 13% of the frame in one pass), and
+    // sampleSdf3d runs the decode up to 27 times per sphere-trace step, ~22
+    // steps per traced ray. The CELL the seed names is unchanged, so the
+    // field, the march and the picture are identical.
+    struct SeedBits final {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        bool fits() const { return x + y + z <= kMaxSeedBits; }
+    };
+
+    // The bits needed to hold the coordinates 0..n-1 (0 for a 1-cell span).
+    static int bitsForDim(int n) {
+        int b = 0;
+        while ((1 << b) < n) {
+            ++b;
+        }
+        return b;
+    }
+
+    static SeedBits seedBitsFor(int nx, int ny, int nz) {
+        return SeedBits{bitsForDim(nx), bitsForDim(ny), bitsForDim(nz)};
+    }
+
+    SeedBits seedBits() const { return bits_; }
     // Build the SDF over the box [0,nx) x [0,ny) x [0,nz) from a solid/air
     // predicate. solid(x,y,z) is true for a solid voxel. sample() is the
     // distance to the nearest solid cube (0 inside the solid).
@@ -52,13 +85,20 @@ public:
             static_cast<std::size_t>(nx) * ny * nz;
         dist_.assign(n, kInf);
         seed_.assign(n, kSdfEmptySeed);
+        bits_ = seedBitsFor(nx, ny, nz);
+        // A box whose spans do not fit the packing cannot be encoded. The
+        // field then holds no seeds at all, which reads as "open space
+        // everywhere" (no SDF shadows) rather than as a WRONG field; the
+        // renderer refuses such a build up front, so this is belt and braces.
+        const bool encodable = bits_.fits();
         for (int z = 0; z < nz; ++z)
             for (int y = 0; y < ny; ++y)
                 for (int x = 0; x < nx; ++x) {
                     if (solid(x, y, z)) {
                         dist_[I(x, y, z)] = 0.0f;
-                        seed_[I(x, y, z)] =
-                            static_cast<std::uint32_t>(I(x, y, z));
+                        if (encodable) {
+                            seed_[I(x, y, z)] = encodeSeed(x, y, z);
+                        }
                     }
                 }
         // Two-pass chamfer relaxation tracking the nearest seed: W1 = 1
@@ -151,9 +191,11 @@ public:
         const int x0 = static_cast<int>(std::floor(px));
         const int y0 = static_cast<int>(std::floor(py));
         const int z0 = static_cast<int>(std::floor(pz));
-        // The seed decodes as x + y*nx + z*nx*ny (the shader's arithmetic).
-        const std::uint32_t unx = static_cast<std::uint32_t>(nx_);
-        const std::uint32_t uny = static_cast<std::uint32_t>(ny_);
+        // The seed's three bit fields (the shader's arithmetic, pass 50).
+        const std::uint32_t mx = maskX();
+        const std::uint32_t my = maskY();
+        const int shiftY = bits_.x;
+        const int shiftZ = bits_.x + bits_.y;
         float best = kInf;
         // The nearest solid cube to p is the seed of one of the cells around
         // p; take the min over the 3x3x3 neighborhood of cells (the chamfer
@@ -171,9 +213,9 @@ public:
                     if (s == kSdfEmptySeed) {
                         continue;
                     }
-                    const int vx = static_cast<int>(s % unx);
-                    const int vy = static_cast<int>((s / unx) % uny);
-                    const int vz = static_cast<int>(s / (unx * uny));
+                    const int vx = static_cast<int>(s & mx);
+                    const int vy = static_cast<int>((s >> shiftY) & my);
+                    const int vz = static_cast<int>(s >> shiftZ);
                     // L2 distance from p to the solid cube [v, v+1)^3.
                     const float qx = std::clamp(px, float(vx), float(vx + 1));
                     const float qy = std::clamp(py, float(vy), float(vy + 1));
@@ -192,8 +234,23 @@ private:
     int nx_ = 0;
     int ny_ = 0;
     int nz_ = 0;
+    SeedBits bits_{};
     std::vector<float> dist_;
-    std::vector<std::uint32_t> seed_;  // kSdfEmptySeed = no solid in view
+    std::vector<std::uint32_t> seed_;  // packed cell or kSdfEmptySeed
+    // A field of bits_.x bits holds coordinates 0..2^bits_.x - 1, i.e. 0 when
+    // the span is one cell - so the masks below are always well defined
+    // (bits are capped at kMaxSeedBits = 31 by fits()).
+    std::uint32_t maskX() const {
+        return bits_.x == 0 ? 0u : (1u << bits_.x) - 1u;
+    }
+    std::uint32_t maskY() const {
+        return bits_.y == 0 ? 0u : (1u << bits_.y) - 1u;
+    }
+    std::uint32_t encodeSeed(int x, int y, int z) const {
+        return static_cast<std::uint32_t>(x) |
+               (static_cast<std::uint32_t>(y) << bits_.x) |
+               (static_cast<std::uint32_t>(z) << (bits_.x + bits_.y));
+    }
     std::size_t I(int x, int y, int z) const {
         return (static_cast<std::size_t>(z) * ny_ +
                 static_cast<std::size_t>(y)) *

@@ -114,8 +114,9 @@ class VoxelResources final {
 
 	// 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): one device-local storage
 	// buffer holding the nearest-solid-cell (argmin seed) for every cell of
-	// a camera-centered box (one u32 per cell, x + y*nx + z*nx*ny,
-	// 0xFFFFFFFF = no solid in the box's view), built on the CPU by
+	// a camera-centered box (one u32 per cell, the cell packed as three bit
+	// fields - pass 50, see SdfField::SeedBits - 0xFFFFFFFF = no solid in
+	// the box's view), built on the CPU by
 	// vv::voxel::SdfField on a background thread and uploaded here. The
 	// box geometry (origin in world voxels + dims in cells) is published
 	// via a small host-visible uniform (binding 13) with writeSdfBox -
@@ -136,6 +137,11 @@ class VoxelResources final {
 	// the full world height tall; its cell dims are
 	// (2*kSdfHalfChunks*chunkSizeX, worldHeight, 2*kSdfHalfChunks*chunkSizeZ).
 	static constexpr std::uint32_t kSdfHalfChunks = 3;  // box = 2*kSdfHalfChunks chunks
+	// The SDF box uniform (binding 13) is ivec4 box + uvec4 dims + uvec4
+	// seedBits (pass 50). ONE definition: the buffer, the descriptor range and
+	// writeSdfBox all have to agree, and a range shorter than the block makes
+	// the shader read outside it.
+	static constexpr std::uint32_t kSdfBoxUniformBytes = 3u * 16u;
 	// Starts the copy of a complete SDF (the argmin seed per cell) into the
 	// buffer: staging fill + one transfer submit, and RETURNS WITHOUT WAITING
 	// (pass 42 - the wait used to be a frame hitch). The caller publishes the
@@ -156,14 +162,17 @@ class VoxelResources final {
 	bool sdfUploadComplete(VkDevice device);
 	// Publishes the SDF box geometry (binding 13): box.xyz = origin in
 	// world voxels, box.w = 1 when active / -1 when no field; dims.xyz =
-	// box size in cells, dims.w = the half the shader must read (the seed
-	// base is dims.w * nx * ny * nz), 0 when no field. Plain mapped write,
+	// box size in cells, dims.w = the base CELL OFFSET of the live half in
+	// the seed buffer (pass 49: the halves are strided by the buffer's cell
+	// count, not by the field's); seedBits.xyz = the seed packing's bits per
+	// axis (pass 50). All zero when no field. Plain mapped write,
 	// but the payload goes out BEFORE the active word: a reader that catches
 	// the write (the GPU samples this buffer while a dispatch is running)
 	// must never see "active" next to a half-updated origin or half index.
 	void writeSdfBox(std::int32_t boxX, std::int32_t boxY, std::int32_t boxZ,
-			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool active,
-			std::uint32_t half);
+			std::uint32_t nx, std::uint32_t ny, std::uint32_t nz,
+			std::uint32_t seedBitsX, std::uint32_t seedBitsY,
+			std::uint32_t seedBitsZ, bool active, std::uint32_t half);
 	void clearSdfBox();
 
 	// Async partial upload into the given half: cellRuns are (cellOffset,
