@@ -3052,6 +3052,220 @@ void testSdfBoxUniform() {
 							decoded);
 }
 
+// Pass 52: sampleSdf3d takes the min cube distance over the EIGHT cells whose
+// centres surround p (floor(p - 0.5) and +1, clamped) instead of the 3x3x3
+// block, comparing squared distances so a step pays one sqrt instead of 27.
+// The claim is "same field, fewer taps", so this pins it the way the picture is
+// actually made: a march over both gathers on real terrain has to agree on every
+// ray's verdict (modulo a stray grazing ray) and on the visibility it
+// accumulates - plus an exact-equality case where the two must not differ at
+// all.
+void testSdfCornerGather() {
+	using vv::voxel::Chunk;
+	using vv::voxel::ChunkCoord;
+	using vv::voxel::SdfBoxGeometry;
+	using vv::voxel::SdfField;
+
+	// (a) One solid cell: that cube is the only candidate either gather can
+	// find, so the two are the same function of p and must agree exactly -
+	// which also pins that the squared-distance comparison is not losing a
+	// candidate or picking the wrong one.
+	{
+		SdfField one;
+		one.build(24, 12, 24, [](int x, int y, int z) {
+			return x == 7 && y == 5 && z == 3;
+		});
+		std::size_t probes = 0, mismatches = 0;
+		for (int i = 0; i < 600; ++i) {
+			const float px = 0.25f + 0.37f * float(i % 23);
+			const float py = 0.50f + 0.11f * float(i % 11);
+			const float pz = 0.75f + 0.29f * float(i % 19);
+			++probes;
+			if (std::abs(one.sample(px, py, pz) - one.sampleCorners(px, py, pz)) >
+					1e-5f) {
+				++mismatches;
+			}
+		}
+		check(probes > 0 && mismatches == 0,
+				"sdf corner gather: a one-solid field gives both gathers the same "
+				"value");
+	}
+
+	// (b) Real terrain, built the way the renderer builds it (band crop and
+	// all).
+	const int cx = 32, cz = 32, wh = 128;
+	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
+	vv::voxel::World world(tcfg, cx, wh, cz);
+	std::vector<const Chunk*> added;
+	std::vector<ChunkCoord> evicted;
+	world.ensureRegion(0, 0, 4, added, evicted);
+	const std::uint32_t halfChunks = 2;
+	const std::uint32_t side = 2u * halfChunks;
+	std::vector<std::vector<std::uint8_t>> snapshots(std::size_t(side) * side);
+	for (std::uint32_t z = 0; z < side; ++z) {
+		for (std::uint32_t x = 0; x < side; ++x) {
+			if (const Chunk* c = world.findChunk(ChunkCoord{
+							-int(halfChunks) + int(x), -int(halfChunks) + int(z)})) {
+				snapshots[std::size_t(z) * side + x] = c->voxelTypes();
+			}
+		}
+	}
+	const SdfBoxGeometry box =
+			SdfBoxGeometry::centeredOn(0, 0, halfChunks, cx, cz, wh);
+	const std::uint32_t bandNy = vv::voxel::sdfBoxBandHeight(box, snapshots, 16u);
+	SdfBoxGeometry banded = box;
+	banded.cropToBand(bandNy);
+	SdfField field;
+	vv::voxel::buildSdfBoxField(banded, snapshots, field);
+
+	// The shader's sunRayEscapesSdf3d field part: march out to the box crossing,
+	// folding the penumbra in, returning "blocked" when a sample lands on the
+	// surface. Exactly the march both gathers feed.
+	const auto march = [](const auto& sample, const float o[3], const float sun[3],
+												const float lo[3], const float hi[3],
+												bool* outBlocked) {
+		float tExit = 0.0f;
+		if (o[0] >= lo[0] && o[0] < hi[0] && o[1] >= lo[1] && o[1] < hi[1] &&
+				o[2] >= lo[2] && o[2] < hi[2]) {
+			tExit = 1e30f;
+			for (int a = 0; a < 3; ++a) {
+				if (std::abs(sun[a]) > 1e-6f) {
+					const float face = (sun[a] > 0.0f) ? hi[a] : lo[a];
+					tExit = std::min(tExit, (face - o[a]) / sun[a]);
+				}
+			}
+		}
+		float visibility = 1.0f;
+		float t = 0.0f;
+		*outBlocked = false;
+		for (int i = 0; i < 160; ++i) {
+			if (t >= tExit) {
+				return visibility;
+			}
+			const float h =
+					sample(o[0] + sun[0] * t, o[1] + sun[1] * t, o[2] + sun[2] * t);
+			if (h < 1e-3f) {
+				*outBlocked = true;
+				return 0.0f;
+			}
+			visibility = std::min(
+					visibility, std::clamp(8.0f * h / std::max(t, 1e-4f), 0.0f, 1.0f));
+			t += std::max(h * 0.7f, 0.05f);
+		}
+		return visibility;
+	};
+
+	float sun[3] = {0.5f, 1.0f, 0.5f};
+	{
+		const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+		for (float& v : sun) {
+			v /= len;
+		}
+	}
+	const float lo[3] = {float(banded.originX), float(banded.originY),
+											 float(banded.originZ)};
+	const float hi[3] = {lo[0] + float(banded.nx), lo[1] + float(banded.ny),
+											 lo[2] + float(banded.nz)};
+
+	// The invariant, pointwise: the 8 candidates are a subset of the 27, so the
+	// 8-cell min can never be smaller. (Not to be confused with a ray's
+	// accumulated visibility - the two marches step differently, so their
+	// penumbra is sampled at different points and either can end up darker.)
+	std::size_t probes = 0, belowRef = 0, aboveRef = 0, overFifth = 0;
+	double devSum = 0.0, devMax = 0.0;
+	for (int z = 1; z < int(banded.nz); z += 7) {
+		for (int y = 1; y < int(banded.ny); y += 5) {
+			for (int x = 1; x < int(banded.nx); x += 7) {
+				// Cell centre and an off-centre point (the gather's candidate
+				// set depends on floor(p - 0.5), so both must be covered).
+				for (int k = 0; k < 2; ++k) {
+					const float px = float(banded.originX) + float(x) + (k ? 0.13f : 0.5f);
+					const float py = float(banded.originY) + float(y) + (k ? 0.77f : 0.5f);
+					const float pz = float(banded.originZ) + float(z) + (k ? 0.41f : 0.5f);
+					const float a = field.sample(px, py, pz);
+					const float b = field.sampleCorners(px, py, pz);
+					++probes;
+					if (b < a - 1e-4f) {
+						++belowRef;
+					}
+					if (b > a + 1e-4f) {
+						++aboveRef;
+						devSum += double(b) - double(a);
+						devMax = std::max(devMax, double(b) - double(a));
+						if (b - a > 0.05f) {
+							++overFifth;
+						}
+					}
+				}
+			}
+		}
+	}
+	check(probes > 1000, "sdf corner gather: the grid covered enough samples");
+	check(belowRef == 0,
+			"sdf corner gather: the 8-cell min is never below the 27-cell min");
+	check(aboveRef * 100 <= probes * 10,
+			"sdf corner gather: the 8-cell min is above the 27-cell one on <=10% of "
+			"samples");
+
+	std::size_t rays = 0, verdictDiff = 0;
+	double visDeltaSum = 0.0, visDeltaMax = 0.0, refVisSum = 0.0, cornerVisSum = 0.0;
+	for (int wz = -60; wz < 60; wz += 5) {
+		for (int wx = -60; wx < 60; wx += 5) {
+			int top = -1;
+			for (int y = wh - 1; y >= 0; --y) {
+				if (vv::voxel::sdfBoxCellSolid(
+								banded, snapshots, std::uint32_t(wx - banded.originX),
+								std::uint32_t(y), std::uint32_t(wz - banded.originZ))) {
+					top = y;
+					break;
+				}
+			}
+			if (top < 0) {
+				continue;
+			}
+			const float o[3] = {float(wx) + 0.5f, float(top) + 1.0f + 1e-3f + sun[1] * 1e-2f,
+													float(wz) + 0.5f + sun[2] * 1e-2f};
+			bool blocked27 = false, blocked8 = false;
+			const float vis27 = march(
+					[&field](float px, float py, float pz) {
+						return field.sample(px, py, pz);
+					},
+					o, sun, lo, hi, &blocked27);
+			const float vis8 = march(
+					[&field](float px, float py, float pz) {
+						return field.sampleCorners(px, py, pz);
+					},
+					o, sun, lo, hi, &blocked8);
+			++rays;
+			if (blocked27 != blocked8) {
+				++verdictDiff;
+			}
+			const double dv = std::abs(double(vis8) - double(vis27));
+			visDeltaSum += dv;
+			visDeltaMax = std::max(visDeltaMax, dv);
+			refVisSum += double(vis27);
+			cornerVisSum += double(vis8);
+		}
+	}
+	check(rays > 500, "sdf corner gather: the terrain gave enough rays to judge");
+	check(verdictDiff * 100 <= rays,
+			"sdf corner gather: verdicts match the 27-cell gather on >=99% of rays");
+	check(visDeltaSum / double(std::max<std::size_t>(rays, 1)) <= 0.005,
+			"sdf corner gather: mean visibility moves less than 0.005");
+	check(visDeltaMax <= 0.20,
+			"sdf corner gather: no ray's visibility moves by more than 0.2");
+	std::printf("sdf corner gather: %zu samples never below the 27-cell min, "
+							"%zu above it (%.3f mean / %.3f max, %zu over 0.05); %zu rays, "
+							"%zu verdict diffs, mean vis %.4f -> %.4f, mean |dvis| %.4f, "
+							"max %.3f; 8 taps per step against the 3x3x3's (up to) 27\n",
+							probes, aboveRef,
+							devSum / double(std::max<std::size_t>(aboveRef, 1)),
+							devMax, overFifth, rays, verdictDiff,
+							refVisSum / double(std::max<std::size_t>(rays, 1)),
+							cornerVisSum / double(std::max<std::size_t>(rays, 1)),
+							visDeltaSum / double(std::max<std::size_t>(rays, 1)), visDeltaMax);
+}
+
 void testSdfBoxBuild() {
 	using vv::voxel::Chunk;
 	using vv::voxel::ChunkCoord;
@@ -3889,6 +4103,7 @@ int main() {
 	testSdfBoxBand();
 	testSdfSeedEncoding();
 	testSdfBoxUniform();
+	testSdfCornerGather();
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();

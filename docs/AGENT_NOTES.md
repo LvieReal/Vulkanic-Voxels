@@ -1494,3 +1494,120 @@ shader compile as its dependency, and the game target depends on it. Verified
 with a real shader change and no C++ change: `[2/3] Copying SPIR-V shaders...`
 with no link step in the log, the exe's mtime untouched and both copies back in
 sync - the case that used to silently keep the old shader.
+
+## Pass 52: the corner gather - eight cells instead of twenty-seven (optimization P3)
+
+Owner task: the P3 item of the optimization inspection ("u16/u8 distance field
+per cell, ~8 taps + a lerp per step instead of the 27-tap gather"), greenlit
+with "we can proceed to distance-field upload optimization". Before writing any
+upload code the CPU probe (`/tmp/probe_df.cpp`, not committed - build with the
+usual `g++ -std=c++20 -O2 -I src ... src/terrain/*.cpp src/voxel/*.cpp`) was
+extended to put every candidate sampler through the SHADOW MARCH the shader
+runs: the shipping banded box (192 x 110 x 192, 4.05 M cells, 16.2 MB), sun
+`normalize(0.5, 1, 0.5)`, surface origins lifted exactly like `sunShadow`, step
+`max(h * 0.7, 0.05)`, the 160-step budget and the hand-off at the box crossing
+all as in the shader.
+
+### What the probe measured (31 k rays at stride 1; stride 3 = 3481 rays in
+parentheses)
+
+| sampler | blocked | mean visibility | steps/ray | taps/ray |
+| --- | --- | --- | --- | --- |
+| seeds, 3x3x3 (shipped) | 12.9% (12.5%) | 0.690 (0.695) | 22.0 (22.0) | 592.8 (592.9) |
+| seeds, 8 corners + 1 sqrt | 12.8% (12.5%) | 0.690 (0.695) | 21.8 (21.8) | **174.2** (174.2) |
+| seeds, 14 = 8 corners + 6 face | 12.9% | 0.690 | 21.9 | 307.2 |
+| u16 trilinear DF, own argmin | 11.3% (11.2%) | 0.857 (0.858) | 18.7 | 149.2 |
+| u16 trilinear DF, cellDistance - 0.5 | 11.2% | 0.866 | 18.0 | 144.3 |
+
+The 8-corner gather moves 9 verdicts of 31 k rays (2 of 3481), mean |dvis|
+0.0003, max 0.075 - measurement noise on the rays that graze a cave mouth, and
+the step count is unchanged, so the 0.7 safety factor stays exactly as
+conservative as it was. This is the P3 tap target (8 taps per step instead of
+27, one sqrt instead of eight) reached with a shader edit: no new buffer, no new
+upload, no change to `SdfBoxUniform`, `SdfField`'s packed seeds or the pass-42
+publish pairing.
+
+### Why the candidates can be cut and why the picture cannot move
+
+The field is cell-centred: every cell stores the nearest solid voxel inside it,
+so the candidates that can carry the min at `p` are the cells whose CENTRES
+surround it - `floor(p - 0.5)` and `+1`. The shader's own clamp into the box is
+equivalent to skipping an out-of-range corner (a duplicate candidate cannot
+change a min), and the squared-distance comparison is only a change of units.
+The 3x3x3's farther cells do carry the min somewhere in the field: over the
+shipping-style banded field 294 912 probes agree exactly on 88.12% of samples,
+the other 35 040 are ABOVE the 8-cell min (mean +0.725, worst +12.655 voxels)
+and none is ever below it (a subset min cannot be). The disagreements are all in
+open sky - the points that are already tens of voxels away from any surface,
+where `k*h/t` is clamped to 1 and the march has nothing left to decide, which is
+why its verdicts and its accumulated visibility do not move. (The test terrain,
+being hillier, agrees on 95.2% of its own samples, up to +14.589.) The 14-candidate variant (8 corners + the 6
+face neighbours of `p`'s own cell) halves the gap again at 307 taps and 4 moved
+verdicts; it is measured and documented here but not shipped, because the
+8-candidate version already reaches the tap target with the picture bound.
+
+### Implementation
+
+- `resources/shaders/pixels_rgba.comp` (`sampleSdf3d`): the decode is unchanged
+  (pass 50's shifts/masks); the gather is the eight corners of the interpolation
+  cell compared as squared distances with a single `sqrt` at the end, and
+  `bestSq >= 1e29 -> 1e30` reproduces the old "no solid among the candidates"
+  value. The 0.7 step factor, the 160-step budget, `sunRayEscapesSdf3d`'s
+  hand-off at the box crossing and the `box.w < 0` gate are untouched, as is
+  `shadowPenumbra`.
+- `src/voxel/SdfField.hpp`: `sampleCorners()` is the CPU mirror of the new
+  gather (same `floor(p - 0.5)`, same clamps, same squared comparison) so the
+  change is testable without a device; `sample()` stays as the 3x3x3 reference
+  the tests march against. Nothing on the build/upload side changed - the
+  pass-50 packed seeds are read by both gathers.
+
+### Verification
+
+- `testSdfCornerGather` (new). (a) A field with ONE solid cell: the cube is the
+  only candidate either gather can find, so 600 probes must agree exactly -
+  which pins the candidate set and the squared comparison. (b) The shipping
+  banded field (band crop, real terrain): 15 884 samples, **none below the
+  27-cell min** (the subset invariant), 756 above it (0.646 mean / 14.589 max,
+  677 of them by more than 0.05 - all in open sky); and 576 surface rays marched
+  with the shader's own arithmetic: 0 verdict diffs, mean visibility 0.9181 ->
+  0.9185, mean |dvis| 0.0009, max 0.154 (tolerances 99% / 0.005 / 0.20).
+- Release + debug builds warning-free, `ctest` 100% in both,
+  `glslangValidator -V` exit 0 on the shader; the runtime copy is back in sync
+  (`build/release/bin/resources/shaders/pixels_rgba.comp.spv`, md5
+  7aeccb2deb7c6f28b720ef33831658f1).
+
+### The distance field itself (P3 as written) was measured and left on the shelf
+
+A true per-cell distance field does cut the taps - and it changes the picture,
+which is the bar here. Any real DF (own-argmin cube distance, or the chamfer's
+`cellDistance - 0.5`, or the trilinear read of either) lightens the shadows:
+mean visibility 0.695 -> 0.858 on the shipping field, 46-48 of 3481 rays
+changing verdict. The reason is geometric, not a bug: the 3x3x3 min
+OVER-reports the distance near corners and edges (each cell's stored voxel is
+the nearest one in that cell, so the min over a neighbourhood is a lower bound
+of the local distance but the single-cell values are not), and it is that
+over-report which keeps the current penumbra dark - remove it and the soft
+shadow thins out. A bias cannot put the darkness back: it only shortens steps,
+so 0 -> 0.25 -> 1.0 moves blocked rays from 11.2% to 7.8% and the step count
+from 18.7 to 58.4 (the bigger field over-reports relative to the march, so every
+step gets shorter). An "eroded" DF built from the sampler's own values
+reproduces the picture (12.5% / 0.695) but it is not a distance field: it costs
+1.9 steps per ray against the reference march and 748 verdict diffs, i.e. it
+matches only because it is the sampler's own picture. Quantize + pack for a
+real DF was affordable (28-33 ms exact cube distance, 13-18 ms for
+`cellDistance - 0.5`, on top of the existing bake), so the upload side is
+ready whenever the owner wants the LIGHTER picture - but on the "picture
+quality is the acceptance bar" rule the 8-corner gather dominates it: the same
+8 taps per step, no new buffer, and no visible change.
+
+### Levers left on the march (measured, picture-changing, not shipped)
+
+- Step factor 0.7 -> 0.95: 22.3 -> 18.1 steps per ray on the frame probe's
+  rays (-19%), but rays that graze the corner of a neighbouring column stop
+  being shadowed (the "hit within the first voxel" share drops 12.3% -> 4.9%
+  with a 1-voxel start offset, 12.1% for the factor alone) - a real shadow
+  change, so it stays opt-in.
+- Early-out when the running visibility is already <= 0.02: 0.6 of 18.1 steps
+  per ray. Same rule: it changes which rays keep marching.
+- P4 (incremental sliding rebuild, ~30 ms bakes) is still open; it needs the P2
+  region plumbing and a CPU parity test.

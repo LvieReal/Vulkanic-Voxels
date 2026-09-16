@@ -147,8 +147,8 @@ The seeds themselves are packed so the shader can decode them cheaply (pass
 (`x | y << bits.x | z << (bits.x + bits.y)`, the widths picked per box - 23 bits
 for the default terrain) and decoded with two shifts and two masks. The old
 layout was a linear cell index, which cost three integer divisions per fetch;
-integer division is a long instruction sequence on a GPU, and the shader runs
-that decode up to 27 times per sphere-trace step, so it showed up as the
+integer division is a long instruction sequence on a GPU, and the shader used
+to run that decode up to 27 times per sphere-trace step, so it showed up as the
 hottest code in an Nsight capture. The decoded cell is identical - this is a
 pure arithmetic change, nothing about the field or the picture moves.
 The widths travel to the shader in the box uniform, written word-for-word
@@ -159,6 +159,22 @@ word of the block cannot go missing unnoticed (pass 51: pass 50 added the
 and the 3D shadows silently disappeared). Copying the compiled SPIR-V next to
 the executable is a build step as well, not a side effect of linking, so a
 shader-only rebuild always replaces the `.spv` the game actually loads.
+
+A sphere-trace step no longer gathers the 3x3x3 block around the sample (pass
+52). The field is cell-centred, so the candidates that can carry the distance
+are the eight cells whose centres surround the point (`floor(p - 0.5)` and
+`+1`, clamped into the box - clamping is the same as skipping a corner,
+because a duplicate cannot change a min), and they are compared as squared
+distances, so a step pays eight fetches and one `sqrt` instead of up to 27
+fetches and eight. A CPU probe marched the shipping field with both gathers:
+174 taps per ray against 593, with the step count, the blocked share and the
+mean visibility unchanged (0.0003 mean / 0.075 max visibility difference on the
+rays that graze a cave mouth). This is what the P3 idea (a quantized per-cell
+distance field) was for - the tap target - and it reaches it with no new
+buffer and no new upload. The distance field itself was measured too and left
+out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
+0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
+corners is what keeps the current penumbra dark, and no bias brings that back.
 
 Two things keep the rebake cheap (pass 49). The box's empty sky is cropped: the
 build keeps the highest solid cell of its footprint plus 16 voxels of penumbra
