@@ -6,10 +6,13 @@
 namespace vv::render {
 
 // Push constants sent to the compute shader per dispatch.
-// Layout must match the Push block in resources/shaders/pixels_rgba.comp.
+// Layout must match the Push block in resources/shaders/voxels.comp.
 struct PushConstants final {
 	glm::uvec4 screen{};    // x=width, y=height, z=bgra, w=frame
-	glm::vec4 camera{};     // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance; see VulkanRenderer::fogCutDistance)
+	glm::vec4 camera{};     // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance;
+													// see VulkanRenderer::fogCutDistance); w = pass-57
+													// shadow-ray jitter CONE SLOPE
+													// (VV_SHADOW_JITTER, <0 = unset)
 	glm::uvec4 chunkSize{}; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
 	glm::vec4 voxelSize{};  // xyz=voxel size in world units
 	glm::ivec4 region{};    // x,z = region origin (min corner) in chunk coords;
@@ -21,7 +24,7 @@ struct PushConstants final {
 };
 
 // The Vulkan spec guarantees at least 128 bytes of push constants; this
-// layout must also match the Push block in pixels_rgba.comp exactly.
+// layout must also match the Push block in voxels.comp exactly.
 static_assert(sizeof(PushConstants) == 128, "push constant layout grew");
 
 // Uniform buffer updated each frame with camera and lighting.
@@ -34,7 +37,11 @@ struct SceneUBO final {
 	glm::vec4 lightColor{};
 	glm::vec4 skyLow{};
 	glm::vec4 skyHigh{};
-	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in (w unused)
+	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = SDF shadows
+	glm::vec4 ambient{}; // x = the ambient sky-visibility term (pass 62; 0 =
+											// the pre-62 view-ray formula, bit for bit), y = the cave
+											// floor (minimum sky fraction; < 0 = the shader default,
+											// --ambient-floor); z,w unused
 };
 
 }  // namespace vv::render

@@ -30,9 +30,11 @@ struct VoxelConfig final {
 	// The shader traces it after a ray leaves the full-detail region, so
 	// the visible world extends to the far field boundary (~2k units at
 	// radius 64) while memory stays ~4 MB instead of the ~1.25 GB that
-	// full-detail chunks would need. 0 disables far LOD (fog then ends at
-	// the near-region boundary as before).
-	std::uint32_t farLodRadiusChunks = 64;
+	// full-detail chunks would need. Far LOD is deliberately OFF in the
+	// default config; the renderer opts into this field only when
+	// VV_FAR_LOD=1 is present (see VulkanRenderer::setWorldConfig).
+	// 0 disables far LOD (fog then ends at the near-region boundary).
+	std::uint32_t farLodRadiusChunks = 0;
 	// Far cell footprint in voxels (must divide 2*farLodRadiusChunks*
 	// chunkSizeX; 4 = ~1-3 voxel silhouette quantization at distance).
 	std::uint32_t farLodCellVoxels = 4;

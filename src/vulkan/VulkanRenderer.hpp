@@ -30,7 +30,7 @@ class VulkanRenderer final {
  public:
   struct InitInfo {
     // Platform-agnostic description of the native window to render into.
-    // See vv::platform::NativeWindow and QtNativeWindowResolver.
+    // See vv::platform::NativeWindow and platform/GlfwNativeWindow.
     vv::platform::NativeWindow nativeWindow;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -44,6 +44,12 @@ class VulkanRenderer final {
 
   bool init(const InitInfo& info, std::string& outError);
   void resize(uint32_t width, uint32_t height);
+
+  // Size of the swapchain currently in use (the extent the driver reported on
+  // surface creation; compare against the window's framebuffer size when a
+  // rendering report has to be diagnosed).
+  uint32_t swapchainWidth() const { return m_swapchainExtent.width; }
+  uint32_t swapchainHeight() const { return m_swapchainExtent.height; }
   void drawFrame();
   void setCamera(const vv::core::Camera& camera, float timeSeconds);
   void setWorldConfig(const vv::voxel::VoxelConfig& config);
@@ -60,6 +66,19 @@ class VulkanRenderer final {
   // Called from updateWorld; needs the queue for uploads.
   void ensureFarField(int32_t centerChunkX, int32_t centerChunkZ);
   void launchFarFieldBuild(int32_t centerChunkX, int32_t centerChunkZ);
+
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): a background build of the
+  // nearest-solid-cell field over a camera-centered box (built on the CPU
+  // with vv::voxel::SdfField, the same reference the CPU test pins).
+  // launchSdfBuild is called when a region move completes (the world
+  // chunks under the box are then installed); ensureSdfField (called from
+  // updateWorld) joins a finished build and uploads it, publishing the box
+  // uniform the shader reads.
+  void ensureSdfField();
+  // Pass 49: arm a rebuild when the camera's chunk has drifted past the live
+  // field's margin (never while a region move is streaming).
+  void followSdfField(int32_t chunkX, int32_t chunkZ);
+  void launchSdfBuild(int32_t centerChunkX, int32_t centerChunkZ);
 
   // Incremental region streaming. Generation runs on a WORKER thread
   // (pass 13): the render thread only installs finished chunks and uploads
@@ -118,6 +137,13 @@ class VulkanRenderer final {
   void cleanupSwapchain();
   bool recreateSwapchain(uint32_t width, uint32_t height,
                          std::string& outError);
+  // m_requested* with a sane floor (never 0: vkCreateSwapchainKHR rejects a
+  // zero extent).
+  uint32_t requestedWidth() const;
+  uint32_t requestedHeight() const;
+  // True when the surface has no size to build a swapchain for (a minimized
+  // window on Win32 reports a currentExtent of (0, 0)).
+  bool surfaceHasNoSize() const;
 
   bool createVoxelWorldAndUpload(std::string& outError);
   // Generates/evicts chunks for the new region center, uploads new chunk
@@ -148,6 +174,9 @@ class VulkanRenderer final {
   bool createCommandPool(std::string& outError);
   bool createCommandBuffers(std::string& outError);
   bool createSyncObjects(std::string& outError);
+  // (Re)creates one render-finished semaphore per swapchain image; called from
+  // createSwapchain so the array always matches the images in use.
+  bool createPresentSemaphores(std::string& outError);
 
   bool recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex,
                            std::string& outError);
@@ -166,6 +195,15 @@ class VulkanRenderer final {
   VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
   VkFormat m_swapchainFormat = VK_FORMAT_UNDEFINED;
   VkExtent2D m_swapchainExtent{};
+  // The window size the swapchain should have: set on init and on every
+  // resize(). The recreate paths in drawFrame() use these, NOT the previous
+  // extent - recreating for the old size left the launch frame stretched
+  // until the window was touched (pass 45).
+  uint32_t m_requestedWidth = 0;
+  uint32_t m_requestedHeight = 0;
+  // Set while the surface has no size and rebuilds are being deferred, so the
+  // note is printed once per episode instead of once per attempt.
+  bool m_swapchainRebuildDeferred = false;
   std::vector<VkImage> m_swapchainImages;
   std::vector<VkImageView> m_swapchainImageViews;
   std::vector<VkImageLayout> m_swapchainImageLayouts;
@@ -186,6 +224,8 @@ class VulkanRenderer final {
   std::vector<VkCommandBuffer> m_commandBuffers;
 
   std::vector<VkSemaphore> m_imageAvailableSemaphores;
+  // Per swapchain image (see drawFrame), NOT per frame in flight: a present
+  // that still waits on one must not be reused with another image.
   std::vector<VkSemaphore> m_renderFinishedSemaphores;
   std::vector<VkFence> m_inFlightFences;
   uint32_t m_currentFrame = 0;
@@ -246,6 +286,12 @@ class VulkanRenderer final {
   // by ray-termination cause. Default off. (VV_DEBUG_SSAA / VV_SSAA were
   // removed in pass 10 - supersampling was too heavy.)
   bool m_debugTerminators = false;
+  // Optional SDF soft-shadow experiment (pass 33: the exact march's
+  // traversal + the plain Quilez k*h/t penumbra estimate - pass 34; the
+  // Aaltonen two-sphere refinement was removed, it projected a hard
+  // "clamped edge" stripe). Exact binary shadows remain the default;
+  // VV_SDF_SHADOWS=1 selects the soft marcher.
+  bool m_sdfShadows = false;
   // VV_PERF: frame-time logging for hitch diagnosis (frames > 25 ms,
   // rate-limited). VV_DEBUG_HOLE: color far-march misses over a chunk.
   bool m_perfEnabled = false;
@@ -305,6 +351,82 @@ class VulkanRenderer final {
   std::vector<float> m_slotFadeScratch;
   bool m_farEverActivated = false;
   std::chrono::steady_clock::time_point m_farFadeStart{};
+
+  // --- 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1; background build) ---
+  // The builder thread only touches m_sdfPending (sole ownership until
+  // m_sdfPendingReady flips to true) and reads the world chunks under the
+  // box (installed by the time the build launches); the main thread joins
+  // it in cleanup() before the world is destroyed, and uploads the field
+  // in ensureSdfField.
+  std::thread m_sdfThread;
+  std::atomic<bool> m_sdfBuildRunning{false};
+  std::atomic<bool> m_sdfPendingReady{false};
+  struct SdfBuild {
+    std::vector<std::uint32_t> seeds;  // argmin seed per cell (box layout,
+                                       // kSdfEmptySeed = no solid in view)
+    std::int32_t boxX = 0;  // box origin in world voxels
+    std::int32_t boxY = 0;
+    std::int32_t boxZ = 0;
+    std::uint32_t nx = 0, ny = 0, nz = 0;  // box size in cells (banded ny)
+    std::uint32_t fullNy = 0;  // uncropped height (publish-path sanity check)
+    // Pass 50: the seed packing's bits per axis (vv::voxel::SdfField::SeedBits)
+    // - the shader needs them to decode a seed with shifts and masks.
+    std::uint32_t seedBitsX = 0, seedBitsY = 0, seedBitsZ = 0;
+    std::int32_t centerChunkX = 0;  // the build's center (stale check)
+    std::int32_t centerChunkZ = 0;
+    // Pass 49 (VV_PERF): where a bake's time went. band/build are worker
+    // thread, snapshot/upload are render thread.
+    double snapshotMs = 0.0;
+    double bandMs = 0.0;
+    double buildMs = 0.0;
+  };
+  SdfBuild m_sdfPending;
+  // --- SDF handover state (pass 42) ---
+  // The box uniform and the seed buffer are a PAIR (the shader resolves
+  // "which cell" from the box and indexes the seeds with it), so the publish
+  // order matters: vv::voxel::SdfHandover (voxel/SdfHandover.hpp) owns the
+  // rules, ensureSdfField drives them. m_sdfUploadInFlight: a copy is on the
+  // queue and the box has NOT been published for it; m_sdfUploadBox: the
+  // geometry to publish when it lands; m_sdf*Center*: the chunk the LIVE
+  // field was built for vs the chunk the camera is on now (the retry lever -
+  // a launch swallowed by a running build used to be lost until the next
+  // region move, leaving the soft shadows a whole crossing behind).
+  struct SdfBoxUpload {
+    std::int32_t boxX = 0;
+    std::int32_t boxY = 0;
+    std::int32_t boxZ = 0;
+    std::uint32_t nx = 0, ny = 0, nz = 0;
+    std::uint32_t seedBitsX = 0, seedBitsY = 0, seedBitsZ = 0;
+    std::int32_t centerChunkX = 0;
+    std::int32_t centerChunkZ = 0;
+    std::uint32_t half = 0;  // seed half this build was copied into
+  };
+  bool m_sdfUploadInFlight = false;
+  // The seed half the live box points at (the shader's dims.w). The copy
+  // fills the other one; vv::voxel::SdfHandover::uploadHalf owns that rule.
+  std::uint32_t m_sdfLiveHalf = 0;
+  SdfBoxUpload m_sdfUploadBox;
+  bool m_sdfFieldActive = false;
+  bool m_sdfWantValid = false;
+  std::int32_t m_sdfActiveCenterX = 0;
+  std::int32_t m_sdfActiveCenterZ = 0;
+  std::int32_t m_sdfWantCenterX = 0;
+  std::int32_t m_sdfWantCenterZ = 0;
+  // Pass 49: how far (in chunks, max-norm) the camera may drift from the live
+  // field's center before a rebuild is armed - VV_SDF_MARGIN, default 1, and
+  // the box only covers kSdfHalfChunks in each direction. 0 = the pre-49
+  // "every completed region move" cadence.
+  std::uint32_t m_sdfMarginChunks = 1;
+  // Pass 57: the shadow-ray jitter handed to the shader each frame
+  // (VV_SHADOW_JITTER) - the CONE SLOPE. < 0 = unset, so the shader's
+  // kShadowJitterDefault applies; 0 = jitter off, bit-identical to the
+  // un-jittered estimate.
+  float m_shadowJitter = -1.0f;
+  // Pass-49 bake bookkeeping for the VV_PERF line: how many bakes, when the
+  // last one published (bakes/second), and what the render thread paid.
+  std::uint64_t m_sdfBakeCount = 0;
+  std::chrono::steady_clock::time_point m_sdfLastPublishTime{};
+  double m_sdfUploadMs = 0.0;
 
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;

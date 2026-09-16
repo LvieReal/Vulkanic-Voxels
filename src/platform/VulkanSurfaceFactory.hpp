@@ -12,7 +12,7 @@ namespace vv::platform {
 // Returns the Vulkan instance extensions that must be enabled for
 // createVulkanSurface() to work with the given native window. The first entry
 // is always VK_KHR_surface, followed by the WSI extension matching the native
-// window kind (e.g. VK_KHR_win32_surface or VK_KHR_xcb_surface).
+// window kind (e.g. VK_KHR_win32_surface or VK_KHR_xlib_surface).
 std::vector<const char*> requiredVulkanInstanceExtensions(
 		const NativeWindow& nativeWindow);
 

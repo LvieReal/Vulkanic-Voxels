@@ -1,25 +1,38 @@
 # Agent Notes — Vulkanic Voxels
 
 Working notes for AI agent sessions. **The chat is not persistent — read this
-first.** Per-pass details live in the git log (one commit per pass, verbose
-messages); this file keeps only what you need to work effectively.
+first.** The other documents:
+
+| File | What it is |
+| --- | --- |
+| `docs/PASSES.md` | shipped-feature reports, one per pass (oldest first) |
+| `docs/UPGRADE_PROPOSALS.md` | proposals for future work (ambient light for caves, GPU SDF bake) — not shipped |
+| `git log` | one commit per pass, verbose messages: the commit-level detail |
+
+This file keeps only what you need to work effectively: the tree map, the
+contracts, the switches, the sandbox recipes, the standing owner rules, and where
+the tree stands.
 
 ## Project
 
 Voxel world ray-traced in a Vulkan compute shader (one thread per pixel,
-`resources/shaders/pixels_rgba.comp`), Qt 6 shell, C++23, CMake ≥ 3.26.
-Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
+`resources/shaders/voxels.comp` — its name since pass 59; older pass reports call
+it `pixels_rgba.comp`). C++23, CMake ≥ 3.26, GLFW windowing, no toolkit of any
+kind. The owner's WGSL reference renderer is `docs/reference_renderer.wgsl` and
+it is the canonical look.
 
 | Path | Contents |
 | --- | --- |
-| `src/ui/` | Qt shell (`AppWindow`, `VulkanWidget` — swapchain + game loop) |
-| `src/platform/` | OS abstraction (Win32/X11/Wayland/macOS) — keep OS headers out of the rest |
+| `src/core/` | `App` (window + frame loop + input), `GameWindow`, `InputBindings`, `Version.h.in` |
+| `src/platform/` | OS abstraction (Win32/X11/Wayland/macOS) — keep OS headers out of the rest of the tree |
 | `src/vulkan/` | `VulkanRenderer` (streaming, far LOD, frame loop), `VoxelResources` (GPU buffers) |
-| `src/voxel/` | `World`/`Chunk`/`VoxelTypes`/`VoxelConfig` |
+| `src/voxel/` | `World`/`Chunk`/`VoxelTypes`/`VoxelConfig`, `SdfField`/`SdfBox`/`SdfHandover`/`SdfUniform` |
 | `src/terrain/` | `Noise(2D/3D)`, `TerrainGenerator` (3D density terrain), `FarField` (far LOD + seam patch) |
-| `src/render/` | Scene UBO, push constants, lighting config |
-| `tests/` | CPU tests (no Qt/Vulkan), `ctest --test-dir build` |
-| `scripts/build-linux-toolchain.sh` | Sandbox toolchain (see below) |
+| `src/render/` | scene UBO + push constants, lighting config, image decode |
+| `resources/shaders/` | `voxels.comp` — the whole renderer, one compute shader |
+| `tests/` | CPU tests (no window, no Vulkan device), `ctest --test-dir build` |
+| `third_party/` | vendored GLFW 3.5.1 + glm 1.0.1 + stb_image — see `third_party/README.md` |
+| `scripts/build-linux-toolchain.sh` | sandbox toolchain (see below) |
 
 ## Working rules (owner-set)
 
@@ -28,10 +41,15 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   One ray per pixel.
 - User uploads never reach the sandbox — diagnose from code/math/probes.
 - Mouse locked always; cross-platform abstraction stays.
-- Uncapped fps default; `VV_PRESENT=fifo` restores vsync.
+- Uncapped fps default; `--present fifo` restores vsync.
 - Keep agent docs/toolchain inside the repo or home — `/tmp` gets wiped
   and the workspace gets rolled back occasionally (recovery: `git fetch
   origin <branch>` + `git reset --soft` + re-commit).
+
+- **Docs discipline (pass 60, owner):** `README.md` is user-facing only — build,
+  run, controls, options, troubleshooting. Shipped-feature reports go to
+  `docs/PASSES.md`; agent working notes go here. No per-pass narrative, no probe
+  tables, no internals in the README.
 
 ## Key contracts (sync points between CPU and GPU)
 
@@ -51,153 +69,135 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 - Streaming: generation on a worker thread (pump installs + fence-scoped
   uploads only); released slots have a 2-frame cooldown; region swaps are
   wait-free (no device/queue waits); teleport fallback stays synchronous.
-- Terrain: density = clamp(g·(target−y)) + fbm3·amp, folds (overhangs) in
-  mountains; defaults in `TerrainGenerator.hpp` (lift 36, ceiling 100,
+- Terrain: density = clamp(g·(target−y)) + fbm3·amp; the warp folds the
+  SURFACE (cliffs and slopes), it does not put rock over air - measured at pass
+  62: every column is solid-below/air-above (56k+ columns, six regions, plus a
+  +/-1200 sweep), so the world has no caves, overhangs or tunnels to test cave
+  lighting on. Defaults in `TerrainGenerator.hpp` (lift 36, ceiling 100,
   window (0.92, 0.995), snowLine 82). `maxHeightVoxels()` must stay ≤ 127.
+- Ambient sky visibility (pass 62): the shader derives it from the SAME height
+  atlas the marches use (binding 5, `resolveColumn` -> `columnHeightAt`, 6
+  azimuths x 6 distances 1..32 voxels) plus two 32-voxel SDF rays, in one mean
+  of eight; `scene.ambient.x` = the switch, `scene.ambient.y` = the floor
+  (`< 0` = the shader's `kAmbientFloorDefault`). The CPU mirror is
+  `tests/ambient_mirror.hpp`; the tests pin the shader's text AND the mirror's
+  numbers, so a change on one side without the other fails.
 
-## Environment variables
+## Switches (command line, passes 61-63)
 
-- `VV_DEBUG_TERM` — color miss pixels by ray-termination cause.
-- `VV_DEBUG_HOLE=X,Z` — far-miss pixels over chunk (X,Z): magenta = empty
-  far cell (data hole), cyan = data present but ray passed over (height
-  too low), yellow = march never crossed the chunk.
-- `VV_PERF=1` — log frames > 25 ms with the stream/world bucket.
-- VV_SHADOW_SHARP=1: exact single-ray sun shadows (no cone penumbra).
-- `VV_PRESENT=fifo` — vsync.
+Parsed once in `main()` from `argv` by `src/core/CommandLine.cpp` into one
+`vv::core::GameOptions` (`src/core/CommandLine.hpp`), read by the consumers
+through `vv::core::options()`. Tests: `testCommandLine`. `game --help` prints
+this list; the startup log prints what is not at its default.
+
+| Flag | Effect |
+| --- | --- |
+| `--sdf-shadows` | the 3D voxel SDF soft-shadow experiment (see `docs/PASSES.md`, passes 37-57). Off = the exact binary sun march, the default reference, which must stay bit-identical |
+| `--shadow-jitter <slope>` | cone slope of the per-pixel shadow-ray jitter; default `0.002` (the owner's on-device pick), `0` = off and bit-identical, clamped to 0.5; the contact floor is 10x the slope, capped at one voxel |
+| `--sdf-margin <chunks>` | how far the camera may drift before the SDF box rebuilds; default 1, `0` = every chunk crossing, clamped to the box coverage |
+| `--shadow-sharp` | force the exact binary shadows even with `--sdf-shadows` |
+| `--no-ambient` | the pre-pass-62 ambient: the sky sampled along the view ray, `mix(skyAmb*0.35, skyAmb, hemi) * (0.55 + 0.45*shadow)`. The control the pass-62 upgrade is judged against. `--ambient` (default) = the sky the surface sees |
+| `--ambient-floor <0..1>` | the minimum sky fraction a fully sheltered point keeps (default `0.12`, clamped; `0` = black caves, `1` = flat fill). Rides `scene.ambient.y`; `< 0` means "unset, use the shader default" |
+| `--far-lod` | opt into the coarse far-LOD terrain field (off by default) |
+| `--validation` | enable the Khronos validation layer (debug runs: `run_debug.bat --validation`) |
+| `--perf` | log frames over 25 ms, and each SDF bake's worker/render split |
+| `--platform <auto\|x11\|wayland\|null\|cocoa\|win32>` | force the window platform; `null` = headless smoke run. `auto` is the default |
+| `--present <immediate\|mailbox\|fifo>` | `immediate` (uncapped) is the default; `fifo` restores vsync. `uncapped` is accepted as a spelling of `immediate` |
+| `--debug-term` | colour miss pixels by the ray's termination cause |
+| `--debug-hole <x,z>` | far-miss diagnostics over chunk (x,z): magenta = empty far cell, cyan = data present but the ray passed above it, yellow = the march never crossed the chunk |
+| `--no-<flag>` | clears a boolean flag (last one on the command line wins) |
+| `-h`, `--help` | usage on stdout, exit 0 |
+
+The historical `VV_*` environment variables still work as a fallback - they seed
+the struct and a flag overrides the variable with the same meaning (scripts, CI
+and the owner's on-device sweeps set them). The only `getenv` left in `src/` is
+in `CommandLine.cpp`; everything else reads the parsed struct, which is what the
+tests pin (including the renderer's `pc.camera.w` writer - the pass-51 failure
+mode moved one indirection out, it did not go away).
+
+`GLFW_PLATFORM` (GLFW's own variable) still works for forcing a backend; our
+`--platform` covers the same ground through `glfwInitHint`, so prefer it.
 
 ## Sandbox validation
 
 ```sh
-export PATH=/tmp/deps/venv/bin:/tmp/deps/prefix/bin:$PATH   # symlink -> ~/.cache/vv-deps
+export PATH=/home/user/.cache/vv-deps/venv/bin:/home/user/.cache/vv-deps/prefix/bin:$PATH
 cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_PREFIX_PATH="/tmp/deps/qt6;/tmp/deps/prefix"
+      -DCMAKE_PREFIX_PATH=/home/user/.cache/vv-deps/prefix -DVV_GLFW_NULL_ONLY=ON
 cmake -S . -B build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_PREFIX_PATH="/tmp/deps/qt6;/tmp/deps/prefix"
-cmake --build build/release && cmake --build build/debug  # warning-free
-ctest --test-dir build/release                    # all tests must pass
-glslangValidator -V resources/shaders/pixels_rgba.comp -o /tmp/p.spv
-QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH=/tmp/deps/qt6/lib:/tmp/deps/prefix/lib \
-    timeout 8 ./build/release/bin/game            # must exit cleanly (Vulkan dialog, no crash)
-# CPU tests without the toolchain:
-g++ -std=c++20 -O2 -ffp-contract=off -I. -Isrc tests/terrain_world_tests.cpp \
-    src/terrain/{Noise,Noise3D,TerrainGenerator,FarField}.cpp \
-    src/voxel/{Chunk,VoxelTypes,VoxelTextures,World}.cpp -o /tmp/t && /tmp/t
+      -DCMAKE_PREFIX_PATH=/home/user/.cache/vv-deps/prefix -DVV_GLFW_NULL_ONLY=ON
+cmake --build build/release && cmake --build build/debug   # warning-free
+ctest --test-dir build/release                            # all tests must pass
+glslangValidator -V resources/shaders/voxels.comp -o /tmp/p.spv
+LD_LIBRARY_PATH=/home/user/.cache/vv-deps/prefix/lib \
+    timeout 8 ./build/release/bin/game --platform null     # headless smoke: clear message, no crash
 ```
 
-Toolchain: `bash scripts/build-linux-toolchain.sh` installs into
-`~/.cache/vv-deps` (survives /tmp wipes) and symlinks `/tmp/deps` to it.
+`-DVV_GLFW_NULL_ONLY=ON` is for this box only (no X11/Wayland headers). The
+toolchain is built by `bash scripts/build-linux-toolchain.sh`, which installs
+into `~/.cache/vv-deps` (persists across the `/tmp` wipes) and needs GitHub
+access; GLFW and glm are **vendored** in `third_party/`, so the script only
+builds CMake/Ninja, Vulkan-Headers, Vulkan-Loader and glslang (pass 58).
 
-## Current status (pass 27)
+CPU tests without the toolchain (pass 58 made this work with a bare `g++`:
+GLFW and glm are vendored, so the test suite only needs their include dirs):
 
-Tree state: pass-25 shadows RESTORED on top of the pass-21 revert (the
-owner confirmed the revert worked, then asked for the cone tracing to
-go too): file-based voxel textures + pass-22 aliases intact, sun
-shadows back to the single exact binary march, no light grid, no cone
-machinery. Owner-verified base: 3ff725f.
+```sh
+g++ -std=c++20 -O1 -ffp-contract=off -I. -Isrc \
+    -I third_party/glfw/include -I third_party/glm -I third_party \
+    -DGLFW_INCLUDE_NONE=1 -DVV_SHADER_DIR='"$PWD/resources/shaders"' \
+    -DVV_SRC_DIR='"$PWD/src"' \
+    tests/terrain_world_tests.cpp src/terrain/*.cpp src/voxel/*.cpp \
+    src/render/ImageDecode.cpp src/core/InputBindings.cpp -o /tmp/t && /tmp/t
+```
 
-Pass 29 (textures): SIDE-FACE V AXIS FLIPPED - textures displayed
-upside down on every side face. Root cause: the shader built side-face
-UVs as (z,y)/(x,y), i.e. V = world +Y, but in this pipeline Vulkan's
-V=0 is the image's TOP row (QImage rows upload in order), so the image
-top landed at the voxel BOTTOM. Fix: V = -Y on side faces (REPEAT
-sampler; fract(-y) = 1 - fract(y) keeps tiling continuous). Top/bottom
-faces keep V = +Z (rotation, not flip - art-dependent). README UV
-paragraph updated ("textures display UPRIGHT on sides; mirror the file
-only for horizontal direction"). Validated: both builds warning-free
-(shader recompiled), ctest green, smoke ok.
+**Snapshot note:** `build/` and `~/.cache/` are *not* restored with the
+workspace (the platform snapshots the tree, not those directories), so after a
+session restore the toolchain is gone - rebuild it with
+`scripts/build-linux-toolchain.sh`, or use the recipe above, which needs nothing
+but `g++`.
 
-Pass 28 (textures): PARTIAL TEXTURE SETS NOW WORK PER FACE. Owner
-report: grass_top.png + grass_side.png + "grass bottom = dirt" in
-aliases.txt still rendered grass as plain colors. Root cause: a mode
-only applied when ALL its files existed (the README's own example was
-impossible), so grass had no complete side-uniform set -> entirely
-plain, and the alias then textured only the rarely-visible bottom face.
-Fix: per-face resolution - each face independently uses the first of
-its candidate files that exists (top/bottom: _top/_bottom then the
-uniform file; side faces: the custom name, then _side, then uniform);
-unresolved faces stay plain or take an alias. The startup log now says
-per type "N files, M/6 faces (missing: bottom ...)" so gaps point at
-their fix. Pure logic (suffix chains, face-name mapping, alias-source
-resolution) moved to voxel/VoxelTextures.hpp and unit tested incl. the
-exact reported scenario. README/header docs updated. Validated: both
-builds warning-free, ctest green, smoke ok.
+## Where the tree stands (pass 63)
 
-Pass 27 (first of the fix-one-by-one round): STREAMING PRIORITY WAS
-BACKWARDS. The pump stocks m_genRequests by iterating the sorted
-pending list in reverse (best first), but the workers popped the BACK -
-so the best coords sat at the FRONT forever while every top-up
-(appended at the back, always a little worse) was generated first: the
-nearest, in-frustum chunks appeared dead last after every region move.
-Fix: the workers consume the FRONT (strict FIFO in descending
-priority). streamPriority() extracted to src/vulkan/StreamPriority.hpp
-(glm-free) and pinned by testStreamPriority, including a full
-pump/worker queue simulation (old behavior: 26 priority inversions;
-fixed: 0). Validated: both builds warning-free, ctest green, smoke ok.
-
-Note for the fix round: each fix = one pass = one commit, owner
-verifies before the next.
-
-Owner's stated next step after the shadow saga: their benchmark /
-optimization work (tips delivered in pass 20).
-
-Pass 30 (first optimization pass, owner-requested): HIERARCHICAL DDA.
-New per-chunk "block max" atlas: one u16 per 8x8 block of columns = the
-MAX column bound in the block (kHeightBlockVoxels in voxel/VoxelTypes.hpp
-== kBlockVoxels in the shader; 0 = all-air block), packed two per u32,
-8 words per 32x32 slot, uploaded with each chunk (binding 11, the slot
-freed by the light-grid revert). In the march's column loop: on entering
-a new block, one fetch decides whether the ray provably stays above
-every column of the block until it exits - if so the whole block is
-crossed with branchless ALU-only DDA steps (no chunk-table resolve, no
-column-height fetch, no Y-walk per column). Safety: block exit
-mid-column resumes exactly at the exit t; a re-entry guard handles
-ulp-level boundary misses (stops skipping that block, normal column
-logic advances out); kNoHeightData blocks are never skipped. The skip
-condition implies each skipped column's own air-skip condition, so the
-image is bit-identical. CPU mirror traceHier + 3-way parity
-(old/new/hierarchical, 6000 rays x 2 worlds) green; iteration counts:
-world 0 84,033 -> 36,259 (-57%), world 1 69,924 -> 33,668 (-52%).
-Block-map packing unit tests added (single-block chunk, 9x9 round-up,
-generated 32x32 chunks vs ground truth).
-
-Pass 31 (owner-requested, for Nsight profiling): SPIR-V DEBUG INFO IN
-DEBUG BUILDS ONLY. cmake/Shaders.cmake now passes glslangValidator -g in
-Debug (embeds the GLSL source + line tables: 753 OpLine, full source
-text, 143 KB vs 79 KB) and -g0 (glslang's default = strip) in every
-other config - the flag list is never empty because an empty
-generator-expression argument leaks as a literal "" file argument under
-Ninja/VERBATIM and fails the compile. -g0 is a true no-op: release
-SPIR-V is byte-identical to a flag-less compile (verified by hash).
-Debug spv loads fine on a real driver (offscreen smoke). To profile:
-configure a Debug build dir and run it under Nsight Graphics (Shader
-Profiler activity) - the exe picks up the debug spv from its own
-resources/shaders. scripts/spirv_dbg.py inspects a spv for debug
-opcodes. Note for the optimization hunt: finishRegionMove() still never
-clears m_streamActive (the pass-13 bug, lost in the reverts), so the
-pump re-runs the full region-table publish every frame AT REST - a
-likely CPU-side constant cost; fix parked in 20ca086 as the next pass.
-
-Pass 32 (owner-directed, from the first Nsight profile): KILL THE INTEGER
-DIVISIONS + FIX THE STUCK STREAM FLAG. Nsight showed floorDiv's first two
-lines ('/' and '%') as the #1/#2 hotspots (14% + 12%) and resolveColumn's
-bounds check right behind. Three changes, image bit-identical:
-1) floorDiv power-of-two fast path: every divisor here is pow2 (chunk 32,
-block 8), and arithmetic >> log2(b) IS floor division for two's
-complement (SPIR-V OpShiftRightArithmetic is sign-extending by spec;
-identity pinned by a new CPU test). SPIR-V check: OpSDiv 5->1, OpUDiv
-3->1 (survivors = generic fallback + far-hole debug), shift count up.
-2) resolveColumn hoisted to ONCE per column in the march: the block
-bound, height bound and Y-walk all reuse the slot/local pair
-(columnHeightAt/blockHeightAt take the resolved pair; the old
-columnHeightBound/blockHeightBound re-resolved per call - 2-3
-resolveColumns per column). Shadow march ditto. The Y-walk's
-voxelTypeAt fallback for unresolved columns was always-0 dead work -
-unresolved columns now skip the walk entirely. Block-grid math in the
-shader now rounds UP like the CPU builder (no behavior change at 32).
-3) finishRegionMove() now adopts m_streamTarget as m_regionCenter and
-clears m_streamActive (pass-13 fix, lost in the reverts): without it the
-pump re-ran the full finish path EVERY FRAME AT REST, and m_regionCenter
-stayed pinned to the last synchronous rebuild (stale fog-cut box with
-far-LOD off + far-seam patch scan off-center after streamed moves).
-Validated: CPU parity 3-way unchanged, both builds warning-free, ctest
-green x2, smoke x2.
+- Passes 39-58 are verified on-device. Pass 54 (one-voxel march step cap) and
+  pass 55 (direction jitter) were rejected and are not in the tree; pass 56's
+  origin-jitter mechanism and pass 57's distance-flat rule are the shipped
+  shadow work, with the default at the owner's own pick (`--shadow-jitter
+  0.002`).
+  Waiting for their on-device check: pass 59 (the shader rename), pass 61 (the
+  command line), pass 62 (the ambient) and pass 63 (its sampling fix).
+- **Ambient (passes 62-63)**: on by default; `--no-ambient` is the pre-62
+  control, and the ambient is view-independent - the pass-62 branch of the
+  shader never reads the view ray (a test pins that). Sky visibility =
+  (6-azimuth horizon scan over the near column heights + 2 SDF rays) / 8, plus
+  `--ambient-floor`. It has NO notion of the sun's azimuth: it is sky openness,
+  not shadowing (the sun term is the `ndl * shadow` beside it). The mirror the
+  tests march against is `tests/ambient_mirror.hpp` - change the shader and the
+  mirror together (the suite pins both).
+- **Do not read the height atlas at the nearest column** (pass 63): it makes the
+  term a step function of position, and at distance a sub-voxel camera move
+  flips the sample - measured as 3.5% of the value moving per 0.05-voxel step
+  against 0.4% with bilinear reads and the d = 1 sample dropped (the pre-62
+  view-ray formula measured 0.9%). `probes/probe_ambient_crawl.cpp` (new in
+  pass 63: `--shimmer` prints that table, `--diff` renders the crawl amplified,
+  `--term` isolates one lighting term) is the tool for any future "it shimmers"
+  report.
+- **The shipped terrain has no caves, overhangs or tunnels** (measured, pass 62:
+  56k+ columns in six regions plus a 17-voxel sweep over +/-1200 voxels, zero air
+  cells under a solid top - the density warp folds the surface, it does not put
+  rock over air). "Cave" acceptance has to be judged on the darkest notch the
+  terrain has (scan mean 0.093), not on a roof; the SDF rays are the half of the
+  design that would matter if a roof ever exists.
+- SDF soft shadows remain an **experiment** behind `--sdf-shadows`. The exact
+  binary sun march is the reference and must stay bit-identical.
+- The SDF bake runs on a background thread (~57 ms of worker time on the owner's
+  terrain, pass 53) and the box follows the camera within `--sdf-margin` chunks.
+- Dead ends, measured — do not re-propose without new evidence: Aaltonen
+  triangulation, the footprint/epsilon threshold, both minimum-penumbra forms,
+  the post-loop penumbra floor, h-averaging, the pass-54 step cap, the pass-55
+  fixed-cell direction jitter, P4's sliding rebuild. Details in `docs/PASSES.md`.
+- **Switches are command-line flags since pass 61** (`--sdf-shadows`,
+  `--shadow-jitter`, …); the `VV_*` variables remain as a fallback. See the
+  table above.
+- Next feature work, proposed and not scheduled: the GPU SDF bake
+  (`docs/UPGRADE_PROPOSALS.md` §2). The ambient proposal (§1) shipped as pass 62.

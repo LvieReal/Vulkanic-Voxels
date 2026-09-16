@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "core/CommandLine.hpp"
+
 #include <optional>
 #include <set>
 #include <string>
@@ -229,11 +231,11 @@ VkPresentModeKHR choosePresentMode(
     return std::find(modes.begin(), modes.end(), m) != modes.end();
   };
 
-  // VV_PRESENT=immediate|mailbox|fifo overrides the preference (must still
-  // be supported by the surface; otherwise ignored). "fifo" restores
-  // vsync.
-  if (const char* env = std::getenv("VV_PRESENT")) {
-    const std::string requested = env;
+  // --present immediate|mailbox|fifo overrides the preference (must still be
+  // supported by the surface; otherwise ignored - a missing mode must not stop
+  // the game). "fifo" restores vsync.
+  const std::string requested = vv::core::options().present;
+  if (!requested.empty()) {
     VkPresentModeKHR mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
     if (requested == "immediate") {
       mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
@@ -262,15 +264,27 @@ VkPresentModeKHR choosePresentMode(
 
 VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities,
                             uint32_t width, uint32_t height) {
-  if (capabilities.currentExtent.width != UINT32_MAX) {
+  // A surface is allowed to have no size at all: a minimized window reports
+  // currentExtent == (0, 0) on Win32 (the surface still reports an extent, so
+  // the UINT32_MAX test below does not catch it). vkCreateSwapchainKHR rejects
+  // a zero extent (VUID-VkSwapchainCreateInfoKHR-imageExtent-01689), so that
+  // case falls through to the clamped requested size instead of being handed
+  // to the driver.
+  if (capabilities.currentExtent.width != UINT32_MAX &&
+      capabilities.currentExtent.width > 0 &&
+      capabilities.currentExtent.height > 0) {
     return capabilities.currentExtent;
   }
 
+  // Clamped into what the surface supports, and never zero: a surface that
+  // reports minImageExtent (0, 0) is not usable, but no driver may be handed
+  // an extent of zero either.
   VkExtent2D actual{};
-  actual.width = clampU32(width, capabilities.minImageExtent.width,
+  actual.width = clampU32(width, std::max(1u, capabilities.minImageExtent.width),
                           capabilities.maxImageExtent.width);
-  actual.height = clampU32(height, capabilities.minImageExtent.height,
-                           capabilities.maxImageExtent.height);
+  actual.height =
+      clampU32(height, std::max(1u, capabilities.minImageExtent.height),
+               capabilities.maxImageExtent.height);
   return actual;
 }
 

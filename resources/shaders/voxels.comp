@@ -1,0 +1,2112 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Push constants must match vv::render::PushConstants in
+// src/render/SceneData.hpp.
+layout(push_constant) uniform Push {
+    uvec4 screen;   // x=width, y=height, z=bgra, w=frame
+    vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance);
+                    // w = VV_SHADOW_JITTER: the shadow-ray jitter's CONE
+                    // SLOPE (< 0 = unset, so kShadowJitterDefault applies;
+                    // 0 = jitter off, bit-identical to the un-jittered ray)
+    uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
+    vec4 voxelSize; // xyz=voxel size in world units
+    ivec4 region;   // x,z = region origin (min corner) in chunk coords;
+                    // w = chunk-table half index (ping-pong upload buffer)
+    uvec4 grid;     // x=gridWidth, y=gridHeight, z=slot stride (u32 words),
+                    // w=max terrain voxel y (sky-skip ceiling; MUST be a true
+                    // upper bound on solid terrain or the sky-skip early-out
+                    // clips real terrain into noisy contour rings)
+    ivec4 far;      // x,y = far-LOD min corner (voxel X/Z), z,w = cell dims;
+                    // z = 0 means far LOD is off
+    vec4 farParams; // x = far cell footprint in voxels;
+                    // y = far-field half index (ping-pong upload buffer)
+} pc;
+
+// Voxel atlas: all loaded chunks; each slot holds one chunk's voxel types
+// (one byte per type) packed 4-per-uint32 in X + Y*chunkX + Z*chunkX*H order.
+layout(set = 0, binding = 0) readonly buffer Voxels {
+    uint data[];
+} voxels;
+
+layout(set = 0, binding = 1) writeonly buffer OutPixels {
+    uint outData[];
+} outPixels;
+
+layout(std140, set = 0, binding = 2) uniform Scene {
+    vec4 camPos;
+    vec4 camForward;
+    vec4 camRight;
+    vec4 camUp;
+    vec4 lightDir;
+    vec4 lightColor;
+    vec4 skyLow;
+    vec4 skyHigh;
+    vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = SDF shadows
+    vec4 ambient; // x = ambient sky-visibility term on/off (pass 62; 0 =
+                  // the pre-62 view-ray formula, bit for bit); y = the cave
+                  // floor (minimum sky fraction, < 0 = kAmbientFloorDefault)
+} scene;
+
+// Chunk table: one u32 atlas slot index per region grid cell
+// (row-major over gridWidth x gridHeight, relative to pc.region origin).
+layout(set = 0, binding = 3) readonly buffer ChunkTable {
+    uint slots[];
+} chunkTable;
+
+// Voxel palette: per-type, per-face base colors, uploaded from
+// vv::voxel::kVoxelTypeInfo (entry order = VoxelType enum order). This flat
+// palette is a placeholder - the plan is to replace it with a bindless
+// texture array so each voxel type gets real albedo textures.
+layout(set = 0, binding = 4) readonly buffer VoxelPalette {
+    vec4 top[8];
+    vec4 side[8];
+    vec4 bottom[8];
+} palette;
+
+// Column height atlas (air-skip): per chunk slot, one u16 per voxel column
+// holding (highest solid voxel Y + 1; 0 = all-air), packed two-per-u32
+// (column i even -> low half), row-major over X + Z*chunkSizeX. Slot stride
+// in words = (chunkSizeX * chunkSizeZ + 1) / 2 (sync contract with
+// VoxelResources::heightSlotWordStride / Chunk::heightMapWordStride).
+layout(set = 0, binding = 5) readonly buffer ColumnHeights {
+    uint data[];
+} heights;
+
+// Far-LOD height field: one u32 per coarse cell = (u16 max-solid height + 1
+// in the low half) | (u8 surface voxel type in bits 16..23), row-major over
+// X + Z * dim. Covers voxel space [pc.far.xy, pc.far.xy + pc.far.zw *
+// farParams.x). Built by vv::terrain::FarField on a background thread.
+layout(set = 0, binding = 6) readonly buffer FarLod {
+    uint cells[];
+} farLod;
+
+// Per-slot fade-in alphas (1.0 = opaque). Written by the CPU every
+// frame; a hit inside a chunk whose alpha < 1 is composited against
+// whatever the ray finds BEHIND that chunk (far LOD, another chunk or
+// sky) - see the near march.
+layout(set = 0, binding = 7) readonly buffer ChunkFade {
+    float alpha[];
+} chunkFade;
+
+// Bindless voxel textures (passes 20/21): one image per texture FILE
+// (loaded from resources/textures/voxels; NO atlas). The array is
+// indexed through the per-type face table (binding 10); the sampled
+// image is the face's ALBEDO when the type has files, and types
+// without files fall back to the palette colors (voxelColor). The
+// sampler (binding 9) is REPEAT (world-space UVs tile it per voxel)
+// with NEAREST texel filtering and linear mip blends; the LOD is
+// explicit because ray divergence makes derivatives useless in a
+// marcher.
+layout(set = 0, binding = 8) uniform texture2D
+    voxelTextures[48];  // = kMaxVoxelTextures (voxel/VoxelTextures.hpp)
+layout(set = 0, binding = 9) uniform sampler voxelSampler;
+
+// Per-type face table: 8 u32 per VoxelType. Words 0..5 = image index
+// for face id 0..5 (0 = +Y top, 1 = -Y bottom, 2 = +X back, 3 = -X
+// front, 4 = +Z right, 5 = -Z left);
+// 0xFFFFFFFF = no texture for that face (palette color). Word 6 =
+// nominal texture size (the explicit-LOD estimate), word 7 unused.
+layout(set = 0, binding = 10) readonly buffer VoxelTexInfo {
+    uint perType[];
+} voxelTexInfo;
+
+// Block max-height atlas (pass 30 hierarchical DDA): per chunk slot, one
+// u16 per kBlockVoxels^2 block of columns = the MAX column bound in the
+// block (0 = whole block air), packed two per u32 (block i even -> low
+// half), blockX + blockZ * blocksPerChunkX layout. Built by
+// Chunk::blockHeightMapWords and uploaded with each chunk.
+const int kBlockVoxels = 8;  // sync with vv::voxel::kHeightBlockVoxels
+const int kBlockShift = 3;  // log2(kBlockVoxels), same sync contract
+layout(set = 0, binding = 11) readonly buffer BlockHeights {
+    uint data[];
+} blockHeights;
+
+// 3D voxel SDF (pass 38, the VV_SDF_SHADOWS=1 rewrite): the NEAREST SOLID
+// CELL (argmin seed) for every cell of a camera-centered box, from a
+// two-pass chamfer distance transform built on the CPU
+// (vv::voxel::SdfField) and uploaded as one u32 per cell,
+// x + y*sdfDim.x + z*sdfDim.x*sdfDim.y layout (0xFFFFFFFF = no solid in the
+// box's view). The shader converts the seed to its cell and takes the L2
+// distance to that solid CUBE (exactly 0 inside the solid, >0 in air) - the
+// proper 3D SDF, so the sphere trace below softens the shadow edges running
+// along vertical/steep casters (the 2.5D top-plane model has no data for a
+// side face). Rebuilt on a background thread per region change; the box
+// geometry is published via the SdfBox uniform (binding 13) because the
+// async build can lag the camera by a chunk.
+layout(set = 0, binding = 12) readonly buffer SdfField {
+    uint seed[];
+} sdfField;
+
+layout(std140, set = 0, binding = 13) uniform SdfBox {
+    ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
+    uvec4 dims;   // xyz = box size in cells, w = the live half's base cell
+                  // offset in the seed buffer (pass 49)
+    uvec4 seedBits;  // xyz = bits per axis of the packed seed cell:
+                     // x | (y << seedBits.x) | (z << (seedBits.x + seedBits.y))
+                     // (pass 50 - the CPU picks the smallest widths that hold
+                     // the box's spans, and the three together always fit 31
+                     // bits, so an encoded cell can never be 0xFFFFFFFF)
+} sdfBox;
+
+
+// The far field is double-buffered; farParams.y selects the half (see
+// the table comment above - same swap-without-waits scheme).
+uint farBase()
+{
+    return uint(pc.farParams.y) * (uint(pc.far.z) * uint(pc.far.w));
+}
+
+
+const uint kEmptySlot = 0xFFFFFFFFu;
+// Heightmap sentinel: column not loaded -> no bound known, force the exact
+// cell walk (never skips, so it can never hide solid geometry).
+const uint kNoHeightData = 0xFFFFu;
+
+// Fog contract (must match VulkanRenderer::fogCutDistance):
+//   pc.camera.y = 1 / cutDistance, where cutDistance is the distance from
+//   the camera to the NEAREST SIDE FACE of the loaded chunk region.
+//   fog(d) = 1 - exp(-kFogTail * (d / cutDistance)^kFogExp)
+//      -> 99.8% opaque exactly at d = cutDistance; rays are cut there.
+//   Because any ray's region exit lies at >= the perpendicular distance to
+//   the face it crosses (>= cutDistance), budget-, region- and fog-cut
+//   terminations all happen where the fog is >= 99.8% opaque - the region
+//   boundary is invisible from every direction. (Cutting at the full region
+//   WIDTH instead leaves the near faces at ~half that distance UNfogged:
+//   that was the "noisy rings + cropping" bug.)
+const float kFogTail = 6.215;  // -ln(0.002)
+const float kFogExp = 4.0;     // steep ramp: clear mid-distance, wall at cut
+
+// Ray-termination causes (VV_DEBUG_TERM=1 false-colors miss pixels).
+const int TERM_HIT = 0;
+const int TERM_BUDGET = 1;      // red:   step budget exhausted (should never win)
+const int TERM_REGION_EXIT = 2; // green: left the loaded region
+const int TERM_FOG_CUT = 3;     // blue:  fog distance cut (the normal end)
+const int TERM_SKY_SKIP = 4;    // magenta: whole segment above all terrain
+const int TERM_ASCEND = 5;      // yellow: rising above all terrain mid-trace
+const int TERM_NO_REGION = 6;   // dark:  ray misses the region entirely
+
+vec3 termColor(int cause)
+{
+    if (cause == TERM_BUDGET) {
+        return vec3(1.0, 0.0, 0.0);
+    }
+    if (cause == TERM_REGION_EXIT) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    if (cause == TERM_FOG_CUT) {
+        return vec3(0.1, 0.4, 1.0);
+    }
+    if (cause == TERM_SKY_SKIP) {
+        return vec3(1.0, 0.0, 1.0);
+    }
+    if (cause == TERM_ASCEND) {
+        return vec3(1.0, 1.0, 0.0);
+    }
+    return vec3(0.1, 0.1, 0.15);
+}
+
+// Division rounding towards negative infinity (GLSL '/' truncates).
+// Power-of-two fast path: every divisor here is a power of two (chunk
+// sizes 32, block size 8), and an arithmetic right shift by log2(b) IS
+// floor division for two's-complement integers (SPIR-V
+// OpShiftRightArithmetic is sign-extending by spec) - one instruction
+// instead of the two emulated integer divisions ('/' plus '%') that
+// made floorDiv's first two lines the #1 and #2 shader hotspots in
+// Nsight (14% + 12% of the frame). Pinned on the CPU side by the
+// floorDiv-shift identity test.
+int floorDiv(int a, int b)
+{
+    if ((b & (b - 1)) == 0) {
+        return a >> findLSB(b);
+    }
+    int q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) {
+        --q;
+    }
+    return q;
+}
+
+// Resolves a global voxel column to its atlas slot + chunk-local (x, z).
+// False when outside the loaded region or in an empty slot.
+bool resolveColumn(int voxX, int voxZ, out uint slot, out ivec2 local)
+{
+    const int chunkX = int(pc.chunkSize.x);
+    const int chunkZ = int(pc.chunkSize.z);
+
+    const ivec2 cc = ivec2(floorDiv(voxX, chunkX), floorDiv(voxZ, chunkZ));
+    const ivec2 gridLocal = cc - pc.region.xz;
+    if (any(lessThan(gridLocal, ivec2(0))) ||
+        any(greaterThanEqual(gridLocal, ivec2(pc.grid.xy)))) {
+        return false;
+    }
+
+    // The chunk table is triple-buffered; region.w selects the half. A
+    // swap only writes the half no in-flight frame reads, then flips the
+    // index - no device wait needed (see VulkanRenderer::finishRegionMove).
+    const uint tableBase = uint(pc.region.w) * (pc.grid.x * pc.grid.y);
+    slot = chunkTable.slots[tableBase + uint(gridLocal.x) +
+                            uint(gridLocal.y) * pc.grid.x];
+    if (slot == kEmptySlot) {
+        return false;
+    }
+    local = ivec2(voxX - cc.x * chunkX, voxZ - cc.y * chunkZ);
+    return true;
+}
+
+// Voxel type at a packed atlas index (within one chunk slot).
+uint fetchVoxel(uint slot, uint idx)
+{
+    const uint word = voxels.data[slot * pc.grid.z + (idx >> 2u)];
+    return (word >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// Height bound for an ALREADY-RESOLVED column (see resolveColumn):
+// highest solid voxel Y + 1 (0 = all air). The marches resolve a column
+// once and feed the slot/local pair to this, the block bound and the
+// Y-walk fetches (pass 32: resolveColumn used to run 2-3x per column -
+// each with two integer divisions inside floorDiv).
+uint columnHeightAt(uint slot, ivec2 local)
+{
+    const uint heightStride =
+        (pc.chunkSize.x * pc.chunkSize.z + 1u) >> 1u;
+    const uint col = uint(local.x) + uint(local.y) * pc.chunkSize.x;
+    const uint word = heights.data[slot * heightStride + (col >> 1u)];
+    return ((col & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
+}
+
+// Max height bound over the kBlockVoxels^2 block of columns containing
+// the ALREADY-RESOLVED column (local.x, local.y) (pass 30 + 32): the
+// max column bound in the block, so a ray staying at/above it provably
+// clears EVERY column of the block. The block grid rounds UP per axis
+// like the CPU builder (Chunk::blockHeightWordStride); shifts replace
+// the divisions (local is always in [0, size)).
+uint blockHeightAt(uint slot, ivec2 local)
+{
+    const int blocksX =
+        (int(pc.chunkSize.x) + kBlockVoxels - 1) >> kBlockShift;
+    const int blocksZ =
+        (int(pc.chunkSize.z) + kBlockVoxels - 1) >> kBlockShift;
+    const uint blockStride = (uint(blocksX * blocksZ) + 1u) >> 1u;
+    const uint blk = (uint(local.x) >> kBlockShift) +
+                     (uint(local.y) >> kBlockShift) * uint(blocksX);
+    const uint word = blockHeights.data[slot * blockStride + (blk >> 1u)];
+    return ((blk & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16u);
+}
+
+// Voxel type at a global (possibly negative) voxel coordinate. Returns 0
+// (air) for anything outside the loaded region, in an empty slot, or
+// outside the world's Y range.
+uint voxelTypeAt(ivec3 cell)
+{
+    uint slot = 0u;
+    ivec2 local = ivec2(0);
+    if (!resolveColumn(cell.x, cell.z, slot, local)) {
+        return 0u;
+    }
+    if (cell.y < 0 || cell.y >= int(pc.chunkSize.y)) {
+        return 0u;
+    }
+    const uint idx = uint(local.x) + uint(cell.y) * pc.chunkSize.x +
+                     uint(local.y) * (pc.chunkSize.x * pc.chunkSize.y);
+    return fetchVoxel(slot, idx);
+}
+
+bool intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tmin, out float tmax, out vec3 enterNormal)
+{
+    vec3 inv = 1.0 / rd;
+    vec3 t0 = (bmin - ro) * inv;
+    vec3 t1 = (bmax - ro) * inv;
+    vec3 tsmaller = min(t0, t1);
+    vec3 tbigger = max(t0, t1);
+
+    tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+    tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
+
+    // Determine which face we enter through (axis of tmin).
+    // Normal points outward from the box.
+    enterNormal = vec3(0.0);
+    if (tsmaller.x >= tsmaller.y && tsmaller.x >= tsmaller.z) {
+        enterNormal = (t0.x < t1.x) ? vec3(-1.0, 0.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    } else if (tsmaller.y >= tsmaller.z) {
+        enterNormal = (t0.y < t1.y) ? vec3(0.0, -1.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    } else {
+        enterNormal = (t0.z < t1.z) ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 0.0, 1.0);
+    }
+    return tmax >= max(tmin, 0.0);
+}
+
+// The far field is a height field, so it is only meaningful inside the
+// world's vertical slab. Keeping this interval separate from the near-box
+// interval is important when the camera is below bedrock: a downward ray can
+// miss the near box entirely, but must not be allowed to query a far surface
+// at t = 0 and turn the underground sky into a grass-colored hit.
+bool worldYInterval(vec3 ro, vec3 rd, out float tEnter, out float tExit)
+{
+    const float yMin = 0.0;
+    const float yMax = float(pc.chunkSize.y);
+    if (abs(rd.y) < 1e-6) {
+        if (ro.y < yMin || ro.y > yMax) {
+            tEnter = 1.0;
+            tExit = 0.0;
+            return false;
+        }
+        tEnter = -1e30;
+        tExit = 1e30;
+        return true;
+    }
+    const float a = (yMin - ro.y) / rd.y;
+    const float b = (yMax - ro.y) / rd.y;
+    tEnter = min(a, b);
+    tExit = max(a, b);
+    return tExit >= max(tEnter, 0.0);
+}
+
+// Sky WITHOUT the sun: horizon/zenith gradient + haze. This is what
+// terrain shading and fog use - ambient, rim and the fog target must never
+// show the sun disc/glow through voxels (the pass-5 port fused them and
+// the sun bled through mountains toward the sun; the WGSL reference keeps
+// them separate: compute_env returns .sky and .sun, and trace_voxel's
+// ambient/rim take only .sky).
+vec3 skyBaseColor(vec3 rd)
+{
+    float up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+    float horizon = pow(1.0 - abs(rd.y), 3.0);
+
+    vec3 sky = mix(scene.skyLow.xyz, scene.skyHigh.xyz, smoothstep(0.0, 1.0, up));
+    vec3 haze = vec3(1.0, 0.95, 0.9) * (0.12 * horizon + 0.04 * horizon * horizon);
+    return sky + haze;
+}
+
+// Full sky for TRUE sky pixels (miss rays) only: adds the sun glow + core.
+vec3 skyColor(vec3 rd)
+{
+    vec3 sunDir = normalize(scene.lightDir.xyz);
+    float sunAmount = max(dot(rd, sunDir), 0.0);
+    float sunGlow = pow(sunAmount, 48.0) * 0.8;
+    float sunCore = pow(sunAmount, 512.0) * 8.0;
+    return skyBaseColor(rd) + scene.lightColor.xyz * (sunGlow + sunCore);
+}
+
+vec3 voxelColor(uint type, vec3 normal)
+{
+    uint t = min(type, 7u);
+    if (normal.y > 0.5) {
+        return palette.top[t].rgb;
+    }
+    if (normal.y < -0.5) {
+        return palette.bottom[t].rgb;
+    }
+    return palette.side[t].rgb;
+}
+
+// Per-vertex simulated ambient occlusion (ported from the user's WGSL
+// reference renderer). vertexAO: corner darkening from the two edge
+// neighbors + the diagonal corner neighbor; both edges solid -> fully
+// occluded regardless of the corner.
+float vertexAO(bool side1, bool side2, bool corner)
+{
+    if (side1 && side2) {
+        return 0.0;
+    }
+    return 1.0 - ((side1 ? 1.0 : 0.0) + (side2 ? 1.0 : 0.0) +
+                  (corner ? 1.0 : 0.0)) / 3.0;
+}
+
+// Simulated per-vertex AO on the hit face: samples the 8 voxels
+// surrounding the face in the plane one cell out along the normal,
+// evaluates vertexAO at the 4 face corners and bilinearly blends them by
+// the hit position's fractional location on the face. voxelTypeAt treats
+// unloaded cells as air, so AO fades out only where the fog already hides
+// everything.
+float calculateAO(ivec3 voxel, vec3 n, vec3 hitPos)
+{
+    if (dot(abs(n), vec3(1.0)) < 0.5) {
+        return 1.0;
+    }
+
+    const ivec3 p = voxel + ivec3(n);
+    ivec3 du;
+    ivec3 dv;
+    vec2 localPos;
+    const vec3 absN = abs(n);
+    const vec3 fractPos = fract(hitPos);
+
+    if (absN.x > 0.5) {
+        du = ivec3(0, 0, 1);
+        dv = ivec3(0, 1, 0);
+        localPos = fractPos.zy;
+    } else if (absN.y > 0.5) {
+        du = ivec3(1, 0, 0);
+        dv = ivec3(0, 0, 1);
+        localPos = fractPos.xz;
+    } else {
+        du = ivec3(1, 0, 0);
+        dv = ivec3(0, 1, 0);
+        localPos = fractPos.xy;
+    }
+
+    const bool sMinusU = voxelTypeAt(p - du) != 0u;
+    const bool sPlusU = voxelTypeAt(p + du) != 0u;
+    const bool sMinusV = voxelTypeAt(p - dv) != 0u;
+    const bool sPlusV = voxelTypeAt(p + dv) != 0u;
+
+    const bool cMM = voxelTypeAt(p - du - dv) != 0u;
+    const bool cPM = voxelTypeAt(p + du - dv) != 0u;
+    const bool cMP = voxelTypeAt(p - du + dv) != 0u;
+    const bool cPP = voxelTypeAt(p + du + dv) != 0u;
+
+    const float ao00 = vertexAO(sMinusU, sMinusV, cMM);
+    const float ao10 = vertexAO(sPlusU, sMinusV, cPM);
+    const float ao01 = vertexAO(sMinusU, sPlusV, cMP);
+    const float ao11 = vertexAO(sPlusU, sPlusV, cPP);
+
+    return ao00 * (1.0 - localPos.x) * (1.0 - localPos.y) +
+           ao10 * localPos.x * (1.0 - localPos.y) +
+           ao01 * (1.0 - localPos.x) * localPos.y +
+           ao11 * localPos.x * localPos.y;
+}
+
+// Sun visibility at a hit position (voxel space): marches a ray toward the
+// sun through the same two-tier world - near columns via the height atlas
+// (exact voxels only where the bound says a blocker can be), far cells
+// beyond. Cheap because the sun is high: the ray ascends past all terrain
+// within a few dozen columns and the march ends there. Returns 1.0 lit /
+// 0.0 shadowed.
+// One exact binary shadow ray (the original march, parameterized by
+// direction): ascending column DDA + height-bound voxel walk, coarse
+// far cells beyond the near region. Pinned by the CPU parity mirror in
+// tests/terrain_world_tests.cpp - do not refactor blindly.
+bool sunRayEscapes(vec3 origin, vec3 sunV)
+{
+    if (sunV.y <= 0.05) {
+        return true;  // low/sunset sun: no cheap ascend bound, skip
+    }
+    const float EPS = 1e-6;
+    const float maxTerr = float(pc.grid.w) + 1.0;
+    int sStepX = (sunV.x > 0.0) ? 1 : -1;
+    int sStepZ = (sunV.z > 0.0) ? 1 : -1;
+    float sMaxX = 1e30;
+    float sMaxZ = 1e30;
+    float sDeltaX = 1e30;
+    float sDeltaZ = 1e30;
+    ivec2 col = ivec2(floor(origin.xz));
+    if (abs(sunV.x) > EPS) {
+        const float nextX = float(col.x + ((sStepX > 0) ? 1 : 0));
+        sMaxX = (nextX - origin.x) / sunV.x;
+        sDeltaX = abs(1.0 / sunV.x);
+    } else {
+        sStepX = 0;
+    }
+    if (abs(sunV.z) > EPS) {
+        const float nextZ = float(col.y + ((sStepZ > 0) ? 1 : 0));
+        sMaxZ = (nextZ - origin.z) / sunV.z;
+        sDeltaZ = abs(1.0 / sunV.z);
+    } else {
+        sStepZ = 0;
+    }
+
+    const float farCell = pc.farParams.x;
+    const ivec2 farDim = pc.far.zw;
+    const vec2 farOrigin = vec2(pc.far.xy);
+    float s = 0.0;  // world-unit parameter along sunV
+
+    // A high sun lifts the ray above maxTerrain quickly; 256 columns covers
+    // every realistic caster (and bounds the worst case for low suns).
+    for (int i = 0; i < 256; ++i) {
+        const float sExit = min(sMaxX, sMaxZ);
+        const float y0 = origin.y + sunV.y * s;       // ascending (sun up)
+
+        if (y0 >= maxTerr) {
+            return true;  // above all possible terrain: lit from here on
+        }
+
+        uint slot = 0u;
+        ivec2 local = ivec2(0);
+        if (resolveColumn(col.x, col.y, slot, local)) {
+            // Near region: the height bound says whether a blocker can
+            // exist in this column at all.
+            const uint bound = columnHeightAt(slot, local);
+            if (bound != kNoHeightData && float(bound) > y0) {
+                // Walk only the cells the segment occupies below the bound
+                // (ascending: from the entry cell up).
+                const float y1 = origin.y + sunV.y * sExit;
+                const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
+                                     int(pc.chunkSize.y) - 1);
+                const uint colBase = uint(local.x) +
+                                     uint(local.y) *
+                                         (pc.chunkSize.x * pc.chunkSize.y);
+                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
+                    if (fetchVoxel(slot,
+                                   colBase + uint(y) * pc.chunkSize.x) != 0u) {
+                        return false;
+                    }
+                }
+            }
+        } else if (pc.far.z > 0) {
+            // Beyond the near region: coarse far-cell test (conservative
+            // in the blocker's favor; fog hides the coarseness).
+            const ivec2 fc = ivec2(floor((vec2(col) + vec2(0.5) -
+                                          farOrigin) / farCell));
+            if (all(greaterThanEqual(fc, ivec2(0))) &&
+                all(lessThan(fc, farDim))) {
+                const uint packed =
+                    farLod.cells[farBase() + uint(fc.x) +
+                                 uint(fc.y) * uint(farDim.x)];
+                const float h = float(packed & 0xFFFFu);
+                if (h > 0.0 && y0 < h) {
+                    return false;
+                }
+            }
+        }
+
+        // Branchless 2D DDA step (same pattern as the marches).
+        s = min(sMaxX, sMaxZ);
+        const bool takeX = sMaxX < sMaxZ;
+        sMaxX += takeX ? sDeltaX : 0.0;
+        sMaxZ += takeX ? 0.0 : sDeltaZ;
+        col.x += takeX ? sStepX : 0;
+        col.y += takeX ? 0 : sStepZ;
+    }
+    return true;
+}
+
+// Material hook for the SDF shadow experiment. Current voxel materials are
+// opaque. A future leaf/grass-foliage material should return a fractional
+// opacity here: the marcher reads its occupancy, attenuates the ray, and
+// keeps reading occupancy beyond the column instead of treating foliage as
+// a hard decal. Keeping that policy here avoids coupling shadow projection
+// to the primary surface hit and makes foliage a data/material change
+// rather than a new traversal.
+float shadowOpacity(uint type)
+{
+    return type == 0u ? 0.0 : 1.0;
+}
+
+// SDF soft-shadow sharpness: the inverse of the sun's angular size. 8 ~= a
+// 7-degree sun, whose penumbra spans a few voxels (a soft "game sun"); raise
+// it for harder shadows (32 ~= 2 degrees), lower it for softer.
+const float kShadowSharpness = 8.0;
+
+// Pass 57: jitter the shadow ray - a CONE for the penumbra, a fixed world
+// displacement for the contact.
+//
+// The penumbra estimate is a min over DISCRETE samples, so its error is a
+// coherent function of where the shaded point is: neighbouring pixels walk
+// almost the same samples, the error correlates across the surface, and it
+// reads as bands sweeping a penumbra and as a stepped contact (the ray-traced
+// SDF shadow papers, arXiv 2210.06160 and 2210.04449). A per-pixel jitter
+// decorrelates it: the same error becomes noise at one pixel's scale, which
+// the eye integrates, instead of structure.
+//
+// The jitter has to be normalized WHERE THE SHADOW IS FORMED, which is at the
+// caster, a distance t up the ray - not at the shaded point. Pass 56 displaced
+// the origin by one PIXEL OF THE SHADED POINT'S OWN FOOTPRINT, and the owner
+// found the flaw on-device: "noise scales with distance, so up close it's
+// still not enough, and too far it's too much". The footprint grows with the
+// camera distance, so the offset did, and the visibility it feeds moved by
+// k*offset/t - a 22x spread across the 5..400 unit range of the terrain probe
+// (mean |dvis| 0.008 -> 0.167). Tilting the DIRECTION instead moves the sample
+// by slope*t, so the estimate moves by ~k*slope wherever the caster is: the
+// same noise at every distance (the probe measures 0.02-0.03, flat, over that
+// same range). That is pass 55's mechanism with pass 55's handicap removed -
+// pass 55 hashed a FIXED 1/8-voxel cell (the owner: "in small squares"), this
+// hashes the pixel's own footprint, which is one pixel wide at any distance.
+//
+// A cone alone can never move a contact: there the caster is at t ~= 0, so
+// slope*t ~= 0 (the owner's pass-55 report: "at contacts (small penumbra)
+// there's no jitter at all"). The origin therefore keeps a displacement of its
+// own - kShadowJitterFloor VOXELS, a FIXED world distance, deliberately NOT
+// scaled by the footprint, because a repeat of that scaling is the bug above.
+// It is what breaks the contact marching pattern, and it is also what pass 56
+// got right: the displacement slides along the surface, so the displaced
+// origin stays outside it and the ray keeps its t.
+//
+// Why one lever for both: they fix the two ends of the same gradient. The
+// owner's "0.5 is too small, 5 is enough" was the pass-56 lever, a footprint
+// scale - at a typical view its "5" is ~one VOXEL of displacement, so the
+// floor's default is half a voxel with the lever taking it to the cap, and the
+// cone rides along at the same strength.
+//
+// Cost: two hashes (hash13) and a handful of ALU per shadow RAY, against ~174
+// taps; the march's samples, the penumbra form and the exact path below are
+// untouched.
+//
+// VV_SHADOW_JITTER (pc.camera.w) = the CONE SLOPE, so it A/Bs without a
+// rebuild: 0 turns the jitter off and is bit-identical to the un-jittered
+// picture, kShadowJitterDefault is the shipped slope, and the floor scales
+// with it linearly (0.02 voxel at the default, one at slope 0.10) so one
+// number moves both.
+//
+// The default is the owner's on-device pick. Pass 57 shipped 0.05 and he swept
+// the lever on the device: "VV_SHADOW_JITTER=0.002 feels just right, it's
+// enough to hide stepping and bands" - a quarter of the ramp of the old pass-56
+// lever at its "too small" setting, and 25x under the slope the pass-57 probe
+// used to make its measurements.
+const float kShadowJitterDefault = 0.002;  // cone slope, tan of the tilt
+const float kShadowJitterFloor = 0.02;     // contact displacement, voxels
+const float kShadowJitterFloorMax = 1.0;  // ... and never more than a voxel
+
+float shadowJitterSlope()
+{
+    return (pc.camera.w >= 0.0) ? pc.camera.w : kShadowJitterDefault;
+}
+
+// The contact displacement for the current lever: linear in the slope so that
+// 0 stays exactly off, and capped so a large lever cannot throw the ray off
+// its own surface.
+float shadowJitterFloorVox()
+{
+    const float slope = shadowJitterSlope();
+    if (slope <= 0.0) {
+        return 0.0;
+    }
+    return min(kShadowJitterFloor * (slope / kShadowJitterDefault),
+               kShadowJitterFloorMax);
+}
+
+// Hash13 (Dave Hoskins' "hash without sine"): cheap, deterministic, well
+// distributed in 3D. Two calls with different offsets give the two disc
+// parameters.
+float shadowJitterHash(vec3 p)
+{
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+// The shadow ray, jittered: returns the DIRECTION to march (the same length as
+// sunV, because the march's t is a distance) and writes the ORIGIN to start
+// from. The hash cell is the pixel's footprint, so the grain is one pixel
+// across at any distance and stays glued to the surface (a screen-space hash
+// would crawl under the picture as the camera moves; pass 55's fixed 1/8 voxel
+// was several pixels of squares at range). Both components share the drawn
+// azimuth, so this is one jittered ray, not two independent perturbations.
+vec3 shadowRayJitter(vec3 hitPosVox, vec3 n, vec3 sunV, float footprintVox,
+                     out vec3 outOrigin)
+{
+    const float slope = shadowJitterSlope();
+    const float floorVox = shadowJitterFloorVox();
+    outOrigin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    if (slope <= 0.0 || footprintVox <= 0.0) {
+        return sunV;
+    }
+    const float len = length(sunV);
+    const vec3 dir = sunV / max(len, 1e-6);
+    // The pass-56 azimuth: a direction that SLIDES along the surface (the
+    // tangent plane), so a displaced origin can never start inside the solid
+    // it was standing on, and the ray it is added to keeps its t.
+    vec3 tangent = cross(n, dir);
+    if (dot(tangent, tangent) < 1e-8) {
+        tangent = cross(n, vec3(0.0, 0.0, 1.0));
+    }
+    tangent = normalize(tangent);
+    const vec3 bitangent = cross(n, tangent);
+    const vec3 cell = floor(hitPosVox / max(footprintVox, 1e-5));
+    const float u1 = shadowJitterHash(cell);
+    const float u2 = shadowJitterHash(cell + vec3(17.0, 31.0, 7.0));
+    const float magnitude = sqrt(u1);  // sqrt = uniform inside the disc
+    const float phi = 6.2831853 * u2;
+    const vec3 slide = tangent * cos(phi) + bitangent * sin(phi);
+    // The contact displacement: a fixed world distance, along the surface.
+    outOrigin += slide * (floorVox * magnitude);
+    // The cone: the sample moves by `slope * t` at distance t, i.e. the
+    // estimate moves by ~k * slope wherever the caster is - one noise
+    // amplitude for the whole picture instead of one per camera distance. The
+    // tilt is the same azimuth, projected perpendicular to the sun (a tilt
+    // along the sun would only change t, not where the ray points).
+    vec3 tilt = slide - dir * dot(slide, dir);
+    if (dot(tilt, tilt) < 1e-8) {
+        tilt = tangent - dir * dot(tangent, dir);
+    }
+    return normalize(dir + normalize(tilt) * (slope * magnitude)) * len;
+}
+
+
+// One penumbra sample of the SDF soft shadow (technique:
+// iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t.
+// h is the distance from the sample to the closest relevant surface (a
+// column's top plane - the shadow ray is always ascending), t the distance
+// marched so far. Returns the visibility factor to fold into the min
+// (1.0 = no darkening).
+//
+// The article's Aaltonen two-sphere refinement (estimating the closest
+// point from the current distance h and the PREVIOUS sample's distance) was
+// tried and REMOVED: it is only well-conditioned where the distance is
+// changing slowly (h/prev ~= 1, right at the closest approach) and
+// degenerates to a near-vertical cliff at h/prev ~= 2 (the distance doubling
+// in one step). Sampled at every DDA column and folded into the min, that
+// cliff projects a hard straight edge across the lit terrain - the
+// "clamped edge" stripe. The plain estimate is a smooth, well-conditioned
+// function of (h, t), and the dense per-column sampling (every column the
+// ray clears) already resolves the closest approach well within a pixel, so
+// the refinement's light-leak correction is not needed.
+float shadowPenumbra(float h, float t)
+{
+    return clamp(kShadowSharpness * h / max(t, 1e-4), 0.0, 1.0);
+}
+
+// ---- 3D voxel SDF soft shadow (pass 38, the experimental rewrite) -------
+// The proper 3D voxel SDF: a two-pass chamfer distance transform (built on
+// the CPU, vv::voxel::SdfField, uploaded per region change) gives the
+// NEAREST SOLID CELL (argmin seed) for every cell of a camera-centered box.
+// The SDF at a point is the exact L2 distance to the nearest solid CUBE -
+// 0 inside the solid, >0 in air. Unlike the 2.5D top-plane model below, a
+// side face (a vertical cliff) HAS data, so the sphere trace softens the
+// shadow edges running along vertical/steep casters. sdfBox.box.xyz is the
+// box origin in world voxels (w < 0 = no field yet); sdfBox.dims is the box
+// size in cells (w == where the live half starts in the seed buffer).
+// sdfField.seed holds kSdfHalves copies of one u32 per cell; the cell is
+// packed as three bit fields (see sdfBox.seedBits), 0xFFFFFFFF = no solid in
+// the box's view.
+float sdfCubeDistance(vec3 p, vec3 v)
+{
+    // L2 distance from p to the solid cube [v, v+1)^3 (box-local voxels).
+    vec3 d = max(max(v - p, p - (v + 1.0)), 0.0);
+    return length(d);
+}
+
+// Distance to the nearest solid cube at a WORLD-VOXEL point: min over the
+// EIGHT seed cells whose centres surround the point (mirrors
+// SdfField::sampleCorners, the pass-52 sampler; SdfField::sample is the older
+// 3x3x3 form, kept as the reference the tests march against).
+// Large outside the box = open space, nothing left to block the sun.
+float sampleSdf3d(vec3 p)
+{
+    if (sdfBox.box.w < 0)
+        return 1e30;
+    vec3 local = p - vec3(sdfBox.box.xyz);
+    ivec3 c = ivec3(floor(local));
+    if (c.x < 0 || c.x >= int(sdfBox.dims.x) ||
+        c.y < 0 || c.y >= int(sdfBox.dims.y) ||
+        c.z < 0 || c.z >= int(sdfBox.dims.z))
+        return 1e30;
+    const uint nx = sdfBox.dims.x;
+    const uint ny = sdfBox.dims.y;
+    // Pass 42: the field is double-buffered, so a frame always reads the
+    // seeds that belong to the box it is resolving cells against - even while
+    // the next field is already being copied into the other half. dims.w is
+    // the live half's BASE CELL OFFSET in the seed buffer (pass 49: the
+    // halves are strided by the BUFFER's cell count, not by this field's, so
+    // a band-cropped field of a different height cannot overlap the live one).
+    const uint seedBase = sdfBox.dims.w;
+    // Pass 50: shifts and masks instead of the three integer divisions the
+    // seed used to need. The divisions were the hottest lines of the frame in
+    // the owner's Nsight capture (up to 13%), and this decode ran up to 27
+    // times per sphere-trace step.
+    const uint seedMaskX = (1u << sdfBox.seedBits.x) - 1u;
+    const uint seedMaskY = (1u << sdfBox.seedBits.y) - 1u;
+    const uint seedShiftY = sdfBox.seedBits.x;
+    const uint seedShiftZ = sdfBox.seedBits.x + sdfBox.seedBits.y;
+    // Pass 52: the EIGHT cells whose centres surround p - the interpolation
+    // cell of a cell-centred field, floor(p - 0.5) and +1 - instead of the
+    // 3x3x3 block, and the candidates compared as SQUARED distances so a step
+    // pays one sqrt instead of eight. The block's farther cells can hold a
+    // closer solid (that is part of what its min buys), but only for points
+    // already tens of voxels from any surface, where k*h/t is clamped: over
+    // the shipping-style field 88% of samples agree exactly and 12% are above
+    // this min (mean +0.7, worst +12.7 voxels, none below), and 31 k marched
+    // rays move no verdict except 9 (0.0003 mean / 0.075 max visibility), for
+    // 174 taps per ray instead of 593. See SdfField::sampleCorners.
+    // Clamping a corner into the box is exactly equivalent to skipping it: a
+    // duplicate candidate cannot change a min.
+    const ivec3 last = ivec3(nx - 1u, ny - 1u, sdfBox.dims.z - 1u);
+    const ivec3 lo = clamp(ivec3(floor(local - 0.5)), ivec3(0), last);
+    const ivec3 hi = min(lo + 1, last);
+    float bestSq = 1e30;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+                const ivec3 cc = ivec3(dx == 0 ? lo.x : hi.x,
+                                       dy == 0 ? lo.y : hi.y,
+                                       dz == 0 ? lo.z : hi.z);
+                const uint s = sdfField.seed[seedBase + uint(cc.x) + uint(cc.y) * nx +
+                                             uint(cc.z) * nx * ny];
+                if (s == 0xFFFFFFFFu)
+                    continue;
+                const vec3 v = vec3(float(s & seedMaskX),
+                                    float((s >> seedShiftY) & seedMaskY),
+                                    float(s >> seedShiftZ));
+                const vec3 q = clamp(local, v, v + 1.0);
+                const vec3 e = local - q;
+                bestSq = min(bestSq, dot(e, e));
+            }
+        }
+    }
+    if (bestSq >= 1e29)
+        return 1e30;  // no solid among the eight: the value the 27-gather gave
+    return sqrt(bestSq);
+}
+
+// Sphere-traced soft shadow through the 3D SDF (iquilezles rmshadows with a
+// proper SDF; mirrors SdfField::sphereTracedShadow). March the sun ray,
+// step conservatively by the SDF (0.7x so the chamfer over-estimate can
+// never skip a surface), fold k*h/t into the running min. h is the true 3D
+// distance to the solid surface, so every shadow edge shares one continuous
+// penumbra.
+//
+// Pass 40: the field covers only the 6x6 chunks around the camera (-96..96),
+// so a ray that leaves it is NOT in open space - terrain farther out still
+// shadows it, and breaking there left lit leaks / a hard box-edge band (CPU
+// probe: 53 leaked pixels of 2946 and a visible band without the hand-off, 0
+// with it). Leaving the box - or exhausting the 160-step budget while still
+// inside it - hands the rest of the ray to the 2.5D traversal below, which
+// walks the WHOLE region with the exact march's occlusion events. Returns
+// fractional visibility.
+float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
+                       float startVisibility);
+
+float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
+{
+    if (sdfBox.box.w < 0)
+        return 1.0;  // no field yet: fully lit
+    const vec3 lo = vec3(sdfBox.box.xyz);
+    const vec3 hi = lo + vec3(float(sdfBox.dims.x), float(sdfBox.dims.y),
+                              float(sdfBox.dims.z));
+    // Parameter of the box crossing. 0 when the origin already starts
+    // outside: such a ray is the world-space march's business alone.
+    float tExit = 0.0;
+    if (all(greaterThanEqual(origin, lo)) && all(lessThan(origin, hi))) {
+        tExit = 1e30;
+        for (int a = 0; a < 3; ++a) {
+            if (abs(sunV[a]) > 1e-6) {
+                const float face = (sunV[a] > 0.0) ? hi[a] : lo[a];
+                tExit = min(tExit, (face - origin[a]) / sunV[a]);
+            }
+        }
+    }
+    float visibility = 1.0;
+    float t = 0.0;
+    for (int i = 0; i < 160; ++i) {
+        // Hand off exactly at the crossing, not at the first sample past
+        // it: a step (up to 0.7 * h) must not skip a caster sitting in
+        // the strip just outside the box.
+        if (t >= tExit)
+            return sunRayEscapesSdf(origin + sunV * tExit, sunV, tExit,
+                                    visibility);
+        const vec3 p = origin + sunV * t;
+        const float h = sampleSdf3d(p);
+        if (h < 1e-3)
+            return 0.0;  // hit the surface: fully shadowed from here
+        visibility = min(visibility, shadowPenumbra(h, t));
+        t += max(h * 0.7, 0.05);
+    }
+    return sunRayEscapesSdf(origin + sunV * t, sunV, t, visibility);
+}
+
+// SDF soft shadow ray (VV_SDF_SHADOWS=1), the 2.5D top-plane penumbra
+// (pass 34) - the fallback when no 3D SDF field is uploaded yet (the first
+// region before the background build lands, and every frame the field is
+// still building), AND since pass 40 the continuation of the 3D SDF march
+// once that ray leaves the SDF box (see sunRayEscapesSdf3d). The TRAVERSAL
+// is the exact march's ascending column DDA + height-bound cell walk + coarse
+// far cells over the WHOLE region, so nothing the binary march shadows can
+// leak, and the 256-column budget matches it (the old sphere-traced variant
+// stepped by the "SDF" value, crawled at ~0.04 voxels/step near surfaces, and
+// burned its 128-step budget within ~50 voxels). Softness comes from
+// shadowPenumbra, sampled at every column the ray clears, from the distance
+// to that column's top plane. Returns fractional visibility (1.0 = fully lit,
+// 0.0 = fully shadowed).
+//
+// `origin` is the point the traversal starts from; `startT` is how far the ray
+// has ALREADY come from the shaded surface (the sphere trace hands its ray
+// over mid-flight, and the penumbra estimate must keep using the true distance
+// from that surface, not the distance from the hand-off point), and
+// `startVisibility` the visibility accumulated so far, folded into.
+float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
+                       float startVisibility)
+{
+    if (sunV.y <= 0.05) {
+        return startVisibility;  // low/sunset sun: no cheap ascend bound, skip
+    }
+    const float EPS = 1e-6;
+    const float maxTerr = float(pc.grid.w) + 1.0;
+    int sStepX = (sunV.x > 0.0) ? 1 : -1;
+    int sStepZ = (sunV.z > 0.0) ? 1 : -1;
+    float sMaxX = 1e30;
+    float sMaxZ = 1e30;
+    float sDeltaX = 1e30;
+    float sDeltaZ = 1e30;
+    ivec2 col = ivec2(floor(origin.xz));
+    if (abs(sunV.x) > EPS) {
+        const float nextX = float(col.x + ((sStepX > 0) ? 1 : 0));
+        sMaxX = (nextX - origin.x) / sunV.x;
+        sDeltaX = abs(1.0 / sunV.x);
+    } else {
+        sStepX = 0;
+    }
+    if (abs(sunV.z) > EPS) {
+        const float nextZ = float(col.y + ((sStepZ > 0) ? 1 : 0));
+        sMaxZ = (nextZ - origin.z) / sunV.z;
+        sDeltaZ = abs(1.0 / sunV.z);
+    } else {
+        sStepZ = 0;
+    }
+
+    float visibility = startVisibility;  // min over the penumbra samples
+    float tLocal = 0.0;  // distance from THIS traversal's origin (positions)
+    // Penumbra samples need the distance from the shaded surface, which keeps
+    // growing across a hand-off: startT + tLocal.
+
+    for (int i = 0; i < 256; ++i) {
+        const float sExit = min(sMaxX, sMaxZ);
+        const float y0 = origin.y + sunV.y * tLocal;
+
+        // Above all possible terrain: lit from here on. Keep the
+        // accumulated penumbra - a distant graze already darkened it.
+        if (y0 >= maxTerr) {
+            return visibility;
+        }
+
+        uint slot = 0u;
+        ivec2 local = ivec2(0);
+        if (resolveColumn(col.x, col.y, slot, local)) {
+            const uint bound = columnHeightAt(slot, local);
+            if (bound == kNoHeightData) {
+                // No height data: air, exactly like the exact march.
+            } else if (y0 >= float(bound)) {
+                // Clear of the column: its top plane at `bound` is the
+                // closest relevant surface (the ray is ascending).
+                const float h = y0 - float(bound);
+                visibility =
+                    min(visibility, shadowPenumbra(h, startT + tLocal));
+            } else {
+                // The segment dips below the column's top: the exact cell
+                // walk decides (identical walk to sunRayEscapes).
+                const float y1 = origin.y + sunV.y * sExit;
+                const int yTop = min(int(floor(min(y1, float(bound) - 1.0))),
+                                     int(pc.chunkSize.y) - 1);
+                const uint colBase = uint(local.x) +
+                                     uint(local.y) *
+                                         (pc.chunkSize.x * pc.chunkSize.y);
+                uint solidType = 0u;
+                for (int y = max(int(floor(y0)), 0); y <= yTop; ++y) {
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
+                    if (type != 0u) {
+                        solidType = type;
+                        break;
+                    }
+                }
+                if (solidType != 0u) {
+                    const float opacity = shadowOpacity(solidType);
+                    if (opacity >= 0.999) {
+                        // Opaque: the penumbra up to the surface is already
+                        // accumulated in `visibility`; the surface itself
+                        // blocks the rest of the sun.
+                        return 0.0;
+                    }
+                    // Fractional-opacity foliage: attenuate and keep
+                    // reading occupancy beyond it.
+                    visibility *= 1.0 - opacity;
+                    if (visibility <= 0.01) {
+                        return 0.0;
+                    }
+                }
+                // Air all the way (an overhanging shaft): the topmost solid
+                // sits above the segment and the ray ascends away from it -
+                // no relevant surface here, no estimate for this column.
+            }
+        } else if (pc.far.z > 0) {
+            // Beyond the near region: coarse far cells, conservative in the
+            // blocker's favor exactly like the exact march (fog hides the
+            // coarseness).
+            const float farCell = pc.farParams.x;
+            const ivec2 farDim = pc.far.zw;
+            const vec2 farOrigin = vec2(pc.far.xy);
+            const ivec2 fc = ivec2(floor((vec2(col) + vec2(0.5) -
+                                          farOrigin) / farCell));
+            if (all(greaterThanEqual(fc, ivec2(0))) &&
+                all(lessThan(fc, farDim))) {
+                const uint packed =
+                    farLod.cells[farBase() + uint(fc.x) +
+                                 uint(fc.y) * uint(farDim.x)];
+                const float h = float(packed & 0xFFFFu);
+                if (h > 0.0) {
+                    if (y0 < h) {
+                        return 0.0;  // the exact march's far occlusion
+                    }
+                    visibility = min(visibility,
+                                     shadowPenumbra(y0 - h, startT + tLocal));
+                }
+            }
+        }
+        // No data and no far field: air, like the exact march.
+
+        // Advance to the next column: branchless 2D DDA step (identical to
+        // the exact march, same tie rule).
+        tLocal = sExit;
+        const bool takeX = sMaxX < sMaxZ;
+        sMaxX += takeX ? sDeltaX : 0.0;
+        sMaxZ += takeX ? 0.0 : sDeltaZ;
+        col.x += takeX ? sStepX : 0;
+        col.y += takeX ? 0 : sStepZ;
+    }
+    // Budget exhausted without a known blocker: fail open with the
+    // accumulated penumbra (the exact march fails open with full light).
+    return visibility;
+}
+
+// ---- Ambient sky visibility (pass 62) ------------------------------------
+//
+// What the ambient is FOR, and what it was doing wrong: it used to be a
+// hemisphere blend of the sky sampled along the VIEW ray, cut by
+// (0.55 + 0.45 * shadow). A cave therefore kept 55% of a sky term - "there is
+// practically no ambient light here" is exactly what was missing - and the
+// ambient on a given surface moved when the camera turned.
+//
+// The ambient is now the sky the SURFACE's own hemisphere can actually see:
+//
+//   * the dome is sampled AT THE NORMAL (view-independent by construction),
+//     blended with a dim ground bounce by the same hemispheric weight,
+//   * a horizon scan over the column heights - 6 azimuths x 5 distances
+//     (2..32 voxels), read BILINEARLY - finds how much of the horizontal sky
+//     is blocked. This is what makes a cave dark: a roof is the HIGHEST SOLID
+//     of the columns around the point, so it enters the scan as an extremely
+//     high horizon at short distance,
+//   * two short rays through the 3D SDF (when a field is live) resolve what a
+//     2.5D column scan cannot: the overhang/arch above the point (the 6
+//     azimuths miss a roof that only hangs over the sample), and the
+//     obstruction in the direction the scan itself found worst.
+//
+// All eight directions share ONE mean, so the estimate reads as "the fraction
+// of the hemisphere that reports sky", and the two SDF rays carry 2/8 of its
+// weight: two of the eight directions are the zenith (up the normal) and the
+// sky above the worst horizon. A ray with nothing to hit therefore reports the
+// sky it sees, which is why the floor of the estimate is 2/8 and not zero - a
+// slot canyon really does show sky straight up. A floor term keeps a fully
+// sheltered point readable instead of black (--ambient-floor).
+//
+// The scan reads the NEAR region's columns (binding 5, via resolveColumn);
+// beyond the loaded region a sample reads as open sky, like the marches.
+// Measured on the shipped terrain (default config, seed 1337, 56k+ columns in
+// six regions, 1-voxel scans): every column is solid-below / air-above, so the
+// world has no roofs, arches or tunnels and the two SDF rays escape there - the
+// sheltering this pass adds comes from the scan (a valley floor scans to 0.53,
+// the darkest notch in a 321x321-voxel window to 0.09). The rays are the
+// 3D-correct half for terrain that does grow a roof; the unit tests pin both,
+// with a synthetic cave under a live field.
+//
+// Pass 63, the moire. Sampling the atlas at the NEAREST column made the term a
+// step function of position: at distance, where one pixel covers several
+// voxels of ground, a sub-voxel camera move flips the sampled texel and the
+// horizon estimate jumps with it. Measured on a long shaded view (the ambient
+// term alone, the dark half of the frame, a 0.05-voxel camera move): 3.5% of
+// the value moved per frame - the sparkling/wavy pattern the owner reported.
+// The pre-62 formula measured 0.9% on the same pixels, so this was a
+// regression the pass introduced, not a pre-existing property.
+//
+// The fix, two parts: read the atlas BILINEARLY (4 taps, each a chunk-table
+// fetch + a packed u16 fetch from buffers the marches already read), and drop
+// the d = 1 sample - at one voxel, interpolation across a vertical wall is at
+// its least valid and the sample contributes the largest jumps. 30 bilinear
+// samples per pixel, and the same measurement drops to 0.4%, below the old
+// formula's 0.9%, while the level barely moves. (A continuous-max
+// accumulation and 8 azimuths were both measured and rejected: no gain and a
+// real look change respectively.)
+//
+// The two SDF rays are coarse marches (step max(1.5h, 4 voxels) over 32
+// voxels, <= 8 samples each, ~8 gathers per sample) - together with the scan,
+// roughly two shadow rays' worth of work per shaded pixel, paid once per
+// pixel instead of per ray. scene.ambient.x = 0 restores the pre-62 formula
+// verbatim (--no-ambient).
+const int kAmbientAzimuths = 6;
+const int kAmbientDistances = 5;
+// The ladder starts at 2 voxels, not 1 (pass 63): at d = 1 the sample sits on
+// the neighbour column and the bilinear tap spans a vertical wall, so the
+// horizon it reports is dominated by interpolation error - and it is the
+// sample that moves most for a sub-voxel camera step.
+const float kAmbientDistancesVox[kAmbientDistances] =
+    float[5](2.0, 4.0, 8.0, 16.0, 32.0);
+// The height atlas stores "highest solid + 1" per column, so a column flush
+// with the surface still reads one voxel high; subtracting it is what makes a
+// flat plain report a horizon of exactly 0 instead of a spurious 0.5/1 voxel
+// step at d = 1 (which alone would cost ~55% of the sky in every azimuth).
+const float kAmbientHorizonBias = 1.0;
+// The SDF occlusion rays: they are an ambient estimate, not a shadow - a
+// coarse march is the point (a fine one would cost a whole shadow ray per
+// ray). Range in voxels; lift keeps the origin off its own surface.
+const float kAmbientSdfRange = 32.0;
+const float kAmbientSdfLift = 1.0;
+const float kAmbientSdfHit = 0.5;
+// The silhouette ray aims just ABOVE the horizon the 2.5D scan found: a ray
+// aimed exactly at it grazes the caster (the SDF distance there is ~0.5, which
+// the march treats as clear) and escapes. Aimed above, it answers the question
+// the scan cannot: is there rock over that horizon, or does the sky resume?
+const float kAmbientSdfAboveRatio = 1.3;
+const float kAmbientSdfAboveTan = 0.08;  // ~4.6 degrees
+// 75 degrees: the elevation ceiling for that ray, so the sine -> tangent
+// conversion stays finite and a vertical horizon still probes sensibly.
+const float kAmbientSdfMaxSin = 0.966;
+const float kAmbientSdfMaxTan = 3.732;
+const vec3 kAmbientGroundTint = vec3(0.45, 0.40, 0.32);
+const float kAmbientFloorDefault = 0.12;  // scene.ambient.y < 0 = use this
+
+float ambientFloor()
+{
+    return (scene.ambient.y >= 0.0) ? scene.ambient.y : kAmbientFloorDefault;
+}
+
+// Bilinear read of the height atlas at one world column position, in voxels
+// (the column CENTRE convention: integer + 0.5 sits on a column, integers sit
+// on the boundary between two). Returns the "highest solid + 1" height, or a
+// negative value when no corner of the tap could be resolved (outside the
+// loaded region or in an empty slot) - the caller then has no obstruction
+// information for that sample, exactly like the marches treating it as open
+// sky. Partially loaded taps are renormalized over the corners that exist, so
+// a sample near the region edge fades in instead of stepping.
+float ambientColumnTop(vec2 column)
+{
+    const ivec2 cell = ivec2(floor(column - 0.5));  // the tap's low corner
+    const vec2 t = clamp(column - vec2(cell) - 0.5, 0.0, 1.0);
+    // Fast path: all four corners inside one chunk (the common case, and the
+    // reason this stays one chunk-table fetch per sample) - resolve the low
+    // corner once and read the other three from the same slot. The corner at
+    // +1 belongs to the NEXT chunk when the low corner is the chunk's last
+    // column, so that case falls through to the per-corner path below.
+    uint baseSlot = 0u;
+    ivec2 baseLocal = ivec2(0);
+    if (resolveColumn(cell.x, cell.y, baseSlot, baseLocal) &&
+        baseLocal.x + 1 < int(pc.chunkSize.x) &&
+        baseLocal.y + 1 < int(pc.chunkSize.z)) {
+        const float h00 = float(columnHeightAt(baseSlot, baseLocal));
+        const float h10 = float(columnHeightAt(baseSlot, baseLocal + ivec2(1, 0)));
+        const float h01 = float(columnHeightAt(baseSlot, baseLocal + ivec2(0, 1)));
+        const float h11 = float(columnHeightAt(baseSlot, baseLocal + ivec2(1, 1)));
+        const float a = h00 + (h10 - h00) * t.x;
+        const float b = h01 + (h11 - h01) * t.x;
+        return a + (b - a) * t.y;
+    }
+    // Chunk boundary or unloaded neighbourhood: resolve each corner it can and
+    // renormalize over the ones that exist, so a sample near the region edge
+    // fades in instead of stepping. No corner at all = no information (-1).
+    float total = 0.0;
+    float weight = 0.0;
+    for (int dz = 0; dz <= 1; ++dz) {
+        for (int dx = 0; dx <= 1; ++dx) {
+            uint slot = 0u;
+            ivec2 local = ivec2(0);
+            if (!resolveColumn(cell.x + dx, cell.y + dz, slot, local)) {
+                continue;
+            }
+            const float w = ((dx == 0) ? 1.0 - t.x : t.x) *
+                            ((dz == 0) ? 1.0 - t.y : t.y);
+            total += float(columnHeightAt(slot, local)) * w;
+            weight += w;
+        }
+    }
+    if (weight <= 0.0) {
+        return -1.0;
+    }
+    return total / weight;
+}
+
+// Sky visibility from the height field alone: the SUM over the six azimuths of
+// (1 - sin(horizon elevation)) - the caller adds the two SDF rays and divides
+// by 8, so these are six of its eight terms - plus the worst azimuth (the
+// direction the two SDF rays use) and its sine.
+//
+// The elevation of one azimuth is the MAX over the sampled distances of
+// tan = (column top - point height) / distance: tan is monotonic in the
+// elevation, so the max over samples IS the highest horizon, and one sqrt per
+// azimuth turns it into the sine the visibility needs.
+float ambientHorizonVisibility(vec3 p, out float worstAzimuth, out float worstSin)
+{
+    float total = 0.0;
+    worstSin = 2.0;  // above any real sine: the first azimuth always wins
+    worstAzimuth = 0.0;
+    for (int a = 0; a < kAmbientAzimuths; ++a) {
+        const float azimuth =
+            float(a) * (6.2831853 / float(kAmbientAzimuths));
+        const vec2 dirXZ = vec2(cos(azimuth), sin(azimuth));
+        float tMax = 0.0;
+        for (int i = 0; i < kAmbientDistances; ++i) {
+            const float d = kAmbientDistancesVox[i];
+            const float top = ambientColumnTop(p.xz + dirXZ * d);
+            if (top < 0.0) {
+                continue;  // unloaded / outside the region: no obstruction
+            }
+            tMax = max(tMax, max(top - p.y - kAmbientHorizonBias, 0.0) / d);
+        }
+        const float sinTheta = tMax / sqrt(1.0 + tMax * tMax);
+        total += 1.0 - sinTheta;
+        if (sinTheta < worstSin) {
+            worstSin = sinTheta;
+            worstAzimuth = azimuth;
+        }
+    }
+    return total;  // sum over the azimuths: mean of eight is the caller's job
+}
+
+// One coarse occlusion ray through the 3D SDF, 0..1: how much of the sky
+// survives along `dir`. A ray that leaves the range without meeting anything
+// is open sky (1.0); one that meets a surface at t reports the fraction
+// t / range it traveled. Outside the box the SDF reads 1e30 = open space, so a
+// point the box does not cover simply gets no occlusion information from here.
+float ambientSdfRay(vec3 p, vec3 dir)
+{
+    if (scene.misc.w <= 0.5 || sdfBox.box.w < 0) {
+        return 1.0;  // no field: this ray contributes nothing either way
+    }
+    float t = kAmbientSdfLift;
+    for (int i = 0; i < 8; ++i) {
+        const float h = sampleSdf3d(p + dir * t);
+        if (h < kAmbientSdfHit) {
+            return clamp(t / kAmbientSdfRange, 0.0, 1.0);
+        }
+        t += max(h * 1.5, 4.0);
+        if (t >= kAmbientSdfRange) {
+            break;
+        }
+    }
+    return 1.0;
+}
+
+// The fraction of the sky the point p (world voxels, on the surface) can see,
+// with `n` its normal. See the block comment above for what each term is.
+float ambientSkyVisibility(vec3 p, vec3 n)
+{
+    float worstAzimuth = 0.0;
+    float worstSin = 0.0;
+    float visibility = ambientHorizonVisibility(p, worstAzimuth, worstSin);
+    // The two SDF rays: up the normal (where a cosine-weighted hemisphere
+    // carries most of its energy), and into the scan's worst azimuth slightly
+    // above the horizon it reported there (kAmbientSdfAboveRatio: see the
+    // constant). The sine is capped below 1 before the sine -> tangent
+    // conversion - a horizon straight up (a roof against the sample) would
+    // divide by zero, and 75 degrees already points into any obstruction that
+    // reads as vertical.
+    const float sinClamped = min(worstSin, kAmbientSdfMaxSin);
+    const float tanTheta =
+        sinClamped / sqrt(max(1e-6, 1.0 - sinClamped * sinClamped));
+    const float tanAbove = min(
+        tanTheta * kAmbientSdfAboveRatio + kAmbientSdfAboveTan,
+        kAmbientSdfMaxTan);
+    const vec3 silhouetteDir =
+        normalize(vec3(cos(worstAzimuth), tanAbove, sin(worstAzimuth)));
+    visibility += ambientSdfRay(p, normalize(n));
+    visibility += ambientSdfRay(p, silhouetteDir);
+    return clamp(visibility / 8.0, 0.0, 1.0);
+}
+
+// Sun visibility at a hit position (voxel space): one ascending shadow ray
+// - column DDA + height-bound voxel walk, coarse far cells beyond the near
+// region. By default the exact binary march (1.0 lit / 0.0 shadowed);
+// scene.misc.w (VV_SDF_SHADOWS=1) selects sunRayEscapesSdf instead - the
+// SAME traversal with the Quilez penumbra estimate, returning fractional
+// visibility. Far-LOD hits shadow through the same march: from beyond the
+// region it self-selects the cheap far-cell path.
+//
+// Pass 57: the soft paths march a per-pixel JITTERED ray (shadowRayJitter), so
+// the estimate's sampling error decorrelates across the surface instead of
+// banding. The exact path below keeps the un-jittered ray, bit for bit (1.0
+// lit / 0.0 shadowed, unchanged by any of this).
+float sunShadow(vec3 hitPosVox, vec3 n, float footprintVox)
+{
+    const vec3 sunWorld = normalize(scene.lightDir.xyz);
+    if (sunWorld.y <= 0.05) {
+        return 1.0;  // low/sunset sun: no cheap ascend bound, skip shadows
+    }
+    const vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
+    const vec3 sunV = sunWorld / voxelSize;  // voxel-space direction
+    // Lift off the surface (along the normal, then along the sun) to avoid
+    // self-shadow acne; the hit face's outward cell is air by construction.
+    const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
+    if (scene.misc.w > 0.5) {
+        // Pass 57: the soft paths march a cone-jittered ray from a slightly
+        // displaced origin, so their sampling error decorrelates across the
+        // surface instead of banding (see shadowRayJitter). The exact path
+        // below keeps the un-jittered ray and stays bit-identical.
+        vec3 softOrigin;
+        const vec3 softDir =
+            shadowRayJitter(hitPosVox, n, sunV, footprintVox, softOrigin);
+        // Pass 38: the proper 3D voxel SDF sphere trace when a field is
+        // uploaded (sdfBox.box.w >= 0). The 2.5D top-plane penumbra is the
+        // fallback until the background build lands (and if it ever stalls).
+        if (sdfBox.box.w >= 0) {
+            return sunRayEscapesSdf3d(softOrigin, softDir);
+        }
+        return sunRayEscapesSdf(softOrigin, softDir, 0.0, 1.0);
+    }
+    return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
+}
+
+float fogAmount(float dist)
+{
+    float x = dist * pc.camera.y;  // dist / cutDistance
+    return 1.0 - exp(-kFogTail * pow(x, kFogExp));
+}
+
+// Traces one ray through the sub-pixel sample position uv (final NDC-style
+// coordinates, already aspect-scaled and y-flipped) and returns the shaded
+// color. When debugTerm is set, miss pixels are false-colored by their
+// termination cause instead of showing sky.
+// Shades one surface hit (shared by the primary result and the fading
+// chunk's front layer; extracted from traceRay's tail in pass 19).
+vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
+                     ivec2 sCellXZ, int sHitY, vec3 sStart, vec3 sRd,
+                     vec3 sRdWorld, float sTEntryOffset)
+{
+    const vec3 hitPos = sStart + sRd * sTHit;
+    vec3 n = normalize(sNormal);
+    vec3 sunDir = normalize(scene.lightDir.xyz);
+    float ndl = max(dot(n, sunDir), 0.0);
+
+    // One pixel of world space at this hit: the texture LOD's texel footprint
+    // AND the shadow test's jitter unit (pass 56) both come from it.
+    const float voxelsPerPixel =
+        (sTEntryOffset + sTHit) * 2.0 * pc.camera.x / float(pc.screen.y);
+
+    // Albedo: the face's texture file when the type has one (binding 10
+    // face table -> bindless image), else the palette color. Applies to
+    // far-LOD hits too: deep mips average to the texture's mean color,
+    // which keeps the near/far seam consistent.
+    vec3 base;
+    uint texIdx = 0xFFFFFFFFu;
+    float nominal = 32.0;
+    if (sType < 7u) {
+        const uint fid = (sNormal.y > 0.5) ? 0u
+            : (sNormal.y < -0.5) ? 1u
+            : (sNormal.x > 0.5) ? 2u
+            : (sNormal.x < -0.5) ? 3u
+            : (sNormal.z > 0.5) ? 4u : 5u;
+        texIdx = voxelTexInfo.perType[sType * 8u + fid];
+        nominal = float(voxelTexInfo.perType[sType * 8u + 6u]);
+    }
+    if (texIdx == 0xFFFFFFFFu) {
+        base = voxelColor(sType, sNormal);  // plain colors (no files)
+    } else {
+        // World-space UV on the hit face: the two axes tangent to it.
+        // REPEAT addressing tiles the texture per voxel (1 uv unit).
+        // SIDE faces negate V: Vulkan's V=0 is the image's TOP row
+        // (rows upload in order), so V = +y put the image top at the
+        // voxel BOTTOM - every side texture displayed upside down
+        // (pass 29). V = -y flips it: fract(-y) = 1 - fract(y) keeps
+        // the tiling continuous across voxels. Top/bottom faces keep
+        // V = +z (a rotation, not a flip - art-dependent).
+        const vec2 uv = abs(sNormal.y) > 0.5
+            ? hitPos.xz
+            : (abs(sNormal.x) > 0.5
+                   ? vec2(hitPos.z, -hitPos.y)
+                   : vec2(hitPos.x, -hitPos.y));
+        // Explicit LOD from the texel footprint: texels per pixel =
+        // texRes * worldUnitsPerPixel, worldUnitsPerPixel at distance d
+        // = d * 2 * tanHalfFov / screenHeight. Clamped to the mip chain.
+        const float texelsPerPixel = nominal * voxelsPerPixel;
+        float lod = log2(max(texelsPerPixel, 1.0));
+        lod = min(lod, log2(max(nominal, 1.0)));
+        base = textureLod(
+            sampler2D(voxelTextures[nonuniformEXT(texIdx)], voxelSampler),
+            uv, lod).rgb;
+    }
+
+    // Per-vertex simulated AO on the hit face (from the owner's WGSL
+    // reference): darkens creases and corners. Far-LOD hits skip AO
+    // (invisible at multi-hundred-unit distances).
+    float ao = 1.0;
+    if (!sFarHit) {
+        ao = calculateAO(ivec3(sCellXZ.x, sHitY, sCellXZ.y), sNormal, hitPos);
+    }
+
+    // Sun shadows: one cheap ascending ray toward the sun. Skipped only
+    // when the direct term is zero anyway (ndl <= 0). Far-LOD hits MUST
+    // be shadowed too: from beyond the region the march self-selects the
+    // cheap far-cell path, and skipping it here lit the whole far band
+    // at full sun while the near terrain right next to it sat in shade.
+    // The SDF path (scene.misc.w) returns fractional visibility instead
+    // of binary lit/shadowed - see sunShadow.
+    float shadow = 1.0;
+    if (ndl > 0.0) {
+        shadow = sunShadow(hitPos, n, voxelsPerPixel);
+    }
+
+    // Lighting model ported from the owner's WGSL reference renderer:
+    // hemispheric sky ambient + direct sun + fresnel rim, from the sunless
+    // sky (skyBaseColor - never the sun disc/glow).
+    float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 direct =
+        scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0)) * shadow;
+    float view = max(dot(n, -sRdWorld), 0.0);
+
+    vec3 ambient;
+    vec3 rim;
+    if (scene.ambient.x > 0.5) {
+        // Pass 62: the sky the SURFACE can see (ambientSkyVisibility), sampled
+        // at the NORMAL - so the ambient of a given surface no longer changes
+        // when the camera turns - blended with a dim ground bounce by the
+        // hemispheric weight, and floored so a cave is dark, not black. The
+        // old (0.55 + 0.45 * shadow) cut is gone: it removed at most 45% of a
+        // sky term in a cave while darkening every sun-shadowed face outdoors,
+        // and the visibility term replaces what it was standing in for. The
+        // rim is sky light too, so it follows the same visibility.
+        const vec3 skyIrr = skyBaseColor(n);
+        const vec3 groundBounce = scene.skyLow.xyz * kAmbientGroundTint;
+        const float skyVis = ambientSkyVisibility(hitPos, n);
+        const vec3 dome = mix(groundBounce, skyIrr, hemi);
+        ambient = dome * skyVis + skyIrr * ambientFloor();
+        rim = skyIrr * (0.12 * pow(1.0 - view, 5.0)) * skyVis;
+    } else {
+        // --no-ambient: the pre-62 formula, character for character (the
+        // control the upgrade is judged against, and bit-identical to it).
+        vec3 skyAmb = skyBaseColor(sRdWorld);
+        ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
+        rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
+    }
+
+    vec3 color = base * (ambient + direct + rim) * ao;
+
+    // Distance fog towards the sunless sky in this direction.
+    float fog = clamp(fogAmount(sTEntryOffset + sTHit), 0.0, 1.0);
+    return mix(color, skyBaseColor(sRdWorld), fog);
+}
+
+vec3 traceRay(vec2 uv, bool debugTerm)
+{
+    vec3 camPos = scene.camPos.xyz;
+    vec3 forward = normalize(scene.camForward.xyz);
+    vec3 right = normalize(scene.camRight.xyz);
+    vec3 up = normalize(scene.camUp.xyz);
+
+    float tanHalfFov = pc.camera.x;
+    vec3 rdWorld = normalize(forward + right * (uv.x * tanHalfFov) +
+                             up * (uv.y * tanHalfFov));
+    vec3 roWorld = camPos;
+
+    vec3 voxelSize = max(pc.voxelSize.xyz, vec3(1e-6));
+    vec3 ro = roWorld / voxelSize;
+    vec3 rd = rdWorld / voxelSize;
+
+    // Region (loaded world) bounds in global voxel space.
+    ivec3 regionMinVox = ivec3(pc.region.x * int(pc.chunkSize.x), 0,
+                               pc.region.z * int(pc.chunkSize.z));
+    ivec3 regionMaxVox = regionMinVox + ivec3(
+        int(pc.grid.x) * int(pc.chunkSize.x),
+        int(pc.chunkSize.y),
+        int(pc.grid.y) * int(pc.chunkSize.z));
+
+    vec3 bmin = vec3(regionMinVox);
+    vec3 bmax = vec3(regionMaxVox);
+    float tEnter = 0.0;
+    float tExit = 0.0;
+    vec3 enterNormal = vec3(0.0);
+    // A ray can miss the near region entirely only from above the world
+    // (the camera's XZ is always inside it), and a ray can stay above all
+    // terrain while crossing it. Both used to early-return sky - correct
+    // before far LOD, wrong now: they must still run the far march (that
+    // was the "terrain crops away the higher I fly" bug). They now skip
+    // only the NEAR march.
+    const bool nearIntersect =
+        intersectAABB(ro, rd, bmin, bmax, tEnter, tExit, enterNormal);
+
+    vec3 start = ro + rd * 1e-4;
+    const float tEntryOffset = nearIntersect ? max(tEnter, 0.0) : 0.0;
+    float tEndRegion = 0.0;
+    if (nearIntersect) {
+        start = ro + rd * max(tEnter, 0.0);
+        start = min(start, bmax - vec3(1e-4));
+        start += rd * 1e-4;
+        tEndRegion = tExit - tEntryOffset;
+    }
+    ivec3 cell = ivec3(floor(start));
+    // Primary ray terminator: the fog cut (99.8% opaque at 1 / fogDensity).
+    const float tEndFog = (1.0 / max(pc.camera.y, 1e-6)) - tEntryOffset;
+    float tEnd = min(tEndRegion, tEndFog);
+    float worldYEnter = 0.0;
+    float worldYExit = 0.0;
+    const bool worldYHit = worldYInterval(ro, rd, worldYEnter, worldYExit);
+    if (tEnd <= 0.0 && pc.far.z == 0) {
+        // Fog cut before the near region even starts. With far LOD ACTIVE
+        // this must NOT return sky: from above the world (camera out of
+        // bounds, y > worldHeight) horizontal rays miss the near box
+        // entirely (tEndRegion = 0) and still have to run the far march -
+        // this early return was the last remaining piece of the altitude
+        // crop ("still there exactly when I fly out of bounds").
+        return debugTerm ? termColor(TERM_FOG_CUT) : skyColor(rdWorld);
+    }
+
+    // Sky-skip (near region only): terrain never rises above pc.grid.w, so
+    // a ray whose whole region segment stays above that line can only see
+    // sky - WITHIN the region. Beyond it the far march takes over. y is
+    // linear in the ray parameter, so the segment minimum is at an
+    // endpoint.
+    const float maxTerrainY = float(pc.grid.w);
+    bool nearSkip = true;
+    if (nearIntersect) {
+        nearSkip = min(start.y, (ro + rd * tExit).y) > maxTerrainY;
+    }
+    const bool nearMarch = nearIntersect && !nearSkip;
+
+    bool hit = false;
+    vec3 normal = vec3(0.0);
+    uint hitType = 0u;
+    // Y of the hit cell (kept for the AO sample at shading time).
+    int hitY = 0;
+    // Fading-chunk front layer (see the near march hit block).
+    bool frontValid = false;
+    float frontFade = 1.0;
+    uint frontType = 0u;
+    vec3 frontNormal = vec3(0.0);
+    float frontTHit = 0.0;
+    ivec2 frontCellXZ = ivec2(0);
+    int frontHitY = 0;
+    // Ray parameter (same units as the old tracer: t multiplies rd, and the
+    // distance from the camera is tEntryOffset + t) at the hit, relative to
+    // the region entry point.
+    float tHit = 0.0;
+    // Why the ray ended, for the VV_DEBUG_TERM view. Defaults to the budget
+    // (loop exhausted); every break overwrites it.
+    int termCause = nearMarch
+        ? TERM_BUDGET
+        : (nearIntersect ? TERM_SKY_SKIP : TERM_NO_REGION);
+
+    if (!nearMarch && pc.far.z == 0) {
+        // Nothing to trace near, and no far LOD to fall through to.
+        return debugTerm ? termColor(termCause) : skyColor(rdWorld);
+    }
+
+    const float EPS = 1e-6;
+
+    // --- Heightmap-guided traversal -------------------------------
+    // 2D DDA over XZ voxel columns. Per column, the height bound decides
+    // whether the ray can possibly touch solid cells:
+    //   - the segment stays at/above the bound -> ONE step to the next
+    //     column (the air-skip; the old tracer burned a cell crossing per
+    //     air voxel instead);
+    //   - otherwise -> walk only the cells the segment actually occupies,
+    //     starting no higher than the bound (cells above it are provably
+    //     air), with the slot resolved once per column.
+    // The walk enumerates exactly the same solid cells (and entry faces) as
+    // a plain 3D DDA - see the traversal parity test - so the image is
+    // identical while air becomes nearly free.
+    int stepX = (rd.x > 0.0) ? 1 : -1;
+    int stepZ = (rd.z > 0.0) ? 1 : -1;
+
+    float tMaxX = 1e30;
+    float tMaxZ = 1e30;
+    float tDeltaX = 1e30;
+    float tDeltaZ = 1e30;
+
+    if (abs(rd.x) > EPS) {
+        float nextX = float(cell.x + ((stepX > 0) ? 1 : 0));
+        tMaxX = (nextX - start.x) / rd.x;
+        tDeltaX = abs(1.0 / rd.x);
+    } else {
+        stepX = 0;
+    }
+
+    if (abs(rd.z) > EPS) {
+        float nextZ = float(cell.z + ((stepZ > 0) ? 1 : 0));
+        tMaxZ = (nextZ - start.z) / rd.z;
+        tDeltaZ = abs(1.0 / rd.z);
+    } else {
+        stepZ = 0;
+    }
+
+    // Axis of the XZ boundary crossed to enter the current column (-1 for
+    // the segment's first column -> use the region entry normal).
+    int lastAxis = -1;
+    // Entry parameter of the current column.
+    float t = 0.0;
+    const int worldTop = int(pc.chunkSize.y) - 1;
+
+    // Hierarchical-DDA block cache (pass 30): the block the current
+    // column belongs to and whether it was found skippable. The block
+    // bound is fetched ONCE per block entry; while the ray stays above
+    // it, whole blocks cross with pure-ALU DDA steps.
+    int curBX = -0x40000000;
+    int curBZ = -0x40000000;
+    bool curBlockSkippable = false;
+    float tBlockExitCache = 0.0;
+
+    if (nearMarch) {
+    for (int i = 0; i < int(pc.chunkSize.w); ++i) {
+        if (t >= tEnd) {
+            termCause = (tEndFog < tEndRegion) ? TERM_FOG_CUT : TERM_REGION_EXIT;
+            break;
+        }
+        const float tColExit = min(min(tMaxX, tMaxZ), tEnd);
+        const float y0 = start.y + rd.y * t;        // y at column entry
+        const float y1 = start.y + rd.y * tColExit; // y at column exit
+        const float yMin = min(y0, y1);
+
+        // Ascending above the highest possible terrain: nothing left to hit.
+        // (maxTerrainY is the top solid cell index; its top face is at
+        // maxTerrainY + 1.)
+        if (rd.y > 0.0 && y0 >= maxTerrainY + 1.0) {
+            termCause = TERM_ASCEND;
+            break;
+        }
+
+        // Resolve the column ONCE (pass 32): the block bound, the height
+        // bound and the Y-walk fetches below all reuse this slot/local
+        // pair. Before, columnHeightBound and the walk each resolved it
+        // again (2-3 resolveColumn calls = 4-6 integer divisions per
+        // column, the Nsight #1/#2 hotspots).
+        uint slot = 0u;
+        ivec2 local = ivec2(0);
+        const bool haveSlot = resolveColumn(cell.x, cell.z, slot, local);
+
+        // --- Hierarchical block skip (pass 30) ---------------------
+        // On entering a new kBlockVoxels^2 block, ONE fetch of the
+        // block's max height decides whether the ray provably stays
+        // above EVERY column of the block until it exits: if so, the
+        // whole block is crossed with branchless DDA steps and no
+        // per-column table/height fetches at all. The skip condition
+        // implies each skipped column's own air-skip condition (bound_c
+        // <= blockMax <= min y over the block segment <= min y over the
+        // column segment), so the hit sequence is bit-identical - pinned
+        // by the traversal parity test (traceHier mirror).
+        const int bx = floorDiv(cell.x, kBlockVoxels);
+        const int bz = floorDiv(cell.z, kBlockVoxels);
+        if (bx != curBX || bz != curBZ) {
+            curBX = bx;
+            curBZ = bz;
+            float tBlockExit = tEnd;
+            if (abs(rd.x) > EPS) {
+                const float edgeX =
+                    float((bx + ((stepX > 0) ? 1 : 0)) * kBlockVoxels);
+                tBlockExit = min(tBlockExit, (edgeX - start.x) / rd.x);
+            }
+            if (abs(rd.z) > EPS) {
+                const float edgeZ =
+                    float((bz + ((stepZ > 0) ? 1 : 0)) * kBlockVoxels);
+                tBlockExit = min(tBlockExit, (edgeZ - start.z) / rd.z);
+            }
+            const uint blockMax =
+                haveSlot ? blockHeightAt(slot, local) : kNoHeightData;
+            const float yBExit = start.y + rd.y * tBlockExit;
+            curBlockSkippable =
+                (blockMax != kNoHeightData) &&
+                (min(y0, yBExit) >= float(blockMax));
+            tBlockExitCache = tBlockExit;
+        }
+        if (curBlockSkippable) {
+            // Fast-forward the column DDA to the block exit. Bounded by
+            // 2*kBlockVoxels crossings per block; no memory traffic.
+            for (int g = 0; g < 2 * kBlockVoxels + 2; ++g) {
+                const float tNext = min(tMaxX, tMaxZ);
+                if (tNext > tBlockExitCache) {
+                    break;
+                }
+                t = tNext;
+                const bool ffx = tMaxX < tMaxZ;
+                tMaxX += ffx ? tDeltaX : 0.0;
+                tMaxZ += ffx ? 0.0 : tDeltaZ;
+                cell.x += ffx ? stepX : 0;
+                cell.z += ffx ? 0 : stepZ;
+                lastAxis = ffx ? 0 : 2;
+            }
+            if (t < tBlockExitCache) {
+                // Block exit mid-column: the current column is provably
+                // air up to here; resume from the exit point.
+                t = tBlockExitCache;
+            }
+            // Ulp-safety: if the DDA did not actually leave the block
+            // (block-exit boundary missed by rounding), stop skipping
+            // this block - the normal column logic advances us out.
+            if (floorDiv(cell.x, kBlockVoxels) == curBX &&
+                floorDiv(cell.z, kBlockVoxels) == curBZ) {
+                curBlockSkippable = false;
+            }
+            continue;
+        }
+
+        const uint bound =
+            haveSlot ? columnHeightAt(slot, local) : kNoHeightData;
+        const bool skip = (bound != kNoHeightData) && (yMin >= float(bound));
+
+        // An unresolved column (outside the region / empty slot) is all
+        // air: voxelTypeAt returned 0 for every cell of the old walk, so
+        // skipping the walk outright is identical - and free.
+        if (!skip && haveSlot) {
+            const uint colBase = uint(local.x) + uint(local.y) *
+                                (pc.chunkSize.x * pc.chunkSize.y);
+
+            // First cell to check: the segment's entry cell, clamped down to
+            // the height bound / world top (cells above are provably air).
+            int yFirst = min(int(floor(y0)), worldTop);
+            if (bound != kNoHeightData) {
+                yFirst = min(yFirst, int(bound) - 1);
+            }
+            const int yLast = int(floor(y1));
+
+            if (rd.y < 0.0) {
+                // Descending: cells in t order from yFirst down to the
+                // lowest cell the segment reaches (clamped into the world).
+                for (int y = yFirst; y >= max(yLast, 0); --y) {
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
+                    if (type != 0u) {
+                        hit = true;
+                        hitType = type;
+                        hitY = y;
+                        if (y == int(floor(y0))) {
+                            // Entered this cell at column entry (XZ face or
+                            // the segment start).
+                            tHit = t;
+                            normal = (lastAxis == 0)
+                                ? vec3(-float(stepX), 0.0, 0.0)
+                                : (lastAxis == 2)
+                                    ? vec3(0.0, 0.0, -float(stepZ))
+                                    : enterNormal;
+                        } else {
+                            // Crossed into this cell through its top face.
+                            tHit = (float(y + 1) - start.y) / rd.y;
+                            normal = vec3(0.0, 1.0, 0.0);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                // Ascending or horizontal: cells from yFirst up to the
+                // highest cell the segment reaches, stopping above the
+                // height bound (cells there are provably air).
+                const int yTop = min(yLast, worldTop);
+                for (int y = max(yFirst, 0); y <= yTop; ++y) {
+                    if (bound != kNoHeightData && y >= int(bound)) {
+                        break;
+                    }
+                    const uint type =
+                        fetchVoxel(slot, colBase + uint(y) * pc.chunkSize.x);
+                    if (type != 0u) {
+                        hit = true;
+                        hitType = type;
+                        hitY = y;
+                        if (y == int(floor(y0))) {
+                            tHit = t;
+                            normal = (lastAxis == 0)
+                                ? vec3(-float(stepX), 0.0, 0.0)
+                                : (lastAxis == 2)
+                                    ? vec3(0.0, 0.0, -float(stepZ))
+                                    : enterNormal;
+                        } else {
+                            // Crossed into this cell through its bottom face.
+                            tHit = (float(y) - start.y) / rd.y;
+                            normal = vec3(0.0, -1.0, 0.0);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (hit) {
+                // Fade-in compositing (pass 19): a hit inside a chunk
+                // still fading in is recorded as the FRONT layer and the
+                // march skips past that whole chunk, so the final color
+                // can blend the chunk against whatever is really behind
+                // it (far-LOD preview, another chunk, sky) instead of a
+                // fake backdrop. Only the FIRST fading hit per ray gets
+                // this treatment; later ones shade normally.
+                if (!frontValid && haveSlot &&
+                    chunkFade.alpha[slot] < 0.999) {
+                    frontValid = true;
+                    frontFade = chunkFade.alpha[slot];
+                    frontType = hitType;
+                    frontNormal = normal;
+                    frontTHit = tHit;
+                    frontCellXZ = cell.xz;
+                    frontHitY = hitY;
+                    hit = false;
+                    // Skip past this chunk's XZ box. Floor division via
+                    // floats (integer / truncates toward zero - wrong
+                    // for negative world coordinates).
+                    const vec2 cs2 = vec2(pc.chunkSize.x, pc.chunkSize.z);
+                    const ivec2 cbase = ivec2(
+                        floor(vec2(cell.xz) / cs2) * cs2);
+                    float tOut = t;
+                    if (abs(rd.x) > EPS) {
+                        tOut = max(tOut, (rd.x > 0.0)
+                            ? (float(cbase.x + int(pc.chunkSize.x)) -
+                               start.x) / rd.x
+                            : (float(cbase.x) - start.x) / rd.x);
+                    }
+                    if (abs(rd.z) > EPS) {
+                        tOut = max(tOut, (rd.z > 0.0)
+                            ? (float(cbase.y + int(pc.chunkSize.z)) -
+                               start.z) / rd.z
+                            : (float(cbase.y) - start.z) / rd.z);
+                    }
+                    if (tOut <= t + 1e-6) {
+                        tOut = tEnd;  // vertical ray: nothing else nearby
+                    }
+                    t = min(tOut + 1e-4, tEnd);
+                    cell.x = int(floor(start.x + rd.x * t));
+                    cell.z = int(floor(start.z + rd.z * t));
+                    // Re-init the DDA crossing times for the new column
+                    // (steps and per-cell deltas are unchanged).
+                    if (abs(rd.x) > EPS) {
+                        const float nx =
+                            float(cell.x + ((stepX > 0) ? 1 : 0));
+                        tMaxX = (nx - start.x) / rd.x;
+                    }
+                    if (abs(rd.z) > EPS) {
+                        const float nz =
+                            float(cell.z + ((stepZ > 0) ? 1 : 0));
+                        tMaxZ = (nz - start.z) / rd.z;
+                    }
+                    lastAxis = -1;
+                    continue;
+                }
+                termCause = TERM_HIT;
+                break;
+            }
+        }
+
+        // Advance to the next column: BRANCHLESS 2D DDA step (cf.
+        // shadertoy.com/view/4dX3zl - masked selects instead of a
+        // divergent branch; ties keep the old rule: X only on strictly
+        // less, else Z, matching the CPU parity mirror).
+        t = min(tMaxX, tMaxZ);
+        const bool takeX = tMaxX < tMaxZ;
+        tMaxX += takeX ? tDeltaX : 0.0;
+        tMaxZ += takeX ? 0.0 : tDeltaZ;
+        cell.x += takeX ? stepX : 0;
+        cell.z += takeX ? 0 : stepZ;
+        lastAxis = takeX ? 0 : 2;
+    }
+    }  // near march
+
+    // --- Far-LOD march ------------------------------------------------
+    // Runs only when the ray left the full-detail region without a hit and
+    // far LOD is active (pc.far.z > 0). 2D DDA over coarse height cells:
+    // each cell is a column of footprint farParams.x voxels whose surface
+    // top plane sits at its stored height. One u32 fetch + compares per
+    // cell; the near-region traversal above is untouched, so its parity
+    // guarantee still holds.
+    bool farHit = false;
+    bool holeDbgFar = false;
+    bool holeVisitedFar = false;
+    bool holeEmptyFar = false;
+    if (!hit && pc.far.z > 0 && worldYHit) {
+        const float cell = pc.farParams.x;
+        const ivec2 farDim = pc.far.zw;
+        const vec2 farOrigin = vec2(pc.far.xy);
+
+        // Restrict the far height-field march to the world's vertical slab.
+        // In particular, a camera below bedrock looking down has no forward
+        // Y interval and must return sky rather than sampling a far column at
+        // the camera position.
+        const float yStart = worldYEnter - tEntryOffset;
+        const float yEnd = worldYExit - tEntryOffset;
+        const float farStartRaw = max(max(tEndRegion, yStart), 0.0);
+        const float farEnd = min(tEndFog, yEnd);
+        const bool farEndIsFog = tEndFog <= yEnd;
+        const float farStart = farStartRaw + 1e-4;
+        if (farEnd <= farStart) {
+            // There is no forward part of this ray inside the world slab.
+            // Leave farHit false; the normal sky path below is correct.
+        } else {
+
+        int fStepX = (rd.x > 0.0) ? 1 : -1;
+        int fStepZ = (rd.z > 0.0) ? 1 : -1;
+        float fMaxX = 1e30;
+        float fMaxZ = 1e30;
+        float fDeltaX = 1e30;
+        float fDeltaZ = 1e30;
+
+        const vec3 farStartPos = start + rd * farStart;
+        const vec2 p = farStartPos.xz;
+        ivec2 c2 = ivec2(floor((p - farOrigin) / cell));
+        if (abs(rd.x) > EPS) {
+            float nextX =
+                farOrigin.x + float(c2.x + ((fStepX > 0) ? 1 : 0)) * cell;
+            fMaxX = (nextX - start.x) / rd.x;
+            fDeltaX = cell / abs(rd.x);
+        } else {
+            fStepX = 0;
+        }
+        if (abs(rd.z) > EPS) {
+            float nextZ =
+                farOrigin.y + float(c2.y + ((fStepZ > 0) ? 1 : 0)) * cell;
+            fMaxZ = (nextZ - start.z) / rd.z;
+            fDeltaZ = cell / abs(rd.z);
+        } else {
+            fStepZ = 0;
+        }
+
+        float ft = farStart;  // entry param of the current far cell
+        int fLastAxis = -1;
+        bool firstFarCell = true;
+        // VV_DEBUG_HOLE instrumentation: farParams.z = targetChunkX + 4096
+        // (the on-flag), farParams.w = targetChunkZ. Tracks whether the
+        // march crossed the target chunk's cells and whether any was
+        // EMPTY (stored height 0).
+        holeDbgFar = pc.farParams.z >= 4096.0;
+        ivec2 holeCellMin = ivec2(0);
+        ivec2 holeCellMax = ivec2(-1);
+        if (holeDbgFar) {
+            const ivec2 chunkOrg = ivec2(int(pc.farParams.z) - 4096,
+                                         int(pc.farParams.w));
+            const vec2 chunkVox = vec2(chunkOrg) *
+                vec2(pc.chunkSize.x, pc.chunkSize.z);
+            holeCellMin = ivec2(floor((chunkVox - farOrigin) / cell));
+            const int perChunk = int(pc.chunkSize.x / uint(cell));
+            holeCellMax = holeCellMin + ivec2(perChunk - 1);
+        }
+        // A ray can cross at most dim.x + dim.y cells of the grid.
+        const int farBudget = farDim.x + farDim.y;
+        for (int i = 0; i < farBudget; ++i) {
+            if (ft >= farEnd) {
+                termCause = farEndIsFog ? TERM_FOG_CUT : TERM_REGION_EXIT;
+                break;
+            }
+            const float ftExit = min(min(fMaxX, fMaxZ), farEnd);
+            const float fy0 = start.y + rd.y * ft;
+            const float fy1 = start.y + rd.y * ftExit;
+
+            // Ascending above all possible terrain: sky.
+            if (rd.y > 0.0 && fy0 >= maxTerrainY + 1.0) {
+                termCause = TERM_ASCEND;
+                break;
+            }
+
+            const bool inGrid = all(greaterThanEqual(c2, ivec2(0))) &&
+                                all(lessThan(c2, farDim));
+            const uint packed = inGrid
+                ? farLod.cells[farBase() + uint(c2.x) +
+                               uint(c2.y) * uint(farDim.x)]
+                : 0u;
+            const float fh = float(packed & 0xFFFFu);
+            if (holeDbgFar &&
+                all(greaterThanEqual(c2, holeCellMin)) &&
+                all(lessThanEqual(c2, holeCellMax))) {
+                holeVisitedFar = true;
+                if (fh == 0.0) {
+                    holeEmptyFar = true;
+                }
+            }
+
+            if (fh > 0.0 && fy0 < fh) {
+                // Entered this cell below the surface top: side-face hit.
+                // A far cell can also be entered through the world's bottom
+                // when the camera is outside the near region. The height
+                // field has no underside material, so use bedrock and the
+                // bottom normal for that one boundary case instead of
+                // painting a grass top into the underground view.
+                const bool bottomEntry = firstFarCell && rd.y > 0.0 &&
+                    abs(start.y + rd.y * farStartRaw) < 0.01;
+                farHit = true;
+                hitType = bottomEntry ? 6u : ((packed >> 16u) & 0xFFu);
+                tHit = ft;
+                normal = bottomEntry ? vec3(0.0, -1.0, 0.0)
+                    : (fLastAxis == 0)
+                        ? vec3(-float(fStepX), 0.0, 0.0)
+                        : (fLastAxis == 2)
+                            ? vec3(0.0, 0.0, -float(fStepZ))
+                            : vec3(0.0, 1.0, 0.0);
+                termCause = TERM_HIT;
+                break;
+            }
+            if (fh > 0.0 && rd.y < 0.0 && fy1 < fh) {
+                // Crossed the surface top plane inside this cell.
+                farHit = true;
+                hitType = (packed >> 16u) & 0xFFu;
+                tHit = clamp((fh - start.y) / rd.y, ft, ftExit);
+                normal = vec3(0.0, 1.0, 0.0);
+                termCause = TERM_HIT;
+                break;
+            }
+
+            // Branchless 2D DDA step (same tie rule as the near march).
+            ft = min(fMaxX, fMaxZ);
+            const bool fTakeX = fMaxX < fMaxZ;
+            fMaxX += fTakeX ? fDeltaX : 0.0;
+            fMaxZ += fTakeX ? 0.0 : fDeltaZ;
+            c2.x += fTakeX ? fStepX : 0;
+            c2.y += fTakeX ? 0 : fStepZ;
+            fLastAxis = fTakeX ? 0 : 2;
+            firstFarCell = false;
+        }
+        }  // valid vertical far interval
+    }
+
+    // Base layer: the hit behind everything (or the miss/sky result).
+    vec3 result;
+    if (hit || farHit) {
+        result = shadeSurfaceHit(hitType, normal, tHit, farHit, cell.xz,
+                                 hitY, start, rd, rdWorld, tEntryOffset);
+        // First far-field activation fades in (scene.misc.z, 0 -> 1):
+        // the whole distant world pops in at once otherwise, which read
+        // as "LOD appears before near chunks". Recenters do NOT fade -
+        // their cells are bit-identical by construction (world-aligned
+        // window shift), so this only ever ramps once per session.
+        if (farHit && scene.misc.z < 0.999) {
+            result = mix(skyColor(rdWorld), result, scene.misc.z);
+        }
+    } else if (holeDbgFar) {
+        // VV_DEBUG_HOLE (see the far march): magenta = crossed an EMPTY
+        // far cell of the target chunk (data hole); cyan = crossed it but
+        // passed over the stored surface (height too low); yellow = the
+        // march never crossed the target chunk (geometry/aim).
+        if (holeEmptyFar) {
+            return vec3(1.0, 0.0, 1.0);
+        }
+        if (holeVisitedFar) {
+            return vec3(0.0, 1.0, 1.0);
+        }
+        return vec3(1.0, 1.0, 0.0);
+    } else {
+        result = debugTerm ? termColor(termCause) : skyColor(rdWorld);
+    }
+
+    // Front layer: a hit inside a FADING chunk, composited over whatever
+    // the march found behind it (far-LOD preview of the same terrain,
+    // another chunk, or sky). One layer is plenty - overlapping fading
+    // chunks at the same pixel for 0.6 s is rare enough to ignore.
+    if (frontValid && !debugTerm) {
+        const vec3 front = shadeSurfaceHit(
+            frontType, frontNormal, frontTHit, false, frontCellXZ,
+            frontHitY, start, rd, rdWorld, tEntryOffset);
+        result = mix(result, front, frontFade);
+    }
+    return result;
+}
+
+uint packColor(vec3 rgb01)
+{
+    vec3 c = clamp(rgb01, 0.0, 1.0);
+
+    // Debanding: add +-0.5 LSB of interleaved gradient noise before the
+    // 8-bit quantization below. Smooth gradients (the sky) would otherwise
+    // show visible bands; the noise is imperceptible on its own.
+    vec2 pix = vec2(gl_GlobalInvocationID.xy);
+    float ign = fract(52.9829189 * fract(0.06711056 * pix.x + 0.00583715 * pix.y));
+    c += vec3((ign - 0.5) / 255.0);
+    c = clamp(c, 0.0, 1.0);
+
+    uint r = uint(c.r * 255.0 + 0.5);
+    uint g = uint(c.g * 255.0 + 0.5);
+    uint b = uint(c.b * 255.0 + 0.5);
+    uint a = 255u;
+
+    if (pc.screen.z != 0u) {
+        return (a << 24) | (r << 16) | (g << 8) | (b << 0);
+    }
+    return (a << 24) | (b << 16) | (g << 8) | (r << 0);
+}
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    uvec2 size = pc.screen.xy;
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+
+    uint idx = p.y * size.x + p.x;
+
+    const bool debugTerm = scene.misc.y > 0.5;
+
+    // Aspect handling: vertical FOV; the horizontal axis is scaled by the
+    // aspect ratio. uv spans [-1, 1] with y flipped (screen y grows down).
+    // One ray per pixel through the pixel center. (The 4x supersampling
+    // mode was removed in pass 10 - too heavy per the owner; the far LOD
+    // keeps distant edges stable on its own.)
+    vec2 uvStep = 2.0 / vec2(size);  // NDC units per pixel
+    vec2 uv = (vec2(p) + vec2(0.5)) * uvStep - 1.0;
+    uv.y = -uv.y;
+    uv.x *= float(size.x) / float(size.y);
+
+    outPixels.outData[idx] = packColor(traceRay(uv, debugTerm));
+}

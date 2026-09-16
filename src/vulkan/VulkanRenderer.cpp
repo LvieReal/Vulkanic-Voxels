@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <set>
 
+#include "core/CommandLine.hpp"
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
 #include "platform/VulkanSurfaceFactory.hpp"
@@ -17,6 +18,9 @@
 #include "render/VoxelTextureFiles.hpp"
 #include "vulkan/StreamPriority.hpp"
 #include "vulkan/VulkanUtils.hpp"
+#include "voxel/SdfBox.hpp"
+#include "voxel/SdfField.hpp"
+#include "voxel/SdfHandover.hpp"
 #include "voxel/VoxelTypes.hpp"
 
 namespace vv::vulkan {
@@ -48,6 +52,13 @@ constexpr std::size_t kStreamSprintChunks = 16;
 // How many chunks the generation worker may run ahead of the upload pump
 // (bounds worker memory: N x 128 KB of staged voxel data).
 constexpr std::size_t kGenBacklog = 6;
+// Pass 49: open sky kept above the highest solid cell of the SDF box's
+// footprint. The soft-shadow penumbra a caster's top corner casts lives in
+// that margin, so cropping flush to the terrain would flatten the light right
+// above cliffs/overhangs. On the test terrain the highest solid cell is y=93
+// of 128, so the band is 110 cells: 18 rows (14% of the cells, ~2.7 MB of the
+// upload) dropped - and flatter ground drops far more, since it is all sky.
+constexpr std::uint32_t kVoxelSdfBandMargin = 16;
 // Chunk fade-in duration (seconds) and the first far-field activation
 // fade (recenters never fade - their cells are identical).
 constexpr double kChunkFadeSeconds = 0.6;
@@ -81,6 +92,8 @@ bool extensionSupported(const char* name,
                      });
 }
 
+constexpr std::uint32_t kDefaultFarLodRadiusChunks = 64;
+
 }  // namespace
 
 VulkanRenderer::~VulkanRenderer() {
@@ -97,15 +110,80 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     return false;
   }
 
-  // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
-  // colors each pixel by ray-termination cause.
-  m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
-  if (const char* perfEnv = std::getenv("VV_PERF")) {
-    m_perfEnabled = std::strcmp(perfEnv, "0") != 0;
+  // Terrain LOD is an explicit experiment, not a hidden default. Keep this
+  // guard here as well as in setWorldConfig() so a renderer that uses the
+  // built-in config follows the same contract. Pass 61: the switches come from
+  // the parsed command line (see core/CommandLine.hpp), which the environment
+  // seeds - there is no getenv in this file any more.
+  const bool farLodRequested = vv::core::options().farLod;
+  if (farLodRequested && m_voxelConfig.farLodRadiusChunks == 0) {
+    m_voxelConfig.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
+  } else if (!farLodRequested) {
+    m_voxelConfig.farLodRadiusChunks = 0;
   }
-  if (const char* holeEnv = std::getenv("VV_DEBUG_HOLE")) {
+  m_sdfShadows = vv::core::options().sdfShadows;
+  if (vv::core::options().shadowSharp) {
+    m_sdfShadows = false;
+  }
+  std::fprintf(stderr, "[vulkan] far LOD: %s (--far-lod), shadows: %s\n",
+               farLodRequested ? "on" : "off",
+               m_sdfShadows ? "SDF experiment" : "exact binary");
+  if (m_sdfShadows) {
+    // Pass 49: how far the camera's chunk may drift from the live field's
+    // center before the box is rebuilt. The box covers +/- kSdfHalfChunks
+    // chunks, so the default of 1 keeps two chunks of high-quality field in
+    // front of the camera while cutting the rebake rate to ~half; 0 restores
+    // the old "every completed region move" cadence (the A/B lever), and 2 is
+    // the most the coverage allows.
+    m_sdfMarginChunks = 1;
+    if (vv::core::options().sdfMarginSet) {
+      m_sdfMarginChunks = static_cast<std::uint32_t>(
+          std::clamp(vv::core::options().sdfMargin, 0,
+                     static_cast<int>(
+                         vv::vulkan::VoxelResources::kSdfHalfChunks) -
+                         1));
+    }
+    std::fprintf(stderr,
+                 "[vulkan] SDF rebuild margin: %u chunk(s) of drift (box "
+                 "covers %u)\n",
+                 m_sdfMarginChunks,
+                 vv::vulkan::VoxelResources::kSdfHalfChunks);
+    // Pass 57: the soft shadow ray is jittered per pixel as a CONE plus a
+    // fixed world displacement at the origin, which turns the discrete march's
+    // coherent sampling error (bands across a penumbra, stepped contacts) into
+    // noise at one pixel's scale. The lever is the CONE SLOPE (unset = the
+    // shader's kShadowJitterDefault, 0.002 since pass 57's follow-up commit and
+    // the owner's on-device pick; 0 for the un-jittered estimate, up to 0.5 =
+    // a 27-degree cone to overshoot on purpose; the contact displacement scales
+    // with it linearly). It rides pc.camera.w to the shader.
+    if (vv::core::options().shadowJitterSet) {
+      m_shadowJitter =
+          std::clamp(vv::core::options().shadowJitter, 0.0f, 0.5f);
+    }
+    if (m_shadowJitter < 0.0f) {
+      std::fprintf(stderr,
+                   "[vulkan] shadow ray jitter: shader default "
+                   "(kShadowJitterDefault)\n");
+    } else if (m_shadowJitter == 0.0f) {
+      std::fprintf(stderr, "[vulkan] shadow ray jitter: off (un-jittered)\n");
+    } else {
+      std::fprintf(stderr,
+                   "[vulkan] shadow ray jitter: %.3f slope (contact floor "
+                   "%.3f vox)\n",
+                   static_cast<double>(m_shadowJitter),
+                   static_cast<double>(
+                       vv::voxel::shadowJitterFloorVox(m_shadowJitter)));
+    }
+  }
+
+  // Debug visualization (see docs/AGENT_NOTES.md): --debug-term false-colors
+  // each pixel by ray-termination cause.
+  m_debugTerminators = vv::core::options().debugTerm;
+  m_perfEnabled = vv::core::options().perf;
+  if (!vv::core::options().debugHole.empty()) {
     int hx = 0, hz = 0;
-    if (std::sscanf(holeEnv, "%d,%d", &hx, &hz) == 2) {
+    if (std::sscanf(vv::core::options().debugHole.c_str(), "%d,%d", &hx, &hz) ==
+        2) {
       m_holeDebugX = hx;
       m_holeDebugZ = hz;
       std::fprintf(stderr,
@@ -130,6 +208,8 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
 
   const uint32_t width = std::max(1u, info.width);
   const uint32_t height = std::max(1u, info.height);
+  m_requestedWidth = width;
+  m_requestedHeight = height;
   if (!createSwapchain(width, height, outError) ||
       !createCommandBuffers(outError) || !createSyncObjects(outError)) {
     cleanup();
@@ -145,9 +225,16 @@ void VulkanRenderer::resize(uint32_t width, uint32_t height) {
     return;
   }
 
+  m_requestedWidth = width;
+  m_requestedHeight = height;
   m_framebufferResized = true;
   std::string error;
-  (void)recreateSwapchain(width, height, error);
+  if (recreateSwapchain(width, height, error)) {
+    // The swapchain was rebuilt for this size right here, so the flag must not
+    // cause a second, redundant rebuild at present time (it stays set when the
+    // rebuild failed, so the present path retries).
+    m_framebufferResized = false;
+  }
 }
 
 void VulkanRenderer::drawFrame() {
@@ -182,9 +269,30 @@ void VulkanRenderer::drawFrame() {
     farFade = static_cast<float>(
         std::min(elapsed / kFarFadeSeconds, 1.0));
   }
-  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
-                        glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
-                                  0.0f, 0.0f));
+  // Pass 62: the ambient sky-visibility term and its cave floor ride the
+  // scene uniform (SceneUBO.ambient). < 0 in y = the shader's own default, so
+  // "unset" never has to be spelled out twice (the pass-51 lesson: a uniform
+  // whose writer and reader disagree is worse than no uniform).
+  const vv::core::GameOptions& vvOptions = vv::core::options();
+  m_sceneUniform.update(
+      m_camera, m_timeSeconds, m_lighting,
+      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
+                m_sdfShadows ? 1.0f : 0.0f, 0.0f),
+      glm::vec4(vvOptions.ambient ? 1.0f : 0.0f,
+                vvOptions.ambientFloorSet ? vvOptions.ambientFloor : -1.0f,
+                0.0f, 0.0f));
+
+  if (m_swapchain == VK_NULL_HANDLE) {
+    // A recreate failed above and left no swapchain to acquire from. Retry;
+    // once the surface can provide one again the loop presents normally. The
+    // frame loop keeps pumping events while this happens, so a window that is
+    // being resized or un-minimized recovers on its own.
+    std::string recreateError;
+    if (!recreateSwapchain(requestedWidth(), requestedHeight(),
+                           recreateError)) {
+      return;
+    }
+  }
 
   uint32_t imageIndex = 0;
   VkResult acquire = vkAcquireNextImageKHR(
@@ -193,8 +301,7 @@ void VulkanRenderer::drawFrame() {
 
   if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
     std::string error;
-    (void)recreateSwapchain(m_swapchainExtent.width, m_swapchainExtent.height,
-                            error);
+    (void)recreateSwapchain(requestedWidth(), requestedHeight(), error);
     return;
   }
   if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
@@ -213,7 +320,11 @@ void VulkanRenderer::drawFrame() {
     return;
   }
 
-  VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+  // The acquire wait must cover every stage that touches the acquired image:
+  // the compute dispatch reads the voxel data, and the TRANSFER stage then
+  // transitions and writes the swapchain image itself.
+  VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT};
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submitInfo.waitSemaphoreCount = 1;
@@ -222,7 +333,14 @@ void VulkanRenderer::drawFrame() {
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &m_commandBuffers[m_currentFrame];
   submitInfo.signalSemaphoreCount = 1;
-  submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[m_currentFrame];
+  // The render-finished semaphore is per SWAPCHAIN IMAGE, not per frame in
+  // flight: the present operation that waits on it may still hold it when this
+  // frame slot comes around again, and presenting only guarantees that the
+  // image it presented is free again when that image is re-acquired. Indexing
+  // by the acquired image means the semaphore is reused exactly when the image
+  // it was presented with is handed back
+  // (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+  submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
 
   if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo,
                     m_inFlightFences[m_currentFrame]) != VK_SUCCESS) {
@@ -233,7 +351,7 @@ void VulkanRenderer::drawFrame() {
   VkPresentInfoKHR presentInfo{};
   presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   presentInfo.waitSemaphoreCount = 1;
-  presentInfo.pWaitSemaphores = &m_renderFinishedSemaphores[m_currentFrame];
+  presentInfo.pWaitSemaphores = &m_renderFinishedSemaphores[imageIndex];
   presentInfo.swapchainCount = 1;
   presentInfo.pSwapchains = &m_swapchain;
   presentInfo.pImageIndices = &imageIndex;
@@ -243,8 +361,10 @@ void VulkanRenderer::drawFrame() {
       m_framebufferResized) {
     m_framebufferResized = false;
     std::string error;
-    (void)recreateSwapchain(m_swapchainExtent.width, m_swapchainExtent.height,
-                            error);
+    // Present says the swapchain no longer matches the surface, so rebuild it
+    // for the window size we were last told about. Using the previous extent
+    // here recreated the swapchain at the OLD size (pass 45).
+    (void)recreateSwapchain(requestedWidth(), requestedHeight(), error);
   } else if (present != VK_SUCCESS) {
     setDeviceLost("vkQueuePresentKHR failed (" +
                   utils::vkResultToString(present) + ").");
@@ -301,6 +421,13 @@ void VulkanRenderer::cleanup() {
   }
   m_farBuildRunning = false;
   m_farPendingReady = false;
+  // Join the 3D voxel SDF builder thread (pass 38): it reads the world
+  // chunks (owned by m_world, destroyed below) and fills m_sdfPending.
+  if (m_sdfThread.joinable()) {
+    m_sdfThread.join();
+  }
+  m_sdfBuildRunning = false;
+  m_sdfPendingReady = false;
 
   if (m_device) {
     vkDeviceWaitIdle(m_device);
@@ -330,15 +457,21 @@ void VulkanRenderer::cleanup() {
     m_pipelineLayout = VK_NULL_HANDLE;
   }
 
-  for (size_t i = 0; i < m_imageAvailableSemaphores.size(); ++i) {
-    if (m_imageAvailableSemaphores[i]) {
-      vkDestroySemaphore(m_device, m_imageAvailableSemaphores[i], nullptr);
+  // Three separate loops: the present semaphores are per swapchain image, the
+  // other two are per frame in flight, so the array sizes differ.
+  for (auto semaphore : m_imageAvailableSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
     }
-    if (m_renderFinishedSemaphores[i]) {
-      vkDestroySemaphore(m_device, m_renderFinishedSemaphores[i], nullptr);
+  }
+  for (auto semaphore : m_renderFinishedSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
     }
-    if (m_inFlightFences[i]) {
-      vkDestroyFence(m_device, m_inFlightFences[i], nullptr);
+  }
+  for (auto fence : m_inFlightFences) {
+    if (fence != VK_NULL_HANDLE) {
+      vkDestroyFence(m_device, fence, nullptr);
     }
   }
   m_imageAvailableSemaphores.clear();
@@ -379,15 +512,20 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
     return;
   }
 
-  if (!config.isValid()) {
+  vv::voxel::VoxelConfig adjusted = config;
+  const bool farLodRequested = vv::core::options().farLod;
+  if (farLodRequested && adjusted.farLodRadiusChunks == 0) {
+    adjusted.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
+  } else if (!farLodRequested) {
+    adjusted.farLodRadiusChunks = 0;
+  }
+  adjusted.renderRadiusChunks = std::min(adjusted.renderRadiusChunks, 16u);
+  adjusted.maxTraceSteps = std::min(adjusted.maxTraceSteps, 4096u);
+
+  if (!adjusted.isValid()) {
     return;
   }
-
-  m_voxelConfig = config;
-  m_voxelConfig.renderRadiusChunks =
-      std::min(m_voxelConfig.renderRadiusChunks, 16u);
-  m_voxelConfig.maxTraceSteps =
-      std::min(m_voxelConfig.maxTraceSteps, 4096u);
+  m_voxelConfig = adjusted;
 }
 
 void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
@@ -467,6 +605,16 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       std::floor(cameraPosition.x / chunkWorldX));
   const int32_t chunkZ = static_cast<int32_t>(
       std::floor(cameraPosition.z / chunkWorldZ));
+
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): decide whether the field must
+  // follow the camera, then drive the handover (join + no-wait upload, a
+  // sub-millisecond fence-scoped copy and a no-op atomic load every other
+  // frame). Pass 49: the rebuild is armed HERE, from the camera's CURRENT
+  // chunk and only once its coverage is about to run out - see
+  // SdfHandover::needsRecenter for why the old region-move trigger was
+  // rebuilding 2-3x more often than the field needs.
+  followSdfField(chunkX, chunkZ);
+  ensureSdfField();
 
   if (m_streamActive) {
     if (chunkX != m_streamTarget.x || chunkZ != m_streamTarget.z) {
@@ -625,7 +773,7 @@ void VulkanRenderer::rebuildStreamPending() {
   // mountain terrain by up to ~25 voxels (the "missing chunks at the
   // render-distance edge" holes).
   m_streamRingPending.clear();
-  if (m_world != nullptr) {
+  if (m_voxelConfig.farLodRadiusChunks != 0 && m_world != nullptr) {
     for (int32_t dz = -r - 1; dz <= r + 1; ++dz) {
       for (int32_t dx = -r - 1; dx <= r + 1; ++dx) {
         if (dx >= -r && dx <= r && dz >= -r && dz <= r) {
@@ -944,8 +1092,10 @@ void VulkanRenderer::finishRegionMove() {
   std::vector<vv::voxel::ChunkCoord> evicted;
   // Amortized (max 8 per swap): freeing a whole crossing row of 128 KB
   // chunk buffers in one call was visible allocator churn.
-  m_world->evictOutside(m_streamTarget.x, m_streamTarget.z,
-                        cfg.renderRadiusChunks + 1, evicted, 8);
+  const std::uint32_t cacheRadius =
+      cfg.renderRadiusChunks + (cfg.farLodRadiusChunks != 0 ? 1u : 0u);
+  m_world->evictOutside(m_streamTarget.x, m_streamTarget.z, cacheRadius, evicted,
+                        8);
 
   // Final publish (logs holes: after completion every region cell must
   // have a slot; an empty one is a real missing chunk).
@@ -961,6 +1111,14 @@ void VulkanRenderer::finishRegionMove() {
   m_regionCenter = m_streamTarget;
   m_streamActive = false;
 
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): this used to be where the
+  // rebuild was requested, once per completed region move. Pass 49 moved that
+  // decision to followSdfField (called every frame from updateWorld): it waits
+  // until the camera's chunk has drifted past the live field's margin, and it
+  // aims the build at the camera's CURRENT chunk instead of the chunk the
+  // stream just finished. The old field keeps rendering until the new one is
+  // published, so there is still no gap - but the builder thread is no longer
+  // running a rebake loop behind every chunk crossing.
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1113,6 +1271,330 @@ void VulkanRenderer::ensureFarField(int32_t centerChunkX,
     if (needsRebuild) {
       launchFarFieldBuild(centerChunkX, centerChunkZ);
     }
+  }
+}
+
+void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
+                                    int32_t centerChunkZ) {
+  if (m_sdfBuildRunning.load() || !m_sdfShadows || !m_world) {
+    return;
+  }
+
+  const auto& cfg = m_voxelConfig;
+  // Box geometry + the voxel -> chunk mapping live in voxel/SdfBox.hpp so the
+  // CPU test can pin them against the real Chunk layout (pass 39: the box was
+  // indexed with the wrong Z stride, which garbled the whole field).
+  const vv::voxel::SdfBoxGeometry box = vv::voxel::SdfBoxGeometry::centeredOn(
+      centerChunkX, centerChunkZ, vv::vulkan::VoxelResources::kSdfHalfChunks,
+      cfg.chunkSizeX, cfg.chunkSizeZ, cfg.worldHeight);
+  if (!box.valid()) {
+    std::fprintf(stderr,
+                 "[vulkan] SDF build skipped: bad box geometry (%ux%ux%u, "
+                 "chunks %u at %ux%u)\n",
+                 box.nx, box.ny, box.nz, box.chunksPerSide, box.chunkSizeX,
+                 box.chunkSizeZ);
+    return;
+  }
+  // Pass 50: the seed is packed into three bit fields, so the box's spans
+  // have to fit 31 bits together. (They do with room to spare for any sane
+  // config: the default box packs 8 + 7 + 8 = 23 bits. A body that big would
+  // also need a ~300 MB seed buffer.) Refuse it here with a reason rather
+  // than upload a field of empty seeds.
+  const vv::voxel::SdfField::SeedBits seedBits =
+      vv::voxel::SdfField::seedBitsFor(static_cast<int>(box.nx),
+                                       static_cast<int>(box.ny),
+                                       static_cast<int>(box.nz));
+  if (!seedBits.fits()) {
+    std::fprintf(stderr,
+                 "[vulkan] SDF build skipped: a %ux%ux%u box needs %d seed "
+                 "bits (max %d)\n",
+                 box.nx, box.ny, box.nz,
+                 seedBits.x + seedBits.y + seedBits.z,
+                 vv::voxel::kMaxSeedBits);
+    return;
+  }
+  m_sdfPendingReady = false;
+  m_sdfBuildRunning = true;
+
+  const std::uint32_t side = box.chunksPerSide;
+  const int32_t firstChunkX = centerChunkX - static_cast<int32_t>(side / 2u);
+  const int32_t firstChunkZ = centerChunkZ - static_cast<int32_t>(side / 2u);
+  // The box covers whole chunks [center-half, center+half-1] on X/Z:
+  // snapshot their voxel types HERE, on the render thread (the only thread
+  // that mutates the world chunk map - install/evict), so the worker's
+  // per-voxel solid test is a plain array read with no map access (and no
+  // race with a concurrent install/evict). Missing chunks read as air.
+  const auto snapshotStart = std::chrono::steady_clock::now();
+  std::vector<std::vector<std::uint8_t>> chunkSnapshots;
+  chunkSnapshots.resize(static_cast<std::size_t>(side) * side);
+  for (std::uint32_t cz = 0; cz < side; ++cz) {
+    for (std::uint32_t cx = 0; cx < side; ++cx) {
+      if (const vv::voxel::Chunk* c = m_world->findChunk(
+              vv::voxel::ChunkCoord{firstChunkX + static_cast<int32_t>(cx),
+                                    firstChunkZ + static_cast<int32_t>(cz)})) {
+        chunkSnapshots[static_cast<std::size_t>(cz) * side + cx] =
+            c->voxelTypes();  // copy (the chunk may be evicted after)
+      }
+    }
+  }
+
+  const double snapshotMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                snapshotStart)
+                                .count();
+
+  // The thread reads the SNAPSHOT (its own copy) and writes m_sdfPending,
+  // which the main thread touches only after m_sdfPendingReady flips.
+  m_sdfThread = std::thread(
+      [snapshots = std::move(chunkSnapshots), box, centerChunkX, centerChunkZ,
+       snapshotMs, this]() mutable {
+        // Pass 49: drop the empty sky above the terrain. The band contains
+        // every solid cell of the footprint, so every retained cell keeps its
+        // full-height argmin seed exactly (see SdfBoxGeometry::cropToBand):
+        // same picture, 14% fewer cells on the test terrain - and together
+        // with the seed pack fused into the build, ~25-30% less worker time
+        // per bake, while the upload drops from 18.9 MB to 16.2 MB.
+        const auto bandStart = std::chrono::steady_clock::now();
+        const std::uint32_t bandNy = vv::voxel::sdfBoxBandHeight(
+            box, snapshots, kVoxelSdfBandMargin);
+        vv::voxel::SdfBoxGeometry banded = box;
+        banded.cropToBand(bandNy);
+        const double bandMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - bandStart)
+                                  .count();
+        if (!banded.valid()) {
+          banded = box;  // never build an invalid window
+        }
+
+        const auto buildStart = std::chrono::steady_clock::now();
+        vv::voxel::SdfField sdf;
+        vv::voxel::buildSdfBoxField(banded, snapshots, sdf);
+        const double buildMs = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - buildStart)
+                                   .count();
+        // The field ALREADY IS the shader's encoding (pass 49: u32 argmin
+        // seeds, kSdfEmptySeed = no solid in view, box layout
+        // x + y*nx + z*nx*ny), so the hand-over is a move - the old int32
+        // build + separate pack pass cost a full 19 MB traversal per bake.
+        // The CPU test pins this array against the shader's convention.
+        sdf.releaseSeeds(m_sdfPending.seeds);
+        m_sdfPending.boxX = banded.originX;
+        m_sdfPending.boxY = banded.originY;
+        m_sdfPending.boxZ = banded.originZ;
+        m_sdfPending.nx = banded.nx;
+        m_sdfPending.ny = banded.ny;
+        m_sdfPending.nz = banded.nz;
+        m_sdfPending.centerChunkX = centerChunkX;
+        m_sdfPending.centerChunkZ = centerChunkZ;
+        m_sdfPending.fullNy = box.ny;
+        // Pass 50: the packing the build used, so the shader can decode it.
+        const vv::voxel::SdfField::SeedBits bits = sdf.seedBits();
+        m_sdfPending.seedBitsX = static_cast<std::uint32_t>(bits.x);
+        m_sdfPending.seedBitsY = static_cast<std::uint32_t>(bits.y);
+        m_sdfPending.seedBitsZ = static_cast<std::uint32_t>(bits.z);
+        m_sdfPending.snapshotMs = snapshotMs;
+        m_sdfPending.bandMs = bandMs;
+        m_sdfPending.buildMs = buildMs;
+        m_sdfPendingReady.store(true, std::memory_order_release);
+      });
+}
+
+// Pass 49: does the live field still cover the camera with margin? If not,
+// aim the next build at the camera's CURRENT chunk. Never arms while a region
+// move is streaming: the box must be built from fully installed chunks (a
+// snapshot taken mid-stream reads the missing chunks as air, i.e. a field with
+// holes - and holes in an SDF read as "open space", so the shadows would go
+// light exactly where the new terrain is arriving).
+void VulkanRenderer::followSdfField(int32_t chunkX, int32_t chunkZ) {
+  if (!m_sdfShadows || !m_world || m_streamActive) {
+    return;
+  }
+  const bool needs =
+      !m_sdfFieldActive ||
+      vv::voxel::SdfHandover::needsRecenter(m_sdfActiveCenterX,
+                                            m_sdfActiveCenterZ, chunkX, chunkZ,
+                                            m_sdfMarginChunks);
+  if (!needs) {
+    return;
+  }
+  m_sdfWantValid = true;
+  m_sdfWantCenterX = chunkX;
+  m_sdfWantCenterZ = chunkZ;
+}
+
+void VulkanRenderer::ensureSdfField() {
+  if (!m_sdfShadows || !m_world) {
+    return;
+  }
+  // The box uniform and the seed buffer are a PAIR (pass 42): the shader
+  // resolves "which cell is this" from the box and indexes the seeds with it,
+  // so a box published next to another build's seeds shades a frame out of a
+  // field that describes different terrain - the owner's one-frame "chunks go
+  // dark". vv::voxel::SdfHandover owns the ordering (copy submitted without a
+  // wait, box published only once that copy's fence signals, field retried
+  // until it covers the camera's chunk); this is its driver.
+  vv::voxel::SdfHandover hand;
+  hand.buildRunning = m_sdfBuildRunning.load();
+  hand.buildReady = m_sdfPendingReady.load();
+  hand.uploadInFlight = m_sdfUploadInFlight;
+  hand.copyComplete =
+      m_sdfUploadInFlight && m_voxelResources.sdfUploadComplete(m_device);
+  hand.haveField = m_sdfFieldActive;
+  hand.wantValid = m_sdfWantValid;
+  hand.activeCenterX = m_sdfActiveCenterX;
+  hand.activeCenterZ = m_sdfActiveCenterZ;
+  hand.wantCenterX = m_sdfWantCenterX;
+  hand.wantCenterZ = m_sdfWantCenterZ;
+  hand.liveHalf = m_sdfLiveHalf;
+
+  switch (hand.step()) {
+    case vv::voxel::SdfHandover::Step::JoinAndUpload: {
+      // The build is done (ready is only set at the end, so this join returns
+      // immediately) and its copy goes onto the queue WITHOUT a wait: it rides
+      // behind every frame that resolved cells against the old box, which is
+      // what makes the publish below safe. Waiting here was the frame hitch
+      // the owner felt as "big latency when the SDFs get recomputed".
+      if (m_sdfThread.joinable()) {
+        m_sdfThread.join();
+      }
+      m_sdfBuildRunning = false;
+
+      // Same geometry the build used - a build from another config (or a
+      // half-installed world) can never publish a mismatched field.
+      const auto& cfg = m_voxelConfig;
+      const vv::voxel::SdfBoxGeometry box =
+          vv::voxel::SdfBoxGeometry::centeredOn(
+              m_sdfPending.centerChunkX, m_sdfPending.centerChunkZ,
+              vv::vulkan::VoxelResources::kSdfHalfChunks, cfg.chunkSizeX,
+              cfg.chunkSizeZ, cfg.worldHeight);
+      const uint32_t nx = box.nx;
+      const uint32_t nz = box.nz;
+      // Pass 49: the field is band-cropped, so ny is the BUILD's band height
+      // (0 < ny <= the full height) while the X/Z extent must still match the
+      // geometry this publish path can vouch for.
+      const bool dimsOk = m_sdfPending.nx == nx && m_sdfPending.nz == nz &&
+                          m_sdfPending.ny > 0 &&
+                          m_sdfPending.ny <= box.ny &&
+                          m_sdfPending.ny <= m_sdfPending.fullNy &&
+                          // Pass 50: the packing the shader will decode with
+                          // must be the one the field was built with.
+                          m_sdfPending.seedBitsX +
+                                  m_sdfPending.seedBitsY +
+                                  m_sdfPending.seedBitsZ <=
+                              static_cast<std::uint32_t>(
+                                  vv::voxel::kMaxSeedBits) &&
+                          m_sdfPending.seeds.size() ==
+                              static_cast<std::size_t>(m_sdfPending.nx) *
+                                  m_sdfPending.ny * m_sdfPending.nz;
+      if (dimsOk) {
+        std::string uploadError;
+        // The SPARE half: whatever the published box points at keeps holding
+        // exactly the seeds it describes until the new box goes live.
+        const std::uint32_t half = hand.uploadHalf();
+        const auto uploadStart = std::chrono::steady_clock::now();
+        if (!m_voxelResources.beginSdfUpload(
+                m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
+                m_sdfPending.seeds, half, m_sdfPending.boxX, m_sdfPending.boxY,
+                m_sdfPending.boxZ, m_sdfPending.nx, m_sdfPending.ny,
+                m_sdfPending.nz, uploadError)) {
+          std::fprintf(stderr, "[vulkan] SDF upload failed: %s\n",
+                       uploadError.c_str());
+        } else {
+          // The host-side staging copy of the (band-cropped) field. Timed for
+          // VV_PERF: this is render-thread time, so it is the only part of a
+          // bake the frame itself pays for; the fence wait inside is retired
+          // by construction (the caller never uploads twice without a publish).
+          m_sdfUploadMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - uploadStart)
+                              .count();
+          m_sdfUploadInFlight = true;
+          m_sdfUploadBox.boxX = m_sdfPending.boxX;
+          m_sdfUploadBox.boxY = m_sdfPending.boxY;
+          m_sdfUploadBox.boxZ = m_sdfPending.boxZ;
+          m_sdfUploadBox.nx = m_sdfPending.nx;
+          m_sdfUploadBox.ny = m_sdfPending.ny;
+          m_sdfUploadBox.nz = m_sdfPending.nz;
+          m_sdfUploadBox.seedBitsX = m_sdfPending.seedBitsX;
+          m_sdfUploadBox.seedBitsY = m_sdfPending.seedBitsY;
+          m_sdfUploadBox.seedBitsZ = m_sdfPending.seedBitsZ;
+          m_sdfUploadBox.centerChunkX = m_sdfPending.centerChunkX;
+          m_sdfUploadBox.centerChunkZ = m_sdfPending.centerChunkZ;
+          m_sdfUploadBox.half = half;
+        }
+      } else {
+        std::fprintf(
+            stderr,
+            "[vulkan] SDF build rejected (dims %ux%ux%u [band of %u] vs "
+            "%ux%ux%u)\n",
+            m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz,
+            m_sdfPending.fullNy, nx, box.ny, nz);
+      }
+      m_sdfPendingReady = false;
+      break;
+    }
+    case vv::voxel::SdfHandover::Step::Publish: {
+      // The copy's fence signalled, and because that copy was queued behind
+      // them, so did every frame that read the old box: no dispatch can be
+      // resolving cells while the new pairing goes live.
+      m_sdfUploadInFlight = false;
+      m_voxelResources.writeSdfBox(
+          m_sdfUploadBox.boxX, m_sdfUploadBox.boxY, m_sdfUploadBox.boxZ,
+          m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+          m_sdfUploadBox.seedBitsX, m_sdfUploadBox.seedBitsY,
+          m_sdfUploadBox.seedBitsZ, true, m_sdfUploadBox.half);
+      m_sdfLiveHalf = m_sdfUploadBox.half;
+      m_sdfFieldActive = true;
+      m_sdfActiveCenterX = m_sdfUploadBox.centerChunkX;
+      m_sdfActiveCenterZ = m_sdfUploadBox.centerChunkZ;
+      ++m_sdfBakeCount;
+      const auto publishedAt = std::chrono::steady_clock::now();
+      const double sinceLastS =
+          m_sdfLastPublishTime.time_since_epoch().count() == 0
+              ? 0.0
+              : std::chrono::duration<double>(publishedAt - m_sdfLastPublishTime)
+                    .count();
+      m_sdfLastPublishTime = publishedAt;
+      std::fprintf(stderr,
+                   "[vulkan] 3D voxel SDF active: %ux%ux%u cells at "
+                   "(%d,%d,%d) (chunk %d,%d)\n",
+                   m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+                   m_sdfUploadBox.boxX, m_sdfUploadBox.boxY,
+                   m_sdfUploadBox.boxZ, m_sdfUploadBox.centerChunkX,
+                   m_sdfUploadBox.centerChunkZ);
+      if (m_perfEnabled) {
+        // Pass 49: the bake's own bookkeeping, so "the SDFs got recomputed"
+        // stops being a guess. Worker ms are off the render thread (they cost
+        // the frame only as CPU contention); upload ms and snapshot ms are
+        // render-thread time.
+        const std::uint64_t cells =
+            static_cast<std::uint64_t>(m_sdfUploadBox.nx) *
+            m_sdfUploadBox.ny * m_sdfUploadBox.nz;
+        std::fprintf(
+            stderr,
+            "[perf] SDF bake #%llu: %ux%ux%u of %u cells (%.1f MB seeds) at "
+            "chunk (%d,%d) | worker: band %.1f + build %.1f ms | render: "
+            "snapshot %.1f + upload %.1f ms | %.2f s since the previous "
+            "bake\n",
+            static_cast<unsigned long long>(m_sdfBakeCount),
+            m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+            m_sdfPending.fullNy,
+            static_cast<double>(cells) * 4.0 / (1024.0 * 1024.0),
+            m_sdfUploadBox.centerChunkX, m_sdfUploadBox.centerChunkZ,
+            m_sdfPending.bandMs, m_sdfPending.buildMs, m_sdfPending.snapshotMs,
+            m_sdfUploadMs, sinceLastS);
+      }
+      break;
+    }
+    case vv::voxel::SdfHandover::Step::Relaunch: {
+      // No field yet, or a build the camera moved away from: the field must
+      // follow the camera's chunk instead of waiting for the next region move
+      // (that wait is what kept the newly streamed chunks on the hard 2.5D
+      // look for up to a crossing before the SDF shadows "appeared").
+      launchSdfBuild(m_sdfWantCenterX, m_sdfWantCenterZ);
+      break;
+    }
+    case vv::voxel::SdfHandover::Step::Idle:
+      break;
   }
 }
 
@@ -1274,6 +1756,14 @@ float VulkanRenderer::fogCutDistance() const {
   const float chunkWorldZ =
       static_cast<float>(cfg.chunkSizeZ) * cfg.voxelSize.z;
 
+  // During an asynchronous region move, m_regionCenter intentionally stays
+  // on the old complete region. The active table, however, may already have
+  // been published for the target region. Use the table's actual origin for
+  // the fog box so its cut follows the visible terrain immediately instead
+  // of waiting for the whole stream to finish.
+  const std::int32_t visibleCenterX = m_tableOriginX;
+  const std::int32_t visibleCenterZ = m_tableOriginZ;
+
   float x0, x1, z0, z1;
   if (m_farFieldActive) {
     x0 = static_cast<float>(m_farOriginVoxX) * cfg.voxelSize.x;
@@ -1284,9 +1774,9 @@ float VulkanRenderer::fogCutDistance() const {
                   cfg.voxelSize.z;
   } else {
     const int32_t originX =
-        m_regionCenter.x - static_cast<int32_t>(cfg.renderRadiusChunks);
+        visibleCenterX - static_cast<int32_t>(cfg.renderRadiusChunks);
     const int32_t originZ =
-        m_regionCenter.z - static_cast<int32_t>(cfg.renderRadiusChunks);
+        visibleCenterZ - static_cast<int32_t>(cfg.renderRadiusChunks);
     x0 = static_cast<float>(originX) * chunkWorldX;
     x1 = x0 + static_cast<float>(cfg.gridWidth()) * chunkWorldX;
     z0 = static_cast<float>(originZ) * chunkWorldZ;
@@ -1324,7 +1814,7 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
   appInfo.apiVersion = requestedApiVersion;
 
   // Platform-delegated: the WSI extensions matching the native window kind
-  // (VK_KHR_win32_surface / VK_KHR_xcb_surface / VK_KHR_wayland_surface /
+  // (VK_KHR_win32_surface / VK_KHR_xlib_surface / VK_KHR_wayland_surface /
   // VK_MVK_macos_surface), always preceded by VK_KHR_surface.
   std::vector<const char*> extensions =
       vv::platform::requiredVulkanInstanceExtensions(info.nativeWindow);
@@ -1353,13 +1843,13 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
 
   // Optional diagnostics: a debug messenger (validation-layer messages on
   // stderr when layers are present). The Khronos validation layer is only
-  // enabled when the VV_VALIDATION environment variable is set, since it
+  // enabled with --validation (or VV_VALIDATION in the environment), since it
   // carries a noticeable performance cost.
   std::vector<const char*> layers;
   if (extensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, available)) {
     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
   }
-  if (std::getenv("VV_VALIDATION") != nullptr) {
+  if (vv::core::options().validation) {
     uint32_t layerCount = 0;
     vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
     std::vector<VkLayerProperties> availableLayers(layerCount);
@@ -1548,6 +2038,17 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height,
       utils::choosePresentMode(support.presentModes);
   const VkExtent2D extent =
       utils::chooseSwapExtent(support.capabilities, width, height);
+  if (extent.width == 0 || extent.height == 0) {
+    // vkCreateSwapchainKHR rejects a zero extent
+    // (VUID-VkSwapchainCreateInfoKHR-imageExtent-01689), and everything sized
+    // from the extent - the output buffer, its memory - would be created at
+    // size 0, which vkCreateBuffer and vkAllocateMemory reject.
+    outError = surfaceHasNoSize()
+                   ? "The window has no drawable size (minimized or hidden); "
+                     "there is nothing to create a swapchain for."
+                   : "Refusing to create a swapchain with a zero extent.";
+    return false;
+  }
 
   uint32_t imageCount = support.capabilities.minImageCount + 1;
   if (support.capabilities.maxImageCount > 0 &&
@@ -1629,6 +2130,9 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height,
     }
   }
 
+  if (!createPresentSemaphores(outError)) {
+    return false;
+  }
   if (!createStorageResources(outError) || !createDescriptorSet(outError) ||
       !createComputePipeline(outError)) {
     return false;
@@ -1655,16 +2159,50 @@ void VulkanRenderer::cleanupSwapchain() {
   m_swapchainImageLayouts.clear();
 }
 
+uint32_t VulkanRenderer::requestedWidth() const {
+  return m_requestedWidth != 0 ? m_requestedWidth : 1;
+}
+
+uint32_t VulkanRenderer::requestedHeight() const {
+  return m_requestedHeight != 0 ? m_requestedHeight : 1;
+}
+
 bool VulkanRenderer::recreateSwapchain(uint32_t width, uint32_t height,
                                        std::string& outError) {
   if (width == 0 || height == 0) {
     return true;
   }
 
+  // Ask the surface what size it has BEFORE tearing the current swapchain
+  // down. A minimized window has no size (Win32 reports (0, 0)), and there is
+  // nothing sensible to create for it: the app is not presenting while
+  // minimized, and the swapchain it already has is the one the window will
+  // need again when it comes back. Deferring here (rather than building a
+  // degenerate one) keeps the frame loop's invariant - either there is a
+  // swapchain that matches the window, or there is no frame to present.
+  if (surfaceHasNoSize()) {
+    if (!m_swapchainRebuildDeferred) {
+      m_swapchainRebuildDeferred = true;
+      std::fprintf(stderr,
+                   "[vulkan] swapchain rebuild deferred: the surface reports "
+                   "no size (window minimized)\n");
+    }
+    return true;
+  }
+  m_swapchainRebuildDeferred = false;
+
   vkDeviceWaitIdle(m_device);
   cleanupSwapchain();
 
   return createSwapchain(width, height, outError);
+}
+
+bool VulkanRenderer::surfaceHasNoSize() const {
+  const utils::SwapchainSupportDetails support =
+      utils::querySwapchainSupport(m_physicalDevice, m_surface);
+  const VkExtent2D extent = support.capabilities.currentExtent;
+  return extent.width != UINT32_MAX &&
+         (extent.width == 0 || extent.height == 0);
 }
 
 bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
@@ -1750,15 +2288,30 @@ bool VulkanRenderer::createDescriptorSetLayout(std::string& outError) {
   blockHeightBinding.descriptorCount = 1;
   blockHeightBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): the argmin-seed storage
+  // buffer (binding 12) + the box geometry uniform (binding 13). Always
+  // bound (the buffers always exist); the shader only reads them when the
+  // box uniform's active flag is set.
+  VkDescriptorSetLayoutBinding sdfBufferBinding{};
+  sdfBufferBinding.binding = 12;
+  sdfBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  sdfBufferBinding.descriptorCount = 1;
+  sdfBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutBinding sdfBoxBinding{};
+  sdfBoxBinding.binding = 13;
+  sdfBoxBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  sdfBoxBinding.descriptorCount = 1;
+  sdfBoxBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
 VkDescriptorSetLayoutBinding bindings[] = {
       voxelBufferBinding, outputBufferBinding, sceneBinding, chunkTableBinding,
       paletteBinding, heightBinding, farBinding, fadeBinding,
       textureArrayBinding, textureSamplerBinding, texInfoBinding,
-      blockHeightBinding};
+      blockHeightBinding, sdfBufferBinding, sdfBoxBinding};
 
   VkDescriptorSetLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  info.bindingCount = 12;
+  info.bindingCount = 14;
   info.pBindings = bindings;
 
   VkResult r = vkCreateDescriptorSetLayout(m_device, &info, nullptr,
@@ -1872,13 +2425,14 @@ bool VulkanRenderer::createVoxelWorldAndUpload(std::string& outError) {
   m_farEverActivated = false;
 
   // Startup is ASYNC now: the old synchronous initial region blocked the
-  // first frame for ~10 s on slow machines (729 chunks x ~15 ms). The far
-  // build starts first (it needs the longest head start), then the region
-  // streams in through the normal worker + pump path from frame one -
-  // the world pops in around the camera over a couple of seconds instead
-  // of freezing. The table halves start zeroed (= all empty slots), so
-  // the first frames simply show far-LOD terrain everywhere.
-  launchFarFieldBuild(0, 0);
+  // first frame for ~10 s on slow machines (729 chunks x ~15 ms). When the
+  // optional far field is enabled it starts first (it needs the longest head
+  // start), then the region streams in through the normal worker + pump path
+  // from frame one. With LOD off there is no extra ring or background field;
+  // the near region is still streamed normally.
+  if (m_voxelConfig.farLodRadiusChunks != 0) {
+    launchFarFieldBuild(0, 0);
+  }
   beginRegionMove(0, 0);
 
   // Safety net above the fog cut: the budget must never bind before the fog
@@ -1936,10 +2490,11 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
 
   std::vector<const vv::voxel::Chunk*> newChunks;
   std::vector<vv::voxel::ChunkCoord> evicted;
-  // radius + 1: the seam-patch ring (see rebuildStreamPending) must be
-  // generated here too - the far cells one chunk beyond the region edge
-  // need real column tops or folded terrain shows holes there.
-  m_world->ensureRegion(centerChunkX, centerChunkZ, radius + 1, newChunks,
+  // The extra ring exists only for far-LOD seam patching. With LOD off,
+  // don't generate terrain that can never be sampled.
+  const std::uint32_t cacheRadius =
+      radius + (m_voxelConfig.farLodRadiusChunks != 0 ? 1u : 0u);
+  m_world->ensureRegion(centerChunkX, centerChunkZ, cacheRadius, newChunks,
                         evicted);
   syncLog.generated = newChunks.size();
 
@@ -2021,6 +2576,9 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   }
 
   m_regionCenter = vv::voxel::ChunkCoord{centerChunkX, centerChunkZ};
+  // The SDF field follows through followSdfField (pass 49), which runs every
+  // frame and therefore covers this synchronous path too - and only rebuilds
+  // once the camera has actually drifted past the live field's margin.
 
   // Rewrite the whole chunk table for the new region grid.
   std::vector<uint32_t> table(static_cast<size_t>(gridW) * gridH,
@@ -2041,6 +2599,8 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
     return false;
   }
   m_tableHalf = nextTableHalf;
+  m_tableOriginX = centerChunkX;
+  m_tableOriginZ = centerChunkZ;
 
   // Diagnostic (rare missing-chunk hunt): log empty cells in the table
   // that was just published.
@@ -2072,6 +2632,14 @@ void VulkanRenderer::cleanupSceneResources() {
 }
 
 bool VulkanRenderer::createStorageResources(std::string& outError) {
+  if (m_swapchainExtent.width == 0 || m_swapchainExtent.height == 0) {
+    // Defensive: a zero extent would size this buffer (and its memory) to zero,
+    // which vkCreateBuffer / vkAllocateMemory reject
+    // (VUID-VkBufferCreateInfo-size-00912,
+    // VUID-VkMemoryAllocateInfo-allocationSize-07897).
+    outError = "Cannot size the render targets from a zero swapchain extent.";
+    return false;
+  }
   const uint64_t elements = static_cast<uint64_t>(m_swapchainExtent.width) *
                             static_cast<uint64_t>(m_swapchainExtent.height);
   const VkDeviceSize bufferSize =
@@ -2144,12 +2712,13 @@ void VulkanRenderer::cleanupStorageResources() {
 bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolSize poolSizes[4] = {};
   poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSizes[0].descriptorCount = 9;  // voxel atlas, output, chunk table,
-                                    // palette, column heights, far LOD,
-                                    // chunk fade, texture info table,
-                                    // block max heights (pass 30)
+  poolSizes[0].descriptorCount = 10;  // voxel atlas, output, chunk table,
+                                     // palette, column heights, far LOD,
+                                     // chunk fade, texture info table,
+                                     // block max heights (pass 30),
+                                     // 3D voxel SDF (pass 38)
   poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  poolSizes[1].descriptorCount = 1;
+  poolSizes[1].descriptorCount = 2;  // scene + SDF box (pass 38)
   poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
   poolSizes[2].descriptorCount =
       vv::voxel::kMaxVoxelTextures;  // bindless texture array capacity
@@ -2159,7 +2728,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   VkDescriptorPoolCreateInfo pool{};
   pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool.maxSets = 1;
-  pool.poolSizeCount = 2;
+  pool.poolSizeCount = 4;
   pool.pPoolSizes = poolSizes;
 
   VkResult r =
@@ -2218,7 +2787,7 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   farInfo.offset = 0;
   farInfo.range = VK_WHOLE_SIZE;
 
-  VkWriteDescriptorSet writes[12] = {};
+  VkWriteDescriptorSet writes[14] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = m_descriptorSet;
   writes[0].dstBinding = 0;
@@ -2335,7 +2904,31 @@ bool VulkanRenderer::createDescriptorSet(std::string& outError) {
   writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[11].pBufferInfo = &blockHeightInfo;
 
-  vkUpdateDescriptorSets(m_device, 12, writes, 0, nullptr);
+  // 3D voxel SDF (pass 38; bindings 12 + 13). Always bound (the buffers
+  // always exist); the shader reads them only when the box uniform's
+  // active flag is set.
+  VkDescriptorBufferInfo sdfInfo{};
+  sdfInfo.buffer = m_voxelResources.sdfBuffer();
+  sdfInfo.offset = 0;
+  sdfInfo.range = VK_WHOLE_SIZE;
+  writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[12].dstSet = m_descriptorSet;
+  writes[12].dstBinding = 12;
+  writes[12].descriptorCount = 1;
+  writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[12].pBufferInfo = &sdfInfo;
+  VkDescriptorBufferInfo sdfBoxInfo{};
+  sdfBoxInfo.buffer = m_voxelResources.sdfBoxBuffer();
+  sdfBoxInfo.offset = 0;
+  sdfBoxInfo.range = vv::vulkan::VoxelResources::kSdfBoxUniformBytes;
+  writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[13].dstSet = m_descriptorSet;
+  writes[13].dstBinding = 13;
+  writes[13].descriptorCount = 1;
+  writes[13].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  writes[13].pBufferInfo = &sdfBoxInfo;
+
+  vkUpdateDescriptorSets(m_device, 14, writes, 0, nullptr);
   return true;
 }
 
@@ -2350,7 +2943,7 @@ void VulkanRenderer::cleanupDescriptorSet() {
 bool VulkanRenderer::createComputePipeline(std::string& outError) {
   const auto shaderDir = vv::core::executableDir() / "resources" / "shaders";
 
-  const auto compPath = shaderDir / "pixels_rgba.comp.spv";
+  const auto compPath = shaderDir / "voxels.comp.spv";
 
   std::string compErr;
   std::vector<char> compCode = vv::core::loadBinaryFile(compPath, compErr);
@@ -2430,9 +3023,37 @@ bool VulkanRenderer::createCommandBuffers(std::string& outError) {
   return true;
 }
 
+// One render-finished semaphore per swapchain image (see drawFrame). Called
+// from createSwapchain, so the array always matches the images of the swapchain
+// in use. The old semaphores are always destroyed instead of being kept when
+// the image count happens to match: a present that returned OUT_OF_DATE /
+// SUBOPTIMAL leaves its semaphore signaled with nothing left to wait on it, and
+// a fresh frame must never signal a signaled binary semaphore. (Presentation
+// only consumes the wait when it actually presents, and the recreate path has
+// already waited for device idle.)
+bool VulkanRenderer::createPresentSemaphores(std::string& outError) {
+  const std::size_t imageCount = m_swapchainImages.size();
+  for (auto semaphore : m_renderFinishedSemaphores) {
+    if (semaphore != VK_NULL_HANDLE) {
+      vkDestroySemaphore(m_device, semaphore, nullptr);
+    }
+  }
+  m_renderFinishedSemaphores.assign(imageCount, VK_NULL_HANDLE);
+
+  VkSemaphoreCreateInfo semInfo{};
+  semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  for (std::size_t i = 0; i < imageCount; ++i) {
+    if (vkCreateSemaphore(m_device, &semInfo, nullptr,
+                          &m_renderFinishedSemaphores[i]) != VK_SUCCESS) {
+      outError = "Failed to create the present semaphores.";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool VulkanRenderer::createSyncObjects(std::string& outError) {
   m_imageAvailableSemaphores.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
-  m_renderFinishedSemaphores.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
   m_inFlightFences.resize(kMaxFramesInFlight, VK_NULL_HANDLE);
 
   VkSemaphoreCreateInfo semInfo{};
@@ -2445,11 +3066,9 @@ bool VulkanRenderer::createSyncObjects(std::string& outError) {
   for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
     VkResult r1 = vkCreateSemaphore(m_device, &semInfo, nullptr,
                                     &m_imageAvailableSemaphores[i]);
-    VkResult r2 = vkCreateSemaphore(m_device, &semInfo, nullptr,
-                                    &m_renderFinishedSemaphores[i]);
-    VkResult r3 =
+    VkResult r2 =
         vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]);
-    if (r1 != VK_SUCCESS || r2 != VK_SUCCESS || r3 != VK_SUCCESS) {
+    if (r1 != VK_SUCCESS || r2 != VK_SUCCESS) {
       outError = "Failed to create synchronization objects.";
       return false;
     }
@@ -2468,7 +3087,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
     return false;
   }
 
-  VkBufferMemoryBarrier preComputeBarriers[4] = {};
+  VkBufferMemoryBarrier preComputeBarriers[5] = {};
   preComputeBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
   preComputeBarriers[0].srcAccessMask = 0;
   preComputeBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2493,6 +3112,11 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[2].buffer = m_outputBuffer;
+  // A barrier covers [offset, offset+size); the zero-initialized defaults mean
+  // an empty range, which vkCmdPipelineBarrier rejects
+  // (VUID-VkBufferMemoryBarrier-size-01188).
+  preComputeBarriers[2].offset = 0;
+  preComputeBarriers[2].size = VK_WHOLE_SIZE;
 
   // Chunk fade alphas: mapped-memory writes from updateWorld must be
   // visible to the compute stage before the dispatch.
@@ -2502,14 +3126,27 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   preComputeBarriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   preComputeBarriers[3].buffer = m_voxelResources.fadeBuffer();
-  preComputeBarriers[2].offset = 0;
-  preComputeBarriers[2].size = VK_WHOLE_SIZE;
+  preComputeBarriers[3].offset = 0;
+  preComputeBarriers[3].size = VK_WHOLE_SIZE;
+
+  // SDF box geometry (pass 38; binding 13): mapped-memory writes from the
+  // SDF upload must be visible to the compute stage before the dispatch.
+  // (The SDF storage buffer itself (binding 12) needs no barrier - its
+  // upload is fence-scoped and lands before the frame starts.)
+  preComputeBarriers[4].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  preComputeBarriers[4].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  preComputeBarriers[4].dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
+  preComputeBarriers[4].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[4].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  preComputeBarriers[4].buffer = m_voxelResources.sdfBoxBuffer();
+  preComputeBarriers[4].offset = 0;
+  preComputeBarriers[4].size = VK_WHOLE_SIZE;
 
   vkCmdPipelineBarrier(cmd,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                            VK_PIPELINE_STAGE_TRANSFER_BIT |
                            VK_PIPELINE_STAGE_HOST_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 4,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 5,
                        preComputeBarriers, 0, nullptr);
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
@@ -2524,7 +3161,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   push.screen = glm::uvec4(m_swapchainExtent.width, m_swapchainExtent.height,
                            isBgra, m_frameCounter);
   push.camera = glm::vec4(m_camera.tanHalfFovRadians(), m_fogDensity, 0.0f,
-                          0.0f);
+                          m_shadowJitter);
   push.chunkSize =
       glm::uvec4(m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
                  m_voxelConfig.chunkSizeZ, m_voxelConfig.maxTraceSteps);

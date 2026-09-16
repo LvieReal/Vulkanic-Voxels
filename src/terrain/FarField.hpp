@@ -17,9 +17,9 @@ namespace vv::terrain {
 // generator's estimated topmost solid voxel (see TerrainGenerator::
 // estimatedTopSolid), matching the near-region silhouette to within the
 // existing far quantization. This quantizes distant silhouettes by roughly
-// +-cellVoxels/2 of terrain height - the accepted far-LOD trade-off (see
-// AGENT_NOTES pass 4); a conservative max-of-samples seam band is a future
-// refinement if the seam is ever objectionable.
+// +-cellVoxels/2 of terrain height - the accepted far-LOD trade-off (pass 4 in
+// the git log); a conservative max-of-samples seam band is a future refinement
+// if the seam is ever objectionable.
 //
 // GPU sync contract (shader binding 6 + push constants farOriginDim /
 // farParams): cells[] is row-major X + Z * dim; height in the low 16 bits,

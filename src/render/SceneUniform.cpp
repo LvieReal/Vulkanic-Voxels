@@ -85,7 +85,8 @@ void SceneUniform::cleanup(VkDevice device) {
 
 void SceneUniform::update(const vv::core::Camera& camera, float timeSeconds,
                           const LightingConfig& lighting,
-                          const glm::vec4& sceneFlags) {
+                          const glm::vec4& sceneFlags,
+                          const glm::vec4& ambientParams) {
   if (!m_mapped) {
     return;
   }
@@ -105,6 +106,7 @@ void SceneUniform::update(const vv::core::Camera& camera, float timeSeconds,
   ubo.skyHigh = glm::vec4(lighting.skyHigh, 0.0f);
   ubo.misc = glm::vec4(timeSeconds, sceneFlags.x, sceneFlags.y,
                        sceneFlags.z);
+  ubo.ambient = ambientParams;
 
   std::memcpy(m_mapped, &ubo, sizeof(ubo));
 }

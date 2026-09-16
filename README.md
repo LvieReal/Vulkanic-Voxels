@@ -1,93 +1,108 @@
 # Vulkanic Voxels
 
 A voxel-tech experiment: infinite terrain ray-traced in a Vulkan **compute
-shader** (one thread per pixel), presented through Qt Widgets.
+shader** (one thread per pixel), presented through GLFW.
 
-The world is an infinite (X/Z) grid of chunks, each 32×128×32 voxels generated
-from a deterministic Perlin-style fBm heightmap. Voxels are typed materials
-(grass, dirt, stone, sand, snow, bedrock — grass has distinct top/side/bottom
-colors), stored as one byte per voxel packed 4-per-uint32 in a GPU chunk
-atlas. A region of chunks around the camera stays resident on the GPU
-(re-centered when you cross a chunk boundary), and distance fog hides the
-region edge.
+The world is an infinite (X/Z) grid of chunks, each 32×128×32 voxels carved from
+a deterministic 3D Perlin-style density field - hills, mountains and overhangs
+alike. Voxels are typed materials (grass, dirt, stone, sand, snow, bedrock, with
+different top/side/bottom colours), stored one byte per voxel in a GPU chunk
+atlas. A region of chunks around the camera stays resident on the GPU and distance
+fog hides the edge of it.
 
-The renderer lives in `src/vulkan`, the world/voxel model in `src/voxel`,
-terrain generation in `src/terrain`, and the Qt shell in `src/ui`. Everything
-platform-specific (Win32/X11/Wayland/macOS windowing) is isolated behind
-`src/platform` so the renderer never touches an OS header.
+Movement keys are bound **by physical position**, so `W` `A` `S` `D` stay in the
+same place on AZERTY, QWERTZ and Dvorak keyboards; the layout label is accepted
+as well, and the startup log prints what each action got.
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
-| `W` `A` `S` `D` | Move |
+| `W` `A` `S` `D` (physical position) | Move |
 | `Space` / `Ctrl` | Fly up / down |
 | `Shift` | Sprint (×3) |
-| Mouse | Look (pointer locked to window center, no button needed) |
-| `Esc` | Release pointer & pause camera — press again (or click) to resume |
+| Mouse | Look (cursor disabled while playing, relative motion, no button needed) |
+| `Esc` | Release the cursor & pause the camera — press again (or click) to resume |
+| Window | Starts maximized; un-maximizing (title-bar button or WM shortcut) gives a window half the monitor size |
 
 ## Building
 
-The project uses CMake (≥ 3.26), C++23, Qt 6 (Core, Gui, Widgets) and the
-Vulkan SDK (headers + loader). Shaders are compiled at build time by
-`glslangValidator`.
+CMake (≥ 3.26), C++23, the Vulkan SDK (headers + loader) and
+`glslangValidator`. Nothing else: [GLFW] and [glm] are **vendored** in
+`third_party/` (see `third_party/README.md`), so there is no `glfw`/`glm`
+package to install and no download at configure time.
+
+The only per-platform install left is what the window backend itself needs - on
+Linux the X11/Wayland development packages (the vendored GLFW compiles whichever
+are present, and falls back to a window-less null backend if neither is, which
+is enough for the tests). `-DVV_USE_SYSTEM_DEPS=ON` prefers system `glfw3`/`glm`
+when they exist (packagers); `-DVV_GLFW_NULL_ONLY=ON` asks for the null backend
+on purpose (`scripts/build-linux-toolchain.sh` covers sandboxes without any
+windowing headers).
 
 ### Windows (MSYS2 / MinGW-w64)
 
 ```sh
 pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
-          mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-vulkan-headers \
+          mingw-w64-ucrt-x86_64-vulkan-headers \
           mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-glslang
 cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/release/bin/game.exe
 ```
 
+`run.bat` does the same from Explorer (it adds MSYS2's `mingw64\bin` to `PATH`)
+and forwards any additional options; `run_debug.bat` builds nothing but starts
+the debug binary with `--validation`.
+
 ### Linux
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential cmake qt6-base-dev libvulkan-dev \
-                 glslang-tools libglm-dev libxcb1-dev libwayland-dev
+sudo apt install build-essential cmake libvulkan-dev glslang-tools
+sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+                 libxi-dev libxkbcommon-dev libwayland-dev   # for a window
 ```
 
 Fedora:
 
 ```sh
-sudo dnf install gcc-c++ cmake qt6-qtbase-devel vulkan-headers \
-                 vulkan-loader-devel glslang-devel glm-devel \
-                 libxcb-devel wayland-devel
+sudo dnf install gcc-c++ cmake vulkan-headers vulkan-loader-devel glslang \
+                 libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel \
+                 libXi-devel libxkbcommon-devel wayland-devel
 ```
 
-> **Optional:** Qt's private headers (`qt6-base-private-dev` on Debian/Ubuntu)
-> enable the native **Wayland** backend. The game builds and runs without them
-> on Windows, macOS and X11; on Wayland without them, run via XWayland:
-> `QT_QPA_PLATFORM=xcb ./build/release/bin/game`.
-
-Build and run:
+Then:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/release/bin/game
+./build/release/bin/game        # or ./run.sh
 ```
 
-A small pure-logic test suite (noise, terrain layering, chunked world) builds
-alongside by default — run it with `ctest --test-dir build` (or disable with
-`-DVV_BUILD_TESTS=OFF`).
+The window opens maximized (decorated, so the window manager keeps panels and
+the title bar usable) and un-maximizes to half the monitor; the first frame is
+already the size the window really has, and minimizing is handled without
+touching the swapchain. Both sizes are printed at startup (`[vv] window: ...`).
 
-Both the X11 (XCB) and Wayland surface backends are compiled in when their
-headers are found; the correct one is picked at run time from the Qt platform.
+Debug runs enable the Khronos **validation layer**: `run_debug.bat` passes
+`--validation`, and `./build/release/bin/game --validation` does the same for any
+other binary. Messages arrive on stderr; when the layer is not installed the app
+says so and continues.
+
+A small pure-logic test suite (noise, terrain layering, chunked world, key
+bindings, the PNG decoder) builds alongside by default: `ctest --test-dir build`
+(disable with `-DVV_BUILD_TESTS=OFF`).
 
 ### macOS
 
-Requires a Vulkan implementation with [MoltenVK]
-(VK_MVK_macos_surface) — e.g. the [Vulkan SDK] for macOS.
+Requires a Vulkan implementation with [MoltenVK] (VK_MVK_macos_surface) — e.g.
+the [Vulkan SDK] for macOS.
 
 ```sh
-brew install cmake qt vulkan-sdk glslang
-cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" -DCMAKE_BUILD_TYPE=Release
+brew install cmake vulkan-sdk glslang
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/release/bin/game.app/Contents/MacOS/game   # or use the build/package_folder target
 ```
@@ -95,19 +110,70 @@ cmake --build build
 ### Packaging
 
 `cmake --build build --target package_folder` produces a distributable folder
-in `build/dist/<config>` with the Qt runtime deployed next to the executable.
+in `build/dist/<config>`: the executable, the SPIR-V shaders and the optional
+`resources/textures` tree are the whole package.
+
+## Command line
+
+`game --help` prints the list. Every switch also accepts a `--no-` prefix where
+that makes sense (`--no-far-lod`), and the last one on the command line wins.
+
+| Option | Effect |
+| --- | --- |
+| `--sdf-shadows` | try the SDF soft-shadow marcher instead of the exact binary sun shadows (the default reference) |
+| `--shadow-jitter <slope>` | strength of the per-pixel shadow-ray jitter, `0` = off (default `0.002`) |
+| `--sdf-margin <chunks>` | how far the camera may drift before the SDF field is rebuilt (default 1) |
+| `--shadow-sharp` | force the exact binary sun shadows |
+| `--no-ambient` | use the pre-pass-62 ambient (the sky sampled along the camera ray) instead of the sky the surface sees |
+| `--ambient-floor <0..1>` | how much sky a fully sheltered point still gets (default `0.12`; `0` = black) |
+| `--far-lod` | enable the coarse far-terrain LOD field (off by default) |
+| `--validation` | enable the Khronos validation layer |
+| `--perf` | log slow frames and the SDF bake's cost split |
+| `--present <mode>` | `immediate` (uncapped, the default), `mailbox` or `fifo` (vsync) |
+| `--platform <name>` | `auto` (default), `x11`, `wayland`, `null`, `cocoa` or `win32` — force the window platform |
+| `--debug-term` | colour pixels by why the ray ended |
+| `--debug-hole <x,z>` | diagnostics for a far-LOD hole over chunk (`x`,`z`) |
+
+The start-up log prints the switches that are not at their defaults
+(`[vv] options: sdf-shadows, shadow-jitter 0.050, ...`), which is what a bug
+report should quote. The `VV_*` environment variables of the same names still
+work as a fallback for scripts and CI (a flag overrides its variable), and an
+unknown flag or a malformed value stops the run with a message instead of
+starting with settings you did not ask for.
 
 ## Troubleshooting
 
-- **Wayland glitches / black window**: run under XWayland with
-  `QT_QPA_PLATFORM=xcb ./build/release/bin/game`. Rendering into a Qt widget on
-  Wayland is best-effort; X11 is the battle-tested path.
+- **Wayland glitches / black window**: force X11 with
+  `GLFW_PLATFORM=x11 ./build/release/bin/game` (XWayland). GLFW picks the
+  session's backend otherwise.
 - **"Required Vulkan instance extension 'VK_KHR_*_surface' is not supported"**:
   your Vulkan loader is too old or misconfigured. Update your GPU drivers /
   Vulkan runtime.
-- **"The X11 (XCB) Vulkan surface backend was not compiled in"**: install the
-  xcb/Wayland development headers (see above) and delete the build directory
-  so CMake re-runs its checks.
+- **"The X11 Vulkan surface backend was not compiled in"**: GLFW has no X11
+  backend in this build; install the X11 development packages (see above),
+  delete the build directory and configure again (or pass
+  `-DVV_USE_SYSTEM_DEPS=ON` to use a system GLFW that has it).
+- **"glfwInit failed"** with "This binary only supports the Null platform": the
+  GLFW library has no windowing backend - the X11/Wayland development packages
+  were missing at configure time, or the build used `-DVV_GLFW_NULL_ONLY=ON`.
+  Install them (see above), delete the build directory so CMake re-runs its
+  checks, and configure again.
+- **Wrong movement keys**: the startup log prints one line per action
+  (`[vv] key move forward: key 87 (w), scancode 17`), including the position and
+  the label the windowing layer reported - that is the ground truth for "the
+  keyboard behaves differently here" reports.
 
+## Documentation
+
+| File | Contents |
+| --- | --- |
+| `docs/PASSES.md` | shipped-feature reports, one per pass |
+| `docs/UPGRADE_PROPOSALS.md` | proposed upgrades that are not shipped (ambient light for caves, GPU SDF bake) |
+| `docs/AGENT_NOTES.md` | working notes for agent sessions (contracts, switches, sandbox recipes) |
+| `docs/reference_renderer.wgsl` | the WGSL reference renderer this look came from |
+| `third_party/README.md` | the vendored dependencies and their exact revisions |
+
+[GLFW]: https://www.glfw.org/
+[glm]: https://github.com/g-truc/glm
 [Vulkan SDK]: https://vulkan.lunarg.com/sdk/home
 [MoltenVK]: https://github.com/KhronosGroup/MoltenVK

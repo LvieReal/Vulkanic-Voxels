@@ -22,13 +22,10 @@ function(vv_enable_packaging target_name)
         )
     endif()
 
-    qt_generate_deploy_app_script(
-        TARGET ${target_name}
-        OUTPUT_SCRIPT deploy_script
-        NO_TRANSLATIONS
-        NO_UNSUPPORTED_PLATFORM_ERROR
-    )
-    install(SCRIPT "${deploy_script}")
+    # Nothing to deploy for the windowing library: GLFW is either linked
+    # statically (the vendored subproject) or already present on the target
+    # system as a shared library its package manager owns. The toolkit's
+    # deployment script went away with the toolkit (pass 43).
 
     set(default_config "${CMAKE_BUILD_TYPE}")
     if(NOT default_config)
