@@ -2491,9 +2491,35 @@ void testSdfHandoverPolicy() {
 	h.wantCenterX = 1;
 	check(h.step() == SdfHandover::Step::Idle,
 			"sdf handover: a field that covers the camera is not rebuilt");
+
+	// Pass 49: WHEN the field is asked to follow. The box covers
+	// +/- kSdfHalfChunks chunks, so a rebuild is only warranted once the
+	// camera has drifted past `marginChunks` from the LIVE field's center.
+	// The old rule (recenter on every completed region move) rebuilt the
+	// field ~3x more often than its own coverage needs, which kept the
+	// builder thread running a rebake loop behind a moving camera.
+	check(!SdfHandover::needsRecenter(0, 0, 0, 0, 1u),
+			"sdf recenter: sitting on the field's chunk is not a rebuild");
+	check(!SdfHandover::needsRecenter(0, 0, 1, 0, 1u),
+			"sdf recenter: one chunk of drift is inside the margin");
+	check(!SdfHandover::needsRecenter(0, 0, 0, -1, 1u),
+			"sdf recenter: drift is signed (negative chunks too)");
+	check(SdfHandover::needsRecenter(0, 0, 2, 0, 1u),
+			"sdf recenter: past the margin the field must follow");
+	check(SdfHandover::needsRecenter(0, 0, 0, -2, 1u),
+			"sdf recenter: past the margin on the negative side as well");
+	check(SdfHandover::needsRecenter(0, 0, 1, 1, 0u),
+			"sdf recenter: margin 0 restores the per-crossing cadence");
+	check(!SdfHandover::needsRecenter(-3, 4, -3, 4, 2u),
+			"sdf recenter: no rebuild while the camera stays put");
+	check(SdfHandover::needsRecenter(-3, 4, -5, 4, 1u),
+			"sdf recenter: negative chunk centers compare by distance");
+	check(!SdfHandover::needsRecenter(-3, 4, -5, 6, 2u),
+			"sdf recenter: margin 2 (the most the coverage allows) holds");
 	std::printf("sdf handover: box/seed pairing pinned either side of the copy "
 			"(spare half, payload before active); the field follows the "
-			"camera's chunk instead of waiting for the next region move\n");
+			"camera's chunk only once its coverage runs out (pass 49 "
+			"margin, VV_SDF_MARGIN)\n");
 }
 
 void testSdfSoftShadow3d() {
@@ -2642,6 +2668,187 @@ void testSdfSoftShadow3d() {
 // the chunks lay out 4096), i.e. the field was built from a scrambled
 // projection of the terrain - which rendered the whole region around the
 // camera fully shadowed. Both checks below fail against that indexing.
+// Pass 49: the top of the SDF box is cropped to the terrain band. Two things
+// must hold, and both are cheap to pin here:
+//   1. the band contains every solid cell of the footprint (a solid outside
+//      the window would make the chamfer UNDER-report a distance, which is
+//      what would let the sphere trace overshoot a caster);
+//   2. inside the band the field is EXACTLY the full-height field, cell for
+//      cell: the chamfer metric's shortest path between two cells of the
+//      window is monotone in every axis, so it never needs to leave the
+//      window - dropping empty sky cannot change a retained cell's argmin.
+void testSdfBoxBand() {
+	using vv::voxel::Chunk;
+	using vv::voxel::ChunkCoord;
+	using vv::voxel::SdfBoxGeometry;
+	using vv::voxel::SdfField;
+
+	const int cx = 32, cz = 32, wh = 128;
+	vv::terrain::TerrainConfig tcfg = testTerrainConfig();
+	vv::voxel::World world(tcfg, cx, wh, cz);
+	std::vector<const Chunk*> added;
+	std::vector<ChunkCoord> evicted;
+	world.ensureRegion(0, 0, 3, added, evicted);  // 7x7 chunks
+
+	const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, 3, cx, cz, wh);
+	const std::uint32_t side = box.chunksPerSide;
+	std::vector<std::vector<std::uint8_t>> snapshots(
+			static_cast<std::size_t>(side) * side);
+	for (std::uint32_t i = 0; i < side * side; ++i) {
+		const int32_t ccx = box.originX / cx + static_cast<int32_t>(i % side);
+		const int32_t ccz = box.originZ / cz + static_cast<int32_t>(i / side);
+		if (const Chunk* c = world.findChunk(ChunkCoord{ccx, ccz})) {
+			snapshots[i] = c->voxelTypes();
+		}
+	}
+
+	// The band height must agree with a brute-force scan through the PINNED
+	// walk (sdfBoxCellSolid), so a stride/order mistake in the fast plane scan
+	// cannot hide behind a passing shadow test.
+	int wantTop = 0;
+	for (std::uint32_t z = 0; z < box.nz; ++z) {
+		for (std::uint32_t y = 0; y < wh; ++y) {
+			for (std::uint32_t x = 0; x < box.nx; ++x) {
+				if (vv::voxel::sdfBoxCellSolid(box, snapshots, x, y, z)) {
+					wantTop = std::max(wantTop, int(y) + 1);
+				}
+			}
+		}
+	}
+	const std::uint32_t margin = 16;
+	const std::uint32_t wantBand = std::min(
+			std::uint32_t(wantTop) + margin, std::uint32_t(wh));
+	const std::uint32_t bandNy = vv::voxel::sdfBoxBandHeight(box, snapshots, margin);
+	check(wantTop > 0, "sdf band: the test terrain has solid ground (sanity)");
+	check(bandNy == wantBand,
+			"sdf band: the band is the highest solid cell plus the margin");
+	check(bandNy < std::uint32_t(wh),
+			"sdf band: the test terrain really has sky to crop (sanity)");
+	// No solid may sit outside the window.
+	bool coversSolids = true;
+	for (std::uint32_t z = 0; z < box.nz && coversSolids; ++z) {
+		for (std::uint32_t y = bandNy; y < std::uint32_t(wh) && coversSolids; ++y) {
+			for (std::uint32_t x = 0; x < box.nx; ++x) {
+				if (vv::voxel::sdfBoxCellSolid(box, snapshots, x, y, z)) {
+					coversSolids = false;
+					break;
+				}
+			}
+		}
+	}
+	check(coversSolids, "sdf band: the window contains every solid cell");
+
+	SdfBoxGeometry banded = box;
+	banded.cropToBand(bandNy);
+	check(banded.valid() && banded.ny == bandNy && banded.originY == 0 &&
+					banded.nx == box.nx && banded.nz == box.nz,
+			"sdf band: the cropped box keeps X/Z and the origin, shortens Y");
+
+	SdfField full;
+	SdfField crop;
+	vv::voxel::buildSdfBoxField(box, snapshots, full);
+	vv::voxel::buildSdfBoxField(banded, snapshots, crop);
+	check(crop.nx() == int(box.nx) && crop.ny() == int(bandNy) &&
+					crop.nz() == int(box.nz),
+			"sdf band: the cropped field has the band's dims");
+
+	// Parity inside the window: the per-cell chamfer distance (exhaustive),
+	// the packed seed encoding, and point samples (strided - sample() is the
+	// 3x3x3 gather both the shader and the sphere trace use).
+	std::size_t distDiff = 0, sampleDiff = 0, solidSeeds = 0, emptySeeds = 0;
+	bool seedsDecode = true;
+	const std::vector<std::uint32_t>& fs = full.seeds();
+	const std::vector<std::uint32_t>& cs = crop.seeds();
+	for (std::uint32_t z = 0; z < box.nz; ++z) {
+		for (std::uint32_t y = 0; y < bandNy; ++y) {
+			for (std::uint32_t x = 0; x < box.nx; ++x) {
+				if (full.cellDistance(int(x), int(y), int(z)) !=
+						crop.cellDistance(int(x), int(y), int(z))) {
+					++distDiff;
+				}
+				const std::size_t iFull = std::size_t(x) +
+						std::size_t(y) * box.nx + std::size_t(z) * box.nx * box.ny;
+				const std::size_t iCrop = std::size_t(x) +
+						std::size_t(y) * banded.nx +
+						std::size_t(z) * banded.nx * banded.ny;
+				// Decode both exactly like the shader does. The seed is a cell
+				// index in the box's OWN layout, so a shorter box shifts every
+				// index above the first row - the ARGMIN CELL is what has to
+				// agree, and it has to name a cell of the box it came from.
+				const bool fullEmpty = fs[iFull] == vv::voxel::kSdfEmptySeed;
+				const bool cropEmpty = cs[iCrop] == vv::voxel::kSdfEmptySeed;
+				if (fullEmpty != cropEmpty) {
+					seedsDecode = false;
+				}
+				if (cropEmpty) {
+					++emptySeeds;
+					continue;
+				}
+				++solidSeeds;
+				const std::uint32_t sx = cs[iCrop] % banded.nx;
+				const std::uint32_t sy =
+						(cs[iCrop] / banded.nx) % banded.ny;
+				const std::uint32_t sz =
+						cs[iCrop] / (banded.nx * banded.ny);
+				if (sx >= banded.nx || sy >= banded.ny || sz >= banded.nz) {
+					seedsDecode = false;  // decodes outside this box
+				}
+				const std::uint32_t fx = fs[iFull] % box.nx;
+				const std::uint32_t fy =
+						(fs[iFull] / box.nx) % box.ny;
+				const std::uint32_t fz =
+						fs[iFull] / (box.nx * box.ny);
+				if (fx != sx || fy != sy || fz != sz) {
+					seedsDecode = false;  // a different solid is the argmin
+				}
+			}
+		}
+	}
+	for (std::uint32_t z = 0; z < box.nz; z += 3) {
+		for (std::uint32_t y = 0; y < bandNy; y += 2) {
+			for (std::uint32_t x = 0; x < box.nx; x += 3) {
+				const float px = float(x) + 0.5f;
+				const float py = float(y) + 0.5f;
+				const float pz = float(z) + 0.5f;
+				if (full.sample(px, py, pz) != crop.sample(px, py, pz)) {
+					++sampleDiff;
+				}
+			}
+		}
+	}
+	check(distDiff == 0,
+			"sdf band: every cell in the window has the full field's distance");
+	check(sampleDiff == 0,
+			"sdf band: point samples in the window match the full field");
+	check(seedsDecode, "sdf band: the packed seeds equal the full field's and "
+							"decode inside the cropped box");
+	check(solidSeeds > 0,
+			"sdf band: the cropped field has seeded cells (sanity)");
+	// A footprint with nothing in it: the band still has a floor (never zero
+	// cells) and every seed is the empty sentinel - the shader skips those and
+	// the field reads as "everything is open space".
+	{
+		const std::vector<std::vector<std::uint8_t>> air;
+		check(vv::voxel::sdfBoxBandHeight(box, air, margin) == margin,
+				"sdf band: no solids leaves exactly the margin");
+		check(vv::voxel::sdfBoxBandHeight(box, air, 0u) == 1u,
+				"sdf band: a zero margin still leaves one row");
+		SdfField none;
+		vv::voxel::buildSdfBoxField(box, air, none);
+		bool allEmpty = true;
+		for (std::uint32_t i = 0; i < box.cells(); ++i) {
+			if (none.seeds()[i] != vv::voxel::kSdfEmptySeed) {
+				allEmpty = false;
+				break;
+			}
+		}
+		check(allEmpty, "sdf band: an empty footprint is all empty seeds");
+	}
+	std::printf("sdf band: %u of %d cells (margin %u), %zu seeded / %zu empty "
+							"cells, field identical inside the window\n",
+							bandNy, wh, margin, solidSeeds, emptySeeds);
+}
+
 void testSdfBoxBuild() {
 	using vv::voxel::Chunk;
 	using vv::voxel::ChunkCoord;
@@ -3476,6 +3683,7 @@ int main() {
 	testSunShadowSdfMarch();
 	testSdfSoftShadow3d();
 	testSdfBoxBuild();
+	testSdfBoxBand();
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();

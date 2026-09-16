@@ -1234,3 +1234,99 @@ the deferred path needs a surface that reports no size, which cannot be
 simulated without a driver. Owner check: minimize/restore with the validation
 layer on stays silent, the window comes back at the size it left, and the
 "rebuild deferred" note appears once per minimize.
+
+## Pass 49: the SDF rebake - crop the sky, follow only when needed (optimization 1)
+
+Owner task: "we need to optimize SDF shadows for production and fix the still
+present latency" - after an inspection pass (probe numbers below), the owner
+picked the two rebuild-side changes together (P1+P2 of the inspection report,
+`/home/user/sdf_optimization_inspection.md`) with the default recenter margin of
+ONE chunk.
+
+### What the inspection measured (probes, not committed)
+
+`/tmp/probe_sdf_cost.cpp` drives the REAL build path (snapshot -> chamfer EDT ->
+seed pack -> staging memcpy) at the shipping geometry; `/tmp/probe_sdf_steps.cpp`
+is a step-for-step copy of the shader's `sunRayEscapesSdf3d` over a real terrain
+field.
+
+- One bake cost ~130-140 ms of WORKER CPU (build 120-137, seed pack 7-11) plus
+  ~2.5 ms on the RENDER thread (snapshot 0.5-0.8, staging memcpy ~1.8) and a
+  18.9 MB upload. The pack pass was a second full traversal of a 19 MB array for
+  a value the build already had.
+- The rebuild was requested from `finishRegionMove`, i.e. on EVERY completed
+  region move (~every 32 voxels of camera travel), while the box already covers
+  +/-96 voxels: 2-3x more bakes than coverage needs, and while the camera moved
+  the builder ran a near-continuous rebake loop competing with the frame for
+  CPU. Nothing blocks the render thread (the join only happens once the build is
+  ready), which is exactly why this shows up as "latency" rather than as an
+  obvious stall.
+- The GPU march is healthy: mean 22.3 steps/ray on lit top faces, 23.3 on
+  sun-facing cliff faces, p90 33, and the 160-step budget is NEVER hit - so no
+  field repair/fragmentation pass is needed. The per-step cost is the 3x3x3 seed
+  gather (up to 27 u32 fetches + 27 cube distances + sqrt); a real distance field
+  would make it 8 taps + a lerp (suggested next, P3).
+
+### What shipped in this pass
+
+1. **Sky crop (`SdfBoxGeometry::cropToBand` + `sdfBoxBandHeight`).** The box's
+   TOP is cropped to the highest solid cell of its footprint + `kVoxelSdfBandMargin`
+   (16 voxels of penumbra margin, so the softened light right above cliffs and
+   overhangs survives). `originY` stays 0: the window must contain every solid
+   cell, or the chamfer would under-report a distance it can no longer see -
+   solids sit on the ground, so only empty sky can be dropped. Dropping empty
+   cells cannot change a retained cell's argmin (the chamfer metric's shortest
+   path between two cells of the window is monotone in every axis, so it never
+   leaves the window), i.e. the field inside the window is IDENTICAL to the
+   full-height one - pinned by `testSdfBoxBand` (exhaustive per-cell distance +
+   packed-seed parity against the full build, plus the band height against a
+   brute-force scan through the pinned `sdfBoxCellSolid` walk).
+   The shader needed no change for this: it already honors `box.y`/`dims.y`, and
+   a ray crossing the new top face hands off at the crossing exactly as before.
+   On the default terrain the band is 110 of 128 rows (18 rows / 14% of the
+   cells, 16.2 MB instead of 18.9 MB to upload); flatter ground drops far more.
+2. **The seed pack is gone (`SdfField` stores the shader's encoding).** The
+   field's seed array IS `std::vector<std::uint32_t>` with `kSdfEmptySeed`
+   (0xFFFFFFFF = no solid in view), so the build's final sweep writes the
+   uploaded value and `releaseSeeds()` hands the array over by move: no second
+   19 MB array, no ~10 ms pack traversal. The CPU test now pins that exact
+   encoding (it decodes seeds the way the shader does).
+3. **`dims.w` is the live half's BASE CELL OFFSET, not the half index.** The two
+   halves are strided by the BUFFER's cell count (`half * m_sdfCells`), matching
+   `beginSdfUpload`'s `dstOffset`; with a per-field stride, a shorter banded
+   field copied into the spare half would overlap the live one. `beginSdfUpload`
+   accepts a field up to the buffer bound (`seeds.empty() || size > m_sdfCells`
+   is the new error), and the publish path validates `ny` against the band
+   instead of requiring the full height.
+4. **Rebake cadence (`SdfHandover::needsRecenter` + `VulkanRenderer::followSdfField`).**
+   The rebuild is armed in `updateWorld` (every frame) and only when the camera's
+   chunk has drifted more than `m_sdfMarginChunks` (VV_SDF_MARGIN, default 1,
+   clamped to `kSdfHalfChunks - 1` = 2; 0 = the old per-crossing cadence) from
+   the LIVE field's center - and never while a region move is streaming (the box
+   must be built from fully installed chunks; a mid-stream snapshot would read
+   the missing chunks as air, i.e. holes, and holes in an SDF read as open
+   space, so the shadows would go light exactly where the new terrain arrives).
+   The want is the camera's CURRENT chunk instead of the stream's target, so a
+   bake lands where the camera is now. `finishRegionMove` no longer touches the
+   want. The pure policy is unit-tested (`needsRecenter`, 9 cases incl. negative
+   chunk centers and margin 0/2).
+5. **Bake instrumentation (VV_PERF).** `[perf] SDF bake #N: 192x110x192 of 128
+   cells (16.2 MB seeds) at chunk (x,z) | worker: band + build ms | render:
+   snapshot + upload ms | s since the previous bake` - the worker numbers are off
+   the render thread (they cost the frame only as contention), the render numbers
+   are frame time. Without VV_PERF the console keeps only the pre-existing
+   "3D voxel SDF active" line (now once per bake instead of once per crossing).
+
+### Verification here
+
+Release + debug warning-free; `ctest` green in both (4.6 s / 22.1 s; the new
+band test builds both the full and the cropped field and compares every cell);
+`glslangValidator -V` exit 0; `VV_PLATFORM=null` smoke unchanged (exit 1, "no
+native window handle"). Probe delta, same terrain, same sandbox CPU: worker per
+bake ~130-140 ms -> ~100-113 ms (-25..-30%, from the 14% smaller field plus the
+removed pack pass) and the render-thread part stays ~2-3 ms; the bake interval
+roughly doubles at margin 1. NOT PROVEN HERE: the on-device look (the sky crop
+must be invisible; a ray leaving the shorter box now runs the 2.5D hand-off for
+a few extra voxels of open sky, which is the same traversal that already covered
+everything above `y = 128`), and the real bake rate/bake-time on the owner's
+machine - that is what the VV_PERF line is for.

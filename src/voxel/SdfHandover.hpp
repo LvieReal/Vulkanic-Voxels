@@ -76,6 +76,36 @@ struct SdfHandover final {
 					 activeCenterZ == wantCenterZ;
 	}
 
+	// Pass 49 - WHEN to recenter. The box covers the whole chunks
+	// [center - halfChunks, center + halfChunks) on X/Z, so a bake is only
+	// warranted once the camera's chunk has drifted more than `marginChunks`
+	// (max-norm on the chunk grid) from the center of the LIVE field: the old
+	// rule (recenter on every completed region move, i.e. every ~32 voxels of
+	// travel) rebuilt the same 4.7 M cells 2-3x more often than the field's
+	// own coverage needs, so while the camera moved the builder thread ran a
+	// near-continuous rebake loop - ~140 ms of a core plus a 19 MB upload per
+	// bake, competing with the frame for CPU. That IS the "latency when the
+	// SDFs get recomputed": nothing waits on it, but the frame has to share
+	// the machine with it.
+	//
+	// marginChunks = 0 restores the old per-crossing cadence (A/B lever).
+	// The caller must also require that no region move is streaming: the box
+	// has to be built from fully installed chunks.
+	static bool needsRecenter(std::int32_t activeCenterX,
+												std::int32_t activeCenterZ,
+												std::int32_t cameraChunkX,
+												std::int32_t cameraChunkZ,
+												std::uint32_t marginChunks) {
+		const std::int32_t dx = cameraChunkX > activeCenterX
+												? cameraChunkX - activeCenterX
+												: activeCenterX - cameraChunkX;
+		const std::int32_t dz = cameraChunkZ > activeCenterZ
+												? cameraChunkZ - activeCenterZ
+												: activeCenterZ - cameraChunkZ;
+		const std::int32_t m = static_cast<std::int32_t>(marginChunks);
+		return dx > m || dz > m;
+	}
+
 	Step step() const {
 		if (uploadInFlight) {
 			// Never publish before the copy lands: the box would select

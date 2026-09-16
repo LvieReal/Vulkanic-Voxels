@@ -134,15 +134,33 @@ camera-centered 6x6-chunk box over the full world height, kept on the camera's
 chunk by a background build) is sphere-traced toward the sun with the plain
 Quilez `k*h/t` penumbra estimate, so shadow edges are soft on vertical / side
 casters too and not just on flat tops (`kShadowSharpness` in the shader tunes
-the softness). The field lives in two halves and the box uniform says which one
-to read, so the copy never blocks a frame and a box only goes live together
-with the seeds it describes; a launch that a running build swallows is retried
-until the field covers the camera's chunk. Only the box is
+the softness). The field lives in two halves and the box uniform says where the live
+half starts, so the copy never blocks a frame and a box only goes live together
+with the seeds it describes. Only the box is
 field-aware: a shadow ray that leaves it hands over to the 2.5D penumbra
 traversal (keeping the distance already marched and the visibility so far), so
 casters outside the box still shadow the frame; until the first box lands the
-same 2.5D traversal runs from the surface. Exact binary sun shadows remain the default
-reference; `VV_SHADOW_SHARP=1` explicitly selects them.
+same 2.5D traversal runs from the surface.
+
+Two things keep the rebake cheap (pass 49). The box's empty sky is cropped: the
+build keeps the highest solid cell of its footprint plus 16 voxels of penumbra
+margin, so a bake is 110 of the 128 rows on the default terrain (14% fewer
+cells, 16.2 MB instead of 18.9 MB to upload) - the retained field is cell-for-
+cell identical to the full-height one, and the shader needs no special case,
+because a ray crossing the new top face hands over exactly as it did through
+`y = worldHeight`. And the field is recentered only when it has to be: the box
+covers +/-3 chunks, so the camera may drift `VV_SDF_MARGIN` chunks (default 1,
+`0` restores the pre-49 "every chunk crossing" cadence, `2` is the most the
+coverage allows) from the live field's center before a rebuild is armed, and
+the rebuild aims at the camera's *current* chunk rather than the one the stream
+finished. A rebuild used to be requested once per completed region move (every
+~32 voxels of travel), which kept the background builder running a rebake loop
+behind a moving camera; `VV_PERF=1` now reports each bake
+(`[perf] SDF bake #N: 192x110x192 of 128 cells (16.2 MB seeds) at chunk (x,z) |
+worker: band + build ms | render: snapshot + upload ms | s since the previous
+bake`), so the remaining cost is measurable instead of guessed at. Exact binary
+sun shadows remain the default reference; `VV_SHADOW_SHARP=1` explicitly selects
+them.
 
 Both the X11 (Xlib) and Wayland surface backends are compiled in when GLFW
 has them; the correct one is picked at run time from the platform GLFW reports.

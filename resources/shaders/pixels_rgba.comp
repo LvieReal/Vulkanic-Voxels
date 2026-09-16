@@ -136,7 +136,8 @@ layout(set = 0, binding = 12) readonly buffer SdfField {
 
 layout(std140, set = 0, binding = 13) uniform SdfBox {
     ivec4 box;    // xyz = box origin in world voxels, w = -1 when no SDF
-    uvec4 dims;   // xyz = box size in cells, w = the seed half to read
+    uvec4 dims;   // xyz = box size in cells, w = the live half's base cell
+                  // offset in the seed buffer (pass 49)
 } sdfBox;
 
 
@@ -636,11 +637,13 @@ float sampleSdf3d(vec3 p)
     uint nx = sdfBox.dims.x;
     uint ny = sdfBox.dims.y;
     uint nz = sdfBox.dims.z;
-    // Pass 42: the field is double-buffered and dims.w says which half the
-    // live box was published with, so a frame always reads the seeds that
-    // belong to the box it is resolving cells against - even while the next
-    // field is already being copied into the other half.
-    uint seedBase = sdfBox.dims.w * nx * ny * nz;
+    // Pass 42: the field is double-buffered, so a frame always reads the
+    // seeds that belong to the box it is resolving cells against - even while
+    // the next field is already being copied into the other half. dims.w is
+    // the live half's BASE CELL OFFSET in the seed buffer (pass 49: the
+    // halves are strided by the BUFFER's cell count, not by this field's, so
+    // a band-cropped field of a different height cannot overlap the live one).
+    uint seedBase = sdfBox.dims.w;
     float best = 1e30;
     for (int dz = -1; dz <= 1; ++dz) {
         int zc = c.z + dz;

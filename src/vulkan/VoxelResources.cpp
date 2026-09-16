@@ -1270,8 +1270,10 @@ bool VoxelResources::beginSdfUpload(
 		outError = "SDF buffer is not enabled on this resource set.";
 		return false;
 	}
-	if (seeds.size() != m_sdfCells) {
-		outError = "SDF size does not match the SDF buffer.";
+	// Pass 49: the band-cropped field is smaller than the buffer bound, which
+	// is sized for the full-height box (both halves, bound stride).
+	if (seeds.empty() || seeds.size() > m_sdfCells) {
+		outError = "SDF field does not fit the SDF buffer.";
 		return false;
 	}
 	if (half >= vv::voxel::kSdfHalves) {
@@ -1313,6 +1315,8 @@ bool VoxelResources::beginSdfUpload(
 	region.srcOffset = 0;
 	// The spare half: the live one keeps holding exactly the seeds the
 	// published box describes for as long as any frame can read them.
+	// Bound stride, matching dims.w (writeSdfBox): the shader and this copy
+	// must agree on where the half starts.
 	region.dstOffset = static_cast<VkDeviceSize>(half) * m_sdfCells * 4u;
 	region.size = static_cast<VkDeviceSize>(seeds.size()) * 4u;
 	vkCmdCopyBuffer(m_sdfCmd, m_sdfStaging, m_sdfBuffer, 1, &region);
@@ -1361,7 +1365,18 @@ void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
 	w[4] = active ? nx : 0u;
 	w[5] = active ? ny : 0u;
 	w[6] = active ? nz : 0u;
-	w[7] = active ? half : 0u;  // dims.w = the half the seeds live in
+	// dims.w = the base CELL OFFSET of the live half in the seed buffer (pass
+	// 49), not the half index: the halves are strided by the BUFFER's cell
+	// count, so a shorter (band-cropped) field copied into the spare half can
+	// never overlap the live one - with a per-field stride the shader's base
+	// and the writer's offset would disagree exactly when the two fields have
+	// different heights.
+	// The seed indices are u32 in the shader and in the field's own encoding,
+	// so the bound is representable by construction (m_sdfCells is 4.7 M for
+	// the default world).
+	w[7] = active ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(half) *
+															 m_sdfCells)
+								: 0u;
 	std::atomic_thread_fence(std::memory_order_release);
 	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
 }

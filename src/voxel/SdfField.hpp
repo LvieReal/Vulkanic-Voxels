@@ -27,9 +27,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace vv::voxel {
+
+// The per-cell argmin seed encoding the shader reads: 0xFFFFFFFF = no solid
+// in view. Pass 49: the field stores the seeds in EXACTLY this encoding, so
+// the array the worker builds IS the array that gets uploaded (binding 12) -
+// the old int32 build + separate u32 pack pass cost ~10 ms of worker time and
+// a full 19 MB read/write traversal per bake for nothing.
+inline constexpr std::uint32_t kSdfEmptySeed = 0xFFFFFFFFu;
 
 class SdfField {
 public:
@@ -43,13 +51,14 @@ public:
         const std::size_t n =
             static_cast<std::size_t>(nx) * ny * nz;
         dist_.assign(n, kInf);
-        seed_.assign(n, -1);
+        seed_.assign(n, kSdfEmptySeed);
         for (int z = 0; z < nz; ++z)
             for (int y = 0; y < ny; ++y)
                 for (int x = 0; x < nx; ++x) {
                     if (solid(x, y, z)) {
                         dist_[I(x, y, z)] = 0.0f;
-                        seed_[I(x, y, z)] = static_cast<int>(I(x, y, z));
+                        seed_[I(x, y, z)] =
+                            static_cast<std::uint32_t>(I(x, y, z));
                     }
                 }
         // Two-pass chamfer relaxation tracking the nearest seed: W1 = 1
@@ -104,12 +113,22 @@ public:
     int ny() const { return ny_; }
     int nz() const { return nz_; }
 
-    // The per-cell argmin seed (nearest solid cell index, -1 = no solid in
-    // view) in box layout x + y*nx + z*nx*ny. The GPU stores this (as u32,
-    // 0xFFFFFFFF for the -1 case) and converts each seed to its cell to
-    // compute the exact L2 distance to that solid CUBE - so the CPU and GPU
-    // build the identical field (parity).
-    const std::vector<int>& seeds() const { return seed_; }
+    // The per-cell argmin seed (nearest solid cell index, kSdfEmptySeed = no
+    // solid in view) in box layout x + y*nx + z*nx*ny - the SAME encoding the
+    // shader reads (pass 49), converted per sample to its cell to compute the
+    // exact L2 distance to that solid CUBE, so the CPU and GPU build the
+    // identical field (parity).
+    const std::vector<std::uint32_t>& seeds() const { return seed_; }
+
+    // Hand the packed seed array over to the caller (the renderer's upload
+    // staging copy): no second array, no copy - the build wrote it in place.
+    // The field is left EMPTY (dims reset), so a released field can never be
+    // sampled: sample()/cellDistance() then answer "outside the field".
+    void releaseSeeds(std::vector<std::uint32_t>& out) {
+        out = std::move(seed_);
+        dist_.clear();
+        nx_ = ny_ = nz_ = 0;
+    }
 
     // Distance from the cell (x, y, z) to the nearest solid surface, in
     // voxel units (the chamfer field minus the half-voxel). 0 inside solid,
@@ -132,6 +151,9 @@ public:
         const int x0 = static_cast<int>(std::floor(px));
         const int y0 = static_cast<int>(std::floor(py));
         const int z0 = static_cast<int>(std::floor(pz));
+        // The seed decodes as x + y*nx + z*nx*ny (the shader's arithmetic).
+        const std::uint32_t unx = static_cast<std::uint32_t>(nx_);
+        const std::uint32_t uny = static_cast<std::uint32_t>(ny_);
         float best = kInf;
         // The nearest solid cube to p is the seed of one of the cells around
         // p; take the min over the 3x3x3 neighborhood of cells (the chamfer
@@ -145,13 +167,13 @@ public:
                         cz < 0 || cz >= nz_) {
                         continue;
                     }
-                    const int s = seed_[I(cx, cy, cz)];
-                    if (s < 0) {
+                    const std::uint32_t s = seed_[I(cx, cy, cz)];
+                    if (s == kSdfEmptySeed) {
                         continue;
                     }
-                    const int vx = s % nx_;
-                    const int vy = (s / nx_) % ny_;
-                    const int vz = s / (nx_ * ny_);
+                    const int vx = static_cast<int>(s % unx);
+                    const int vy = static_cast<int>((s / unx) % uny);
+                    const int vz = static_cast<int>(s / (unx * uny));
                     // L2 distance from p to the solid cube [v, v+1)^3.
                     const float qx = std::clamp(px, float(vx), float(vx + 1));
                     const float qy = std::clamp(py, float(vy), float(vy + 1));
@@ -171,7 +193,7 @@ private:
     int ny_ = 0;
     int nz_ = 0;
     std::vector<float> dist_;
-    std::vector<int> seed_;
+    std::vector<std::uint32_t> seed_;  // kSdfEmptySeed = no solid in view
     std::size_t I(int x, int y, int z) const {
         return (static_cast<std::size_t>(z) * ny_ +
                 static_cast<std::size_t>(y)) *

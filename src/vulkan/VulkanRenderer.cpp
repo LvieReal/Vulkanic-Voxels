@@ -51,6 +51,13 @@ constexpr std::size_t kStreamSprintChunks = 16;
 // How many chunks the generation worker may run ahead of the upload pump
 // (bounds worker memory: N x 128 KB of staged voxel data).
 constexpr std::size_t kGenBacklog = 6;
+// Pass 49: open sky kept above the highest solid cell of the SDF box's
+// footprint. The soft-shadow penumbra a caster's top corner casts lives in
+// that margin, so cropping flush to the terrain would flatten the light right
+// above cliffs/overhangs. On the test terrain the highest solid cell is y=93
+// of 128, so the band is 110 cells: 18 rows (14% of the cells, ~2.7 MB of the
+// upload) dropped - and flatter ground drops far more, since it is all sky.
+constexpr std::uint32_t kVoxelSdfBandMargin = 16;
 // Chunk fade-in duration (seconds) and the first far-field activation
 // fade (recenters never fade - their cells are identical).
 constexpr double kChunkFadeSeconds = 0.6;
@@ -127,6 +134,27 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
   std::fprintf(stderr, "[vulkan] far LOD: %s (VV_FAR_LOD=1), shadows: %s\n",
                farLodRequested ? "on" : "off",
                m_sdfShadows ? "SDF experiment" : "exact binary");
+  if (m_sdfShadows) {
+    // Pass 49: how far the camera's chunk may drift from the live field's
+    // center before the box is rebuilt. The box covers +/- kSdfHalfChunks
+    // chunks, so the default of 1 keeps two chunks of high-quality field in
+    // front of the camera while cutting the rebake rate to ~half; 0 restores
+    // the old "every completed region move" cadence (the A/B lever), and 2 is
+    // the most the coverage allows.
+    m_sdfMarginChunks = 1;
+    if (const char* marginEnv = std::getenv("VV_SDF_MARGIN")) {
+      const int parsed = std::atoi(marginEnv);
+      m_sdfMarginChunks = static_cast<std::uint32_t>(
+          std::clamp(parsed, 0, static_cast<int>(
+                                   vv::vulkan::VoxelResources::kSdfHalfChunks) -
+                                   1));
+    }
+    std::fprintf(stderr,
+                 "[vulkan] SDF rebuild margin: %u chunk(s) of drift (box "
+                 "covers %u)\n",
+                 m_sdfMarginChunks,
+                 vv::vulkan::VoxelResources::kSdfHalfChunks);
+  }
 
   // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
   // colors each pixel by ray-termination cause.
@@ -518,11 +546,6 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
                        .count();
   }
 
-  // 3D voxel SDF (pass 38): join + upload a finished background build (a
-  // sub-millisecond fence-scoped copy once per region change; a no-op
-  // atomic load every other frame).
-  ensureSdfField();
-
   // Chunk fade-in alphas (binding 7): age every tracked slot, finalize
   // finished fades, publish the whole (tiny) array via mapped memory.
   if (!m_slotFadeStart.empty()) {
@@ -554,6 +577,16 @@ void VulkanRenderer::updateWorld(const glm::vec3& cameraPosition) {
       std::floor(cameraPosition.x / chunkWorldX));
   const int32_t chunkZ = static_cast<int32_t>(
       std::floor(cameraPosition.z / chunkWorldZ));
+
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): decide whether the field must
+  // follow the camera, then drive the handover (join + no-wait upload, a
+  // sub-millisecond fence-scoped copy and a no-op atomic load every other
+  // frame). Pass 49: the rebuild is armed HERE, from the camera's CURRENT
+  // chunk and only once its coverage is about to run out - see
+  // SdfHandover::needsRecenter for why the old region-move trigger was
+  // rebuilding 2-3x more often than the field needs.
+  followSdfField(chunkX, chunkZ);
+  ensureSdfField();
 
   if (m_streamActive) {
     if (chunkX != m_streamTarget.x || chunkZ != m_streamTarget.z) {
@@ -1050,15 +1083,14 @@ void VulkanRenderer::finishRegionMove() {
   m_regionCenter = m_streamTarget;
   m_streamActive = false;
 
-  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): the region is complete and
-  // fully published, so the world chunks under the camera-centered box are
-  // installed - tell the frame loop which chunk the field should cover.
-  // ensureSdfField launches the build (and retries if one is already
-  // running), and the old field keeps rendering until the new one is
-  // published, so there is no gap.
-  m_sdfWantValid = true;
-  m_sdfWantCenterX = m_streamTarget.x;
-  m_sdfWantCenterZ = m_streamTarget.z;
+  // 3D voxel SDF (pass 38, VV_SDF_SHADOWS=1): this used to be where the
+  // rebuild was requested, once per completed region move. Pass 49 moved that
+  // decision to followSdfField (called every frame from updateWorld): it waits
+  // until the camera's chunk has drifted past the live field's margin, and it
+  // aims the build at the camera's CURRENT chunk instead of the chunk the
+  // stream just finished. The old field keeps rendering until the new one is
+  // published, so there is still no gap - but the builder thread is no longer
+  // running a rebake loop behind every chunk crossing.
 
   // The seam patch now drains incrementally from updateWorld
   // (drainFarPatch); nothing to do here.
@@ -1246,6 +1278,7 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
   // that mutates the world chunk map - install/evict), so the worker's
   // per-voxel solid test is a plain array read with no map access (and no
   // race with a concurrent install/evict). Missing chunks read as air.
+  const auto snapshotStart = std::chrono::steady_clock::now();
   std::vector<std::vector<std::uint8_t>> chunkSnapshots;
   chunkSnapshots.resize(static_cast<std::size_t>(side) * side);
   for (std::uint32_t cz = 0; cz < side; ++cz) {
@@ -1259,33 +1292,83 @@ void VulkanRenderer::launchSdfBuild(int32_t centerChunkX,
     }
   }
 
+  const double snapshotMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                snapshotStart)
+                                .count();
+
   // The thread reads the SNAPSHOT (its own copy) and writes m_sdfPending,
   // which the main thread touches only after m_sdfPendingReady flips.
   m_sdfThread = std::thread(
       [snapshots = std::move(chunkSnapshots), box, centerChunkX, centerChunkZ,
-       this]() mutable {
-        vv::voxel::SdfField sdf;
-        vv::voxel::buildSdfBoxField(box, snapshots, sdf);
-        // Pack the argmin seed per cell (box layout x + y*nx + z*nx*ny); a
-        // cell with no solid in view (seed -1) gets 0xFFFFFFFF (the shader
-        // skips it). This is the EXACT field the CPU test pins, so the GPU
-        // sphere trace is a byte-for-byte parity of SdfField.
-        const std::vector<int>& raw = sdf.seeds();
-        m_sdfPending.seeds.resize(raw.size());
-        for (std::size_t i = 0; i < raw.size(); ++i) {
-          m_sdfPending.seeds[i] = raw[i] < 0 ? 0xFFFFFFFFu
-                                             : static_cast<std::uint32_t>(raw[i]);
+       snapshotMs, this]() mutable {
+        // Pass 49: drop the empty sky above the terrain. The band contains
+        // every solid cell of the footprint, so every retained cell keeps its
+        // full-height argmin seed exactly (see SdfBoxGeometry::cropToBand):
+        // same picture, 14% fewer cells on the test terrain - and together
+        // with the seed pack fused into the build, ~25-30% less worker time
+        // per bake, while the upload drops from 18.9 MB to 16.2 MB.
+        const auto bandStart = std::chrono::steady_clock::now();
+        const std::uint32_t bandNy = vv::voxel::sdfBoxBandHeight(
+            box, snapshots, kVoxelSdfBandMargin);
+        vv::voxel::SdfBoxGeometry banded = box;
+        banded.cropToBand(bandNy);
+        const double bandMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - bandStart)
+                                  .count();
+        if (!banded.valid()) {
+          banded = box;  // never build an invalid window
         }
-        m_sdfPending.boxX = box.originX;
-        m_sdfPending.boxY = box.originY;
-        m_sdfPending.boxZ = box.originZ;
-        m_sdfPending.nx = box.nx;
-        m_sdfPending.ny = box.ny;
-        m_sdfPending.nz = box.nz;
+
+        const auto buildStart = std::chrono::steady_clock::now();
+        vv::voxel::SdfField sdf;
+        vv::voxel::buildSdfBoxField(banded, snapshots, sdf);
+        const double buildMs = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - buildStart)
+                                   .count();
+        // The field ALREADY IS the shader's encoding (pass 49: u32 argmin
+        // seeds, kSdfEmptySeed = no solid in view, box layout
+        // x + y*nx + z*nx*ny), so the hand-over is a move - the old int32
+        // build + separate pack pass cost a full 19 MB traversal per bake.
+        // The CPU test pins this array against the shader's convention.
+        sdf.releaseSeeds(m_sdfPending.seeds);
+        m_sdfPending.boxX = banded.originX;
+        m_sdfPending.boxY = banded.originY;
+        m_sdfPending.boxZ = banded.originZ;
+        m_sdfPending.nx = banded.nx;
+        m_sdfPending.ny = banded.ny;
+        m_sdfPending.nz = banded.nz;
         m_sdfPending.centerChunkX = centerChunkX;
         m_sdfPending.centerChunkZ = centerChunkZ;
+        m_sdfPending.fullNy = box.ny;
+        m_sdfPending.snapshotMs = snapshotMs;
+        m_sdfPending.bandMs = bandMs;
+        m_sdfPending.buildMs = buildMs;
         m_sdfPendingReady.store(true, std::memory_order_release);
       });
+}
+
+// Pass 49: does the live field still cover the camera with margin? If not,
+// aim the next build at the camera's CURRENT chunk. Never arms while a region
+// move is streaming: the box must be built from fully installed chunks (a
+// snapshot taken mid-stream reads the missing chunks as air, i.e. a field with
+// holes - and holes in an SDF read as "open space", so the shadows would go
+// light exactly where the new terrain is arriving).
+void VulkanRenderer::followSdfField(int32_t chunkX, int32_t chunkZ) {
+  if (!m_sdfShadows || !m_world || m_streamActive) {
+    return;
+  }
+  const bool needs =
+      !m_sdfFieldActive ||
+      vv::voxel::SdfHandover::needsRecenter(m_sdfActiveCenterX,
+                                            m_sdfActiveCenterZ, chunkX, chunkZ,
+                                            m_sdfMarginChunks);
+  if (!needs) {
+    return;
+  }
+  m_sdfWantValid = true;
+  m_sdfWantCenterX = chunkX;
+  m_sdfWantCenterZ = chunkZ;
 }
 
 void VulkanRenderer::ensureSdfField() {
@@ -1334,38 +1417,56 @@ void VulkanRenderer::ensureSdfField() {
               vv::vulkan::VoxelResources::kSdfHalfChunks, cfg.chunkSizeX,
               cfg.chunkSizeZ, cfg.worldHeight);
       const uint32_t nx = box.nx;
-      const uint32_t ny = box.ny;
       const uint32_t nz = box.nz;
-      if (m_sdfPending.nx == nx && m_sdfPending.ny == ny &&
-          m_sdfPending.nz == nz &&
-          m_sdfPending.seeds.size() ==
-              static_cast<std::size_t>(nx) * ny * nz) {
+      // Pass 49: the field is band-cropped, so ny is the BUILD's band height
+      // (0 < ny <= the full height) while the X/Z extent must still match the
+      // geometry this publish path can vouch for.
+      const bool dimsOk = m_sdfPending.nx == nx && m_sdfPending.nz == nz &&
+                          m_sdfPending.ny > 0 &&
+                          m_sdfPending.ny <= box.ny &&
+                          m_sdfPending.ny <= m_sdfPending.fullNy &&
+                          m_sdfPending.seeds.size() ==
+                              static_cast<std::size_t>(m_sdfPending.nx) *
+                                  m_sdfPending.ny * m_sdfPending.nz;
+      if (dimsOk) {
         std::string uploadError;
         // The SPARE half: whatever the published box points at keeps holding
         // exactly the seeds it describes until the new box goes live.
         const std::uint32_t half = hand.uploadHalf();
+        const auto uploadStart = std::chrono::steady_clock::now();
         if (!m_voxelResources.beginSdfUpload(
                 m_device, m_physicalDevice, m_commandPool, m_graphicsQueue,
                 m_sdfPending.seeds, half, m_sdfPending.boxX, m_sdfPending.boxY,
-                m_sdfPending.boxZ, nx, ny, nz, uploadError)) {
+                m_sdfPending.boxZ, m_sdfPending.nx, m_sdfPending.ny,
+                m_sdfPending.nz, uploadError)) {
           std::fprintf(stderr, "[vulkan] SDF upload failed: %s\n",
                        uploadError.c_str());
         } else {
+          // The host-side staging copy of the (band-cropped) field. Timed for
+          // VV_PERF: this is render-thread time, so it is the only part of a
+          // bake the frame itself pays for; the fence wait inside is retired
+          // by construction (the caller never uploads twice without a publish).
+          m_sdfUploadMs = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - uploadStart)
+                              .count();
           m_sdfUploadInFlight = true;
           m_sdfUploadBox.boxX = m_sdfPending.boxX;
           m_sdfUploadBox.boxY = m_sdfPending.boxY;
           m_sdfUploadBox.boxZ = m_sdfPending.boxZ;
-          m_sdfUploadBox.nx = nx;
-          m_sdfUploadBox.ny = ny;
-          m_sdfUploadBox.nz = nz;
+          m_sdfUploadBox.nx = m_sdfPending.nx;
+          m_sdfUploadBox.ny = m_sdfPending.ny;
+          m_sdfUploadBox.nz = m_sdfPending.nz;
           m_sdfUploadBox.centerChunkX = m_sdfPending.centerChunkX;
           m_sdfUploadBox.centerChunkZ = m_sdfPending.centerChunkZ;
           m_sdfUploadBox.half = half;
         }
       } else {
         std::fprintf(
-            stderr, "[vulkan] SDF build rejected (dims %ux%ux%u vs %ux%ux%u)\n",
-            m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz, nx, ny, nz);
+            stderr,
+            "[vulkan] SDF build rejected (dims %ux%ux%u [band of %u] vs "
+            "%ux%ux%u)\n",
+            m_sdfPending.nx, m_sdfPending.ny, m_sdfPending.nz,
+            m_sdfPending.fullNy, nx, box.ny, nz);
       }
       m_sdfPendingReady = false;
       break;
@@ -1383,6 +1484,14 @@ void VulkanRenderer::ensureSdfField() {
       m_sdfFieldActive = true;
       m_sdfActiveCenterX = m_sdfUploadBox.centerChunkX;
       m_sdfActiveCenterZ = m_sdfUploadBox.centerChunkZ;
+      ++m_sdfBakeCount;
+      const auto publishedAt = std::chrono::steady_clock::now();
+      const double sinceLastS =
+          m_sdfLastPublishTime.time_since_epoch().count() == 0
+              ? 0.0
+              : std::chrono::duration<double>(publishedAt - m_sdfLastPublishTime)
+                    .count();
+      m_sdfLastPublishTime = publishedAt;
       std::fprintf(stderr,
                    "[vulkan] 3D voxel SDF active: %ux%ux%u cells at "
                    "(%d,%d,%d) (chunk %d,%d)\n",
@@ -1390,6 +1499,28 @@ void VulkanRenderer::ensureSdfField() {
                    m_sdfUploadBox.boxX, m_sdfUploadBox.boxY,
                    m_sdfUploadBox.boxZ, m_sdfUploadBox.centerChunkX,
                    m_sdfUploadBox.centerChunkZ);
+      if (m_perfEnabled) {
+        // Pass 49: the bake's own bookkeeping, so "the SDFs got recomputed"
+        // stops being a guess. Worker ms are off the render thread (they cost
+        // the frame only as CPU contention); upload ms and snapshot ms are
+        // render-thread time.
+        const std::uint64_t cells =
+            static_cast<std::uint64_t>(m_sdfUploadBox.nx) *
+            m_sdfUploadBox.ny * m_sdfUploadBox.nz;
+        std::fprintf(
+            stderr,
+            "[perf] SDF bake #%llu: %ux%ux%u of %u cells (%.1f MB seeds) at "
+            "chunk (%d,%d) | worker: band %.1f + build %.1f ms | render: "
+            "snapshot %.1f + upload %.1f ms | %.2f s since the previous "
+            "bake\n",
+            static_cast<unsigned long long>(m_sdfBakeCount),
+            m_sdfUploadBox.nx, m_sdfUploadBox.ny, m_sdfUploadBox.nz,
+            m_sdfPending.fullNy,
+            static_cast<double>(cells) * 4.0 / (1024.0 * 1024.0),
+            m_sdfUploadBox.centerChunkX, m_sdfUploadBox.centerChunkZ,
+            m_sdfPending.bandMs, m_sdfPending.buildMs, m_sdfPending.snapshotMs,
+            m_sdfUploadMs, sinceLastS);
+      }
       break;
     }
     case vv::voxel::SdfHandover::Step::Relaunch: {
@@ -2383,11 +2514,9 @@ bool VulkanRenderer::rebuildChunkRegion(int32_t centerChunkX,
   }
 
   m_regionCenter = vv::voxel::ChunkCoord{centerChunkX, centerChunkZ};
-  // Same for the synchronous path (initial region, teleport fallback): the
-  // SDF field must follow the new center too, not only streamed moves.
-  m_sdfWantValid = true;
-  m_sdfWantCenterX = centerChunkX;
-  m_sdfWantCenterZ = centerChunkZ;
+  // The SDF field follows through followSdfField (pass 49), which runs every
+  // frame and therefore covers this synchronous path too - and only rebuilds
+  // once the camera has actually drifted past the live field's margin.
 
   // Rewrite the whole chunk table for the new region grid.
   std::vector<uint32_t> table(static_cast<size_t>(gridW) * gridH,

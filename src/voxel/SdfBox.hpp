@@ -22,6 +22,7 @@
 // (testSdfBoxBuild) now pins this walk against real Chunk data.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -53,7 +54,29 @@ struct SdfBoxGeometry final {
 	bool valid() const {
 		return chunksPerSide > 0 && chunkSizeX > 0 && chunkSizeZ > 0 &&
 					 worldHeight > 0 && nx == chunksPerSide * chunkSizeX &&
-					 ny == worldHeight && nz == chunksPerSide * chunkSizeZ;
+					 ny > 0 && ny <= worldHeight &&
+					 nz == chunksPerSide * chunkSizeZ;
+	}
+
+	// Pass 49: crop the box's TOP to `bandNy` cells (originY stays 0).
+	//
+	// The window must contain every SOLID cell of the footprint, or the
+	// chamfer would under-report the distance to a solid it can no longer see
+	// (the march would overshoot it). Solids sit on the ground, so only the
+	// empty sky above the highest solid can be dropped: every retained cell
+	// then has the SAME argmin seed as in the full-height box (dropping empty
+	// cells cannot change which solid is nearest), i.e. the field is exactly
+	// the full one inside the window. The shader needs no change - it already
+	// honors box.y and dims.y, and a ray crossing the new top face hands off
+	// to the 2.5D march exactly as it did through y = worldHeight.
+	//
+	// On the test terrain the sky above the terrain is ~26% of the box, and the
+	// build cost is close to linear in cells.
+	void cropToBand(std::uint32_t bandNy) {
+		const std::uint32_t clamped =
+				bandNy == 0 ? 1u : std::min(bandNy, worldHeight);
+		ny = clamped;
+		originY = 0;
 	}
 
 	// The box centered on a chunk: chunks [center - half, center + half).
@@ -90,7 +113,13 @@ inline bool sdfBoxCellSolid(
 		const SdfBoxGeometry& box,
 		const std::vector<std::vector<std::uint8_t>>& snapshots,
 		std::uint32_t x, std::uint32_t y, std::uint32_t z) {
-	if (y >= box.worldHeight) {
+	// (x, y, z) are BOX-LOCAL cells; the chunk layout below is indexed with the
+	// WORLD cell row (pass 49: a banded box has originY = 0 today, but the walk
+	// maps through originY so a sliding window can never silently read the
+	// wrong voxel row).
+	const std::uint32_t wy =
+			static_cast<std::uint32_t>(box.originY) + y;
+	if (wy >= box.worldHeight) {
 		return false;
 	}
 	const std::uint32_t chunkX = x / box.chunkSizeX;
@@ -113,9 +142,62 @@ inline bool sdfBoxCellSolid(
 	// Chunk::index and the shader's fetchVoxel).
 	const std::size_t u = x - chunkX * box.chunkSizeX;
 	const std::size_t v = z - chunkZ * box.chunkSizeZ;
-	const std::size_t i = u + static_cast<std::size_t>(y) * box.chunkSizeX +
+	const std::size_t i = u + static_cast<std::size_t>(wy) * box.chunkSizeX +
 												v * box.chunkSizeX * box.worldHeight;
 	return types[i] != static_cast<std::uint8_t>(VoxelType::Air);
+}
+
+// Height of the terrain band the box must keep (pass 49): the highest solid
+// world-cell in the footprint, plus one, plus `margin` cells of open sky (the
+// soft-shadow penumbra of a caster's top corner lives in that margin, so it is
+// not free). Returns at least 1 and at most box.ny.
+//
+// Costs one pass over the snapshot planes, top down with an early exit per
+// chunk - per bake, not per frame. A missing/foreign chunk snapshot reads as
+// air, exactly like sdfBoxCellSolid.
+inline std::uint32_t sdfBoxBandHeight(
+		const SdfBoxGeometry& box,
+		const std::vector<std::vector<std::uint8_t>>& snapshots,
+		std::uint32_t margin) {
+	const std::size_t perChunk = static_cast<std::size_t>(box.chunkSizeX) *
+														 box.worldHeight * box.chunkSizeZ;
+	std::uint32_t top = 0;  // highest solid world cell + 1
+	for (std::uint32_t cz = 0; cz < box.chunksPerSide; ++cz) {
+		for (std::uint32_t cx = 0; cx < box.chunksPerSide; ++cx) {
+			const std::size_t chunk =
+					static_cast<std::size_t>(cz) * box.chunksPerSide + cx;
+			if (chunk >= snapshots.size()) {
+				continue;
+			}
+			const std::vector<std::uint8_t>& types = snapshots[chunk];
+			if (types.size() != perChunk) {
+				continue;
+			}
+			// Top-down: the first solid row ends the scan for this chunk.
+			for (std::uint32_t y = box.worldHeight; y-- > 0;) {
+				bool solid = false;
+				for (std::uint32_t v = 0; v < box.chunkSizeZ && !solid; ++v) {
+					const std::size_t row =
+							static_cast<std::size_t>(v) * box.chunkSizeX *
+									box.worldHeight +
+							static_cast<std::size_t>(y) * box.chunkSizeX;
+					for (std::uint32_t u = 0; u < box.chunkSizeX; ++u) {
+						if (types[row + u] !=
+								static_cast<std::uint8_t>(VoxelType::Air)) {
+							solid = true;
+							break;
+						}
+					}
+				}
+				if (solid) {
+					top = std::max(top, y + 1u);
+					break;
+				}
+			}
+		}
+	}
+	const std::uint32_t want = top + margin;
+	return want == 0 ? 1u : (want > box.ny ? box.ny : want);
 }
 
 // Build the box's SDF (two-pass chamfer EDT + argmin seeds) from the

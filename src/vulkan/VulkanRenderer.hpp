@@ -75,6 +75,9 @@ class VulkanRenderer final {
   // updateWorld) joins a finished build and uploads it, publishing the box
   // uniform the shader reads.
   void ensureSdfField();
+  // Pass 49: arm a rebuild when the camera's chunk has drifted past the live
+  // field's margin (never while a region move is streaming).
+  void followSdfField(int32_t chunkX, int32_t chunkZ);
   void launchSdfBuild(int32_t centerChunkX, int32_t centerChunkZ);
 
   // Incremental region streaming. Generation runs on a WORKER thread
@@ -359,13 +362,20 @@ class VulkanRenderer final {
   std::atomic<bool> m_sdfBuildRunning{false};
   std::atomic<bool> m_sdfPendingReady{false};
   struct SdfBuild {
-    std::vector<std::uint32_t> seeds;  // argmin seed per cell (box layout)
+    std::vector<std::uint32_t> seeds;  // argmin seed per cell (box layout,
+                                       // kSdfEmptySeed = no solid in view)
     std::int32_t boxX = 0;  // box origin in world voxels
     std::int32_t boxY = 0;
     std::int32_t boxZ = 0;
-    std::uint32_t nx = 0, ny = 0, nz = 0;  // box size in cells
+    std::uint32_t nx = 0, ny = 0, nz = 0;  // box size in cells (banded ny)
+    std::uint32_t fullNy = 0;  // uncropped height (publish-path sanity check)
     std::int32_t centerChunkX = 0;  // the build's center (stale check)
     std::int32_t centerChunkZ = 0;
+    // Pass 49 (VV_PERF): where a bake's time went. band/build are worker
+    // thread, snapshot/upload are render thread.
+    double snapshotMs = 0.0;
+    double bandMs = 0.0;
+    double buildMs = 0.0;
   };
   SdfBuild m_sdfPending;
   // --- SDF handover state (pass 42) ---
@@ -398,6 +408,16 @@ class VulkanRenderer final {
   std::int32_t m_sdfActiveCenterZ = 0;
   std::int32_t m_sdfWantCenterX = 0;
   std::int32_t m_sdfWantCenterZ = 0;
+  // Pass 49: how far (in chunks, max-norm) the camera may drift from the live
+  // field's center before a rebuild is armed - VV_SDF_MARGIN, default 1, and
+  // the box only covers kSdfHalfChunks in each direction. 0 = the pre-49
+  // "every completed region move" cadence.
+  std::uint32_t m_sdfMarginChunks = 1;
+  // Pass-49 bake bookkeeping for the VV_PERF line: how many bakes, when the
+  // last one published (bakes/second), and what the render thread paid.
+  std::uint64_t m_sdfBakeCount = 0;
+  std::chrono::steady_clock::time_point m_sdfLastPublishTime{};
+  double m_sdfUploadMs = 0.0;
 
   // Chunk the active field is centered on (recenter decision).
   std::int32_t m_farCenterChunkX = 0;
