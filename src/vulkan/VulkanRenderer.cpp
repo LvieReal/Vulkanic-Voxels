@@ -2941,7 +2941,7 @@ void VulkanRenderer::cleanupDescriptorSet() {
 bool VulkanRenderer::createComputePipeline(std::string& outError) {
   const auto shaderDir = vv::core::executableDir() / "resources" / "shaders";
 
-  const auto compPath = shaderDir / "pixels_rgba.comp.spv";
+  const auto compPath = shaderDir / "voxels.comp.spv";
 
   std::string compErr;
   std::vector<char> compCode = vv::core::loadBinaryFile(compPath, compErr);

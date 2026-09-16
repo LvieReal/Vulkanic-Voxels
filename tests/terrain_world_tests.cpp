@@ -2823,7 +2823,7 @@ void testSdfSoftShadow3d() {
 // wrote and the SDF shadows vanished from a perfectly healthy bake).
 //
 // Two pins, one per side:
-//   - the shader file (resources/shaders/pixels_rgba.comp, VV_SHADER_DIR) must
+//   - the shader file (resources/shaders/voxels.comp, VV_SHADER_DIR) must
 //     still declare kShadowSharpness / kShadowJitterDefault / kShadowJitterFloor
 //     / kShadowJitterFloorMax and still do what the mirror assumes: jitter the
 //     SOFT path's ray (a cone tilt plus a contact floor), leave the exact path
@@ -2842,8 +2842,8 @@ void testSdfShaderMirrorConstants() {
 	double slope = 0.05, floorVox = 0.50, floorMax = 1.0;
 #ifdef VV_SHADER_DIR
 	{
-		std::ifstream in(std::string(VV_SHADER_DIR) + "/pixels_rgba.comp");
-		check(in.good(), "shader mirror: resources/shaders/pixels_rgba.comp "
+		std::ifstream in(std::string(VV_SHADER_DIR) + "/voxels.comp");
+		check(in.good(), "shader mirror: resources/shaders/voxels.comp "
 			"is readable (VV_SHADER_DIR)");
 		if (in.good()) {
 			const std::string src((std::istreambuf_iterator<char>(in)),
@@ -3115,7 +3115,7 @@ void testSdfBoxBand() {
 	const std::vector<std::uint32_t>& fs = full.seeds();
 	const std::vector<std::uint32_t>& cs = crop.seeds();
 	// The seed decode the SHADER runs (pass 50): two shifts and two masks,
-	// mirroring sampleSdf3d in resources/shaders/pixels_rgba.comp.
+	// mirroring sampleSdf3d in resources/shaders/voxels.comp.
 	const auto decodeSeed = [](std::uint32_t v,
 														 const vv::voxel::SdfField::SeedBits& b,
 														 std::uint32_t& outX, std::uint32_t& outY,

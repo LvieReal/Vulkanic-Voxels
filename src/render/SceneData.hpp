@@ -6,7 +6,7 @@
 namespace vv::render {
 
 // Push constants sent to the compute shader per dispatch.
-// Layout must match the Push block in resources/shaders/pixels_rgba.comp.
+// Layout must match the Push block in resources/shaders/voxels.comp.
 struct PushConstants final {
 	glm::uvec4 screen{};    // x=width, y=height, z=bgra, w=frame
 	glm::vec4 camera{};     // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance;
@@ -24,7 +24,7 @@ struct PushConstants final {
 };
 
 // The Vulkan spec guarantees at least 128 bytes of push constants; this
-// layout must also match the Push block in pixels_rgba.comp exactly.
+// layout must also match the Push block in voxels.comp exactly.
 static_assert(sizeof(PushConstants) == 128, "push constant layout grew");
 
 // Uniform buffer updated each frame with camera and lighting.

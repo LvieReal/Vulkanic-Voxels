@@ -26,7 +26,7 @@ constexpr std::uint32_t kVoxelTypeCount = 7;
 // Hierarchical-DDA block size (pass 30): the near march skips whole
 // kHeightBlockVoxels^2 column blocks whose max height bound stays below
 // the ray. Must divide chunkSizeX/Z (32/8 = 4 blocks per chunk side) and
-// matches kBlockVoxels in resources/shaders/pixels_rgba.comp - a sync
+// matches kBlockVoxels in resources/shaders/voxels.comp - a sync
 // contract (see Chunk::blockHeightMapWords and the shader's
 // BlockHeights buffer, binding 11).
 constexpr std::uint32_t kHeightBlockVoxels = 8;

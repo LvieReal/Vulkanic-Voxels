@@ -1,6 +1,6 @@
 // The binding-13 "SdfBox" uniform, word for word (pass 51).
 //
-// The shader (resources/shaders/pixels_rgba.comp) declares
+// The shader (resources/shaders/voxels.comp) declares
 //
 //     layout(std140, set = 0, binding = 13) uniform SdfBox {
 //         ivec4 box;       // 0.. 3: xyz = box origin in world voxels,

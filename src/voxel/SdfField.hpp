@@ -363,7 +363,7 @@ public:
     }
 
     // The shader's sampleSdf3d since pass 52 (see resources/shaders/
-    // pixels_rgba.comp): the min cube distance over the EIGHT cells whose
+    // voxels.comp): the min cube distance over the EIGHT cells whose
     // CENTRES surround p (the interpolation cell of a cell-centred field:
     // floor(p - 0.5) and +1, each clamped into the box) instead of the 3x3x3
     // block, with the candidates compared as SQUARED distances, so a step pays

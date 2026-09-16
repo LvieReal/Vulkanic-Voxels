@@ -7,7 +7,9 @@ messages); this file keeps only what you need to work effectively.
 ## Project
 
 Voxel world ray-traced in a Vulkan compute shader (one thread per pixel,
-`resources/shaders/pixels_rgba.comp`), Qt 6 shell, C++23, CMake ≥ 3.26.
+`resources/shaders/voxels.comp` - named that since pass 59; older entries in
+this file call it `pixels_rgba.comp`). C++23, CMake ≥ 3.26 (GLFW windowing, Qt
+is long gone - the `src/ui/` row below is a stale pass-42-era leftover).
 Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
 
 | Path | Contents |
@@ -81,7 +83,7 @@ Owner's WGSL reference: `docs/reference_renderer.wgsl` (canonical look).
   whole region around the camera was fully shadowed).
   Current state = pass 40: the 3D voxel SDF sphere trace (CPU reference in
   src/voxel/SdfField.hpp, box build + chunk-layout walk in
-  src/voxel/SdfBox.hpp, GPU mirror in pixels_rgba.comp) hands a ray leaving
+  src/voxel/SdfBox.hpp, GPU mirror in voxels.comp) hands a ray leaving
   its box over to the 2.5D k*h/t traversal at the box crossing instead of
   calling the box edge open space (pass 39 = the scrambled box build).
   Exact binary shadows remain the default reference.
@@ -100,7 +102,7 @@ cmake -S . -B build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_PREFIX_PATH="/tmp/deps/qt6;/tmp/deps/prefix"
 cmake --build build/release && cmake --build build/debug  # warning-free
 ctest --test-dir build/release                    # all tests must pass
-glslangValidator -V resources/shaders/pixels_rgba.comp -o /tmp/p.spv
+glslangValidator -V resources/shaders/voxels.comp -o /tmp/p.spv
 QT_QPA_PLATFORM=offscreen LD_LIBRARY_PATH=/tmp/deps/qt6/lib:/tmp/deps/prefix/lib \
     timeout 8 ./build/release/bin/game            # must exit cleanly (Vulkan dialog, no crash)
 # CPU tests without the toolchain:
@@ -2200,3 +2202,47 @@ vendored); the README now says exactly that, and lists what is no longer needed
 (`libglfw3-dev`, `mingw-w64-ucrt-x86_64-glfw`, `libglm-dev`, `glm-devel`,
 `brew install glfw`). Vulkan headers/loader and `glslangValidator` remain system
 requirements, unchanged by this pass.
+
+## Pass 59: the shader is `voxels.comp` (it was `pixels_rgba.comp`)
+
+**Why.** `pixels_rgba.comp` was the name from the 2D compute pixel-drawing era;
+the file has been the voxel ray tracer since the first 3D pass, and the name was
+the last thing still saying otherwise.
+
+**What changed.** `git mv resources/shaders/pixels_rgba.comp
+resources/shaders/voxels.comp` and every reference that means "the shader today":
+the loader path in `VulkanRenderer::createComputePipeline`
+(`voxels.comp.spv`, `resources/shaders/`), the comments that point a reader at the
+shader (`src/render/SceneData.hpp` x2, `src/render/LightingConfig.hpp`,
+`src/voxel/SdfUniform.hpp`, `src/voxel/SdfField.hpp`, `src/voxel/VoxelTypes.hpp`),
+the mirror test's `VV_SHADER_DIR` file name and its failure message
+(`testSdfShaderMirrorConstants` reads the file to pin the shadow arithmetic), and
+the `cmake/Tests.cmake` comment. Nothing else loads it by name: the shader
+pipeline globs `*.comp`, the runtime copy uses the same glob, and the packaging
+target installs `VV_SHADER_SPV_FILES`.
+
+**What did not change.** Not one byte of the shader: `git show HEAD:resources/
+shaders/pixels_rgba.comp | md5sum` and the renamed file's md5 are identical, so
+the rebuilt SPIR-V is identical too - and the name is not part of the SPIR-V, so
+the runtime behaviour cannot differ.
+
+**Verification.** `glslangValidator -V resources/shaders/voxels.comp` exits 0;
+release + debug rebuilt and `ctest` 100% (the mirror test now opens the new name -
+it fails loudly if the file cannot be read, which is the point of the explicit
+`check(in.good(), ...)`); the runtime `resources/shaders` copy holds
+`voxels.comp.spv`, the stale `pixels_rgba.comp.spv` was removed from those
+directories, and neither binary contains the old name any more (the Debug build
+shows the literal `voxels.comp.spv`; the Release build inlines short literals
+into mov immediates, so a byte search there only finds `voxels.c`/`comp.spv`
+fragments - checked with a byte search over both, `pixels_rgba` is gone from
+each). The Release `.spv` is
+byte-identical to the pass-57/58 one (`74ad055c3070a1a1d6eb168ae5e770a0`) - the
+strongest statement that this pass changed no arithmetic - while the Debug `.spv`
+becomes `b44d94e98c515686a37b45fd6202b544`: Debug builds pass `-g`, and glslang
+embeds the SOURCE FILE NAME in the debug information (OpSource/OpName), so a
+rename is supposed to show up there and nowhere else.
+
+**Known staleness, not fixed here (one problem per pass).** This file's "Project"
+header still describes the Qt 6 shell and `src/ui/`; Qt went away in pass 43 and
+the tree has not had a docs-only cleanup since. The project description now says
+so inline; a docs pass should rewrite that header properly.
