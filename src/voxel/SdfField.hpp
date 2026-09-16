@@ -507,18 +507,19 @@ private:
 // contact (t ~= 0 again), so the origin keeps a displacement of
 // kShadowJitterFloor VOXELS - a fixed world distance, deliberately NOT scaled
 // by the footprint - which is what flips the grazing rays an edge is made of.
-// One lever moves both: the floor is linear in the slope (0.5 voxel at the
-// default, one at 0.10), because the owner's "0.5 is too small, 5 is enough"
-// was pass 56's footprint lever, whose "5" is about a VOXEL of displacement at
-// a typical view - and the shipped default sits between the two.
+// One lever moves both: the floor is linear in the slope (0.02 voxel at the
+// default = 10x slope, one at slope 0.10), because the owner's "0.5 is too
+// small, 5 is enough" was pass 56's footprint lever, whose "5" is about a VOXEL
+// of displacement at a typical view. The shipped slope is his own on-device
+// pick (0.002: "feels just right, it's enough to hide stepping and bands").
 //
 // The shader hashes both components per PIXEL-FOOTPRINT cell of the world
 // position, and drives them from ONE hashed azimuth (one jittered ray, not two
 // independent perturbations); the mirror does the same, so a test can walk the
 // same arithmetic the GPU runs. testSdfShaderMirrorConstants holds the
 // constants and the shader's text together.
-inline constexpr float kShadowJitterDefault = 0.05f;  // cone slope
-inline constexpr float kShadowJitterFloor = 0.50f;    // displacement, voxels
+inline constexpr float kShadowJitterDefault = 0.002f;  // cone slope
+inline constexpr float kShadowJitterFloor = 0.02f;    // displacement, voxels
 inline constexpr float kShadowJitterFloorMax = 1.0f;  // ... capped at a voxel
 
 // The contact displacement for a given lever, the shader's

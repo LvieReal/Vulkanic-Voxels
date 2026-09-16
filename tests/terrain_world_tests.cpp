@@ -2682,7 +2682,7 @@ void testSdfSoftShadow3d() {
 		check(std::abs(vv::voxel::shadowJitterFloorVox(2.0f * kSlope) -
 				2.0f * kFloor) < 1e-6f,
 			"sdf3d pass57: the floor scales linearly with the lever");
-		check(vv::voxel::shadowJitterFloorVox(10.0f * kSlope) ==
+		check(vv::voxel::shadowJitterFloorVox(100.0f * kSlope) ==
 				vv::voxel::kShadowJitterFloorMax,
 			"sdf3d pass57: ... and is capped at kShadowJitterFloorMax");
 		// The regression this pass exists for: the displacement is a FIXED
@@ -2767,7 +2767,12 @@ void testSdfSoftShadow3d() {
 		check(coneOver == 0,
 			"sdf3d pass57: the cone's tilt never exceeds its slope");
 
-		// The effect, on the same z=28 scan the earlier passes used.
+		// The effect, on the same z=28 scan the earlier passes used. It runs at
+		// kEffectSlope, not at the shipped default: the default is the owner's
+		// on-device pick (0.002) and is deliberately gentle enough that a
+		// 181-ray scan only brushes the edge, while this check exists to pin
+		// that the mechanism CAN move it.
+		const float kEffectSlope = 0.05f;
 		double sumPlain = 0.0, sumJit = 0.0, maxDiff = 0.0;
 		long samples = 0, moved = 0;
 		for (double x = 5.0; x <= 14.0 + 1e-9; x += 0.05) {
@@ -2779,8 +2784,8 @@ void testSdfSoftShadow3d() {
 			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 			const float pf[3] = {float(p[0]), float(p[1]), float(p[2])};
 			float dir[3], jittered[3];
-			vv::voxel::shadowRayJitter(pf, nUp, sunf, kFootprint, kSlope, dir,
-				jittered);
+			vv::voxel::shadowRayJitter(pf, nUp, sunf, kFootprint,
+				kEffectSlope, dir, jittered);
 			const float plain = vv::voxel::sphereTracedShadow(sdf, of, sunf);
 			const float jit = vv::voxel::sphereTracedShadow(sdf, jittered, dir);
 			sumPlain += plain;
@@ -2795,7 +2800,7 @@ void testSdfSoftShadow3d() {
 			"west edge, floor %.2f vox + cone %.3f: mean vis %.4f jittered / "
 			"%.4f plain (|d| %.4f), %ld moved (max %.3f), cone angle <= %.4f "
 			"rad, length error <= %.1e\n",
-			samples, double(kFloor), double(kSlope), meanJit, meanPlain,
+			samples, double(kFloor), double(kEffectSlope), meanJit, meanPlain,
 			std::abs(meanJit - meanPlain), moved, maxDiff, maxAngle,
 			double(1e-4) * double(kSlope));
 		check(moved * 20 >= samples,
@@ -2970,8 +2975,11 @@ void testSdfShaderMirrorConstants() {
 		const float pf[3] = {float(x), float(b == 0xFFFFu ? 10.0 : double(b)),
 			float(z)};
 		float dir[3], jitOrigin[3];
-		vv::voxel::shadowRayJitter(pf, nUp, sf, kFootprint,
-			vv::voxel::kShadowJitterDefault, dir, jitOrigin);
+		// A lever the effect is measurable at, not the shipped default (the
+		// constants above are pinned against the shader; this half is the
+		// mechanism moving rays).
+		vv::voxel::shadowRayJitter(pf, nUp, sf, kFootprint, 0.05f, dir,
+			jitOrigin);
 		const float byDefault = vv::voxel::sphereTracedShadow(sdf, of, sf);
 		const float explicitCall =
 			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160);

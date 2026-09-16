@@ -633,11 +633,17 @@ const float kShadowSharpness = 8.0;
 //
 // VV_SHADOW_JITTER (pc.camera.w) = the CONE SLOPE, so it A/Bs without a
 // rebuild: 0 turns the jitter off and is bit-identical to the un-jittered
-// picture, kShadowJitterDefault (0.05) is the shipped slope, and the floor
-// scales with it linearly (0.5 voxel at the default, 1.0 at 0.10) so one
+// picture, kShadowJitterDefault is the shipped slope, and the floor scales
+// with it linearly (0.02 voxel at the default, one at slope 0.10) so one
 // number moves both.
-const float kShadowJitterDefault = 0.05;  // cone slope, tan of the tilt
-const float kShadowJitterFloor = 0.50;    // contact displacement, voxels
+//
+// The default is the owner's on-device pick. Pass 57 shipped 0.05 and he swept
+// the lever on the device: "VV_SHADOW_JITTER=0.002 feels just right, it's
+// enough to hide stepping and bands" - a quarter of the ramp of the old pass-56
+// lever at its "too small" setting, and 25x under the slope the pass-57 probe
+// used to make its measurements.
+const float kShadowJitterDefault = 0.002;  // cone slope, tan of the tilt
+const float kShadowJitterFloor = 0.02;     // contact displacement, voxels
 const float kShadowJitterFloorMax = 1.0;  // ... and never more than a voxel
 
 float shadowJitterSlope()

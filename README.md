@@ -194,17 +194,23 @@ distance to the caster. On the 3721-ray terrain probe the mean |dvis| ran 0.008
 so the origin keeps its own displacement - a fixed world distance, in the surface
 tangent plane so a displaced origin cannot start inside the solid it stands on -
 and the two share one hashed azimuth, so it stays one jittered ray. The hash cell
-is still the pixel's footprint, pass 56's accepted per-pixel grain. At the shipped
-default (cone slope 0.05, floor 0.50 vox, reached at the renderer's `VV_SHADOW_JITTER`
-lever; 0 is bit-identical to the un-jittered estimate, the clamp is 0.5 and the
-startup log prints both numbers) the contact scan's grid-locked zigzag - the
+is still the pixel's footprint, pass 56's accepted per-pixel grain. The shipped
+default is the owner's own on-device pick: `VV_SHADOW_JITTER=0.002` ("feels just
+right, it's enough to hide stepping and bands"), a cone slope 25x gentler than
+the probe's measuring lever and 10x its contact floor (0.02 voxel; the lever
+reaches the 1-voxel cap at slope 0.10, and 0 is bit-identical to the un-jittered
+estimate - the startup log prints both numbers). At that default the penumbra
+profile's exactly-flat plateaus - the banding - fall from 47.2% of neighbouring
+samples to 28.1% while the terrain probe's mean |dvis| stays at 0.008 (16.8% of
+rays move by more than 1/255, mean visibility 0.6556 -> 0.6600). At 0.05, where
+the probe can measure the contact effect, the scan's grid-locked zigzag - the
 "stair-stepping" - drops from 0.162 to 0.063 voxel while its profile becomes
-per-sample grain (worst neighbour step 0.037 -> 0.957), the terrains' 18.2% of
-rays move by more than 1/255, and the mean visibility of the probe's terrain view
-goes 0.6556 -> 0.7122: the edge folds toward the light by half a voxel, the same
-trade pass 56 made at the offset the owner called "enough". Costs two hashes per
-shadow ray against ~174 field taps; the march's samples and the exact binary path
-(`VV_SDF_SHADOWS=0`) are untouched, bit for bit.
+per-sample grain (worst neighbour step 0.037 -> 0.957), 18.2% of rays move by
+more than 1/255 and the mean visibility goes 0.6556 -> 0.7122: the edge folds
+toward the light by half a voxel, the trade pass 56 made at the offset the owner
+called "enough". Costs two hashes per shadow ray against ~174 field taps; the
+march's samples and the exact binary path (`VV_SDF_SHADOWS=0`) are untouched, bit
+for bit.
 
 Pass 56 jitters the ray's ORIGIN, one pixel of world, in the surface tangent
 plane - superseded by pass 57's rule for the reason above, but the mechanism it

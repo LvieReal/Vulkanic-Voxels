@@ -2030,12 +2030,14 @@ accepted per-pixel grain):
   repeating that scaling is the bug above - and the tangent plane is pass 56's
   accepted choice: a displaced origin can never start inside the solid it stands
   on, and the ray keeps its t.
-- *Constants*: `kShadowJitterDefault = 0.05` (cone slope),
-  `kShadowJitterFloor = 0.50` voxel at that slope, linear in the lever and
-  capped by `kShadowJitterFloorMax = 1.0` (reached at slope 0.10). The owner's
-  "5" was pass 56's footprint lever, whose value at a typical view is about one
-  voxel of displacement; the shipped default sits between his "too small" (that
-  same lever at 0.5, ~0.1 voxel) and his "enough".
+- *Constants*: `kShadowJitterDefault = 0.002` (the cone slope the owner picked on
+  the device: "VV_SHADOW_JITTER=0.002 feels just right, it's enough to hide
+  stepping and bands"), `kShadowJitterFloor = 0.02` voxel at that slope - i.e.
+  the floor is 10x the slope, capped by `kShadowJitterFloorMax = 1.0` (reached
+  at slope 0.10). The owner's "5" was pass 56's footprint lever, whose value at a
+  typical view is about one voxel of displacement; the shipped default is a
+  quarter of that lever's "too small" setting, and the probe numbers below use
+  0.05 - 25x the default - where the contact metric can resolve the effect.
 - *Lever*: `VV_SHADOW_JITTER` is now the CONE SLOPE (renderer clamp [0, 0.5]),
   and moves both terms; `0` is still bit-identical to the un-jittered estimate
   (the early-out returns `sunV` and the plain lifted origin), and the startup
@@ -2066,8 +2068,23 @@ accepted per-pixel grain):
   - below the probe's timing noise. The march's samples and the exact
   `sunRayEscapes` path are untouched.
 
+**At the shipped default (0.002).** The owner swept the lever on-device and
+picked the gentlest setting that still reads as fixed. Measured at 0.002: the
+penumbra profile's exactly-flat plateaus fall from 47.2% of neighbouring samples
+to 28.1% (this is the banding dissolving into sub-quantisation dither), the
+terrain probe moves 16.8% of rays by more than 1/255 with mean |dvis| 0.0078 and
+mean visibility 0.6556 -> 0.6600, and the blocked share 19.2% -> 22.4%. The
+contact scan's parity-locked zigzag does NOT improve at this strength (0.162 ->
+0.222): a gentle jitter dithers the profile samples (summed |2nd difference| 0.29
+-> 0.48, worst neighbour step 0.037 -> 0.064) without moving the terminator's
+row-to-row structure. What the eye reads as a stepped contact is the plateau/jump
+structure, which is what the default breaks; the geometry-derived zigzag needs
+the 0.05-ish lever to actually move, and then it costs the half-voxel edge fold
+documented above. Both levers are recorded in the probe table at the end of this
+section.
+
 **Honest limits.** The jitter does not fix the SDF's ~1-voxel contact creep; it
-makes the edge noisier and, measured above, folds its mean by half a voxel
+makes the edge noisier and, measured at 0.05, folds its mean by half a voxel
 toward the light. The tangential slide can start inside a step-up that shares
 the point's voxel-face normal (a face normal is axis-aligned, so a horizontal
 slide on a floor can enter the next column), which produces occasional dark
@@ -2094,3 +2111,18 @@ implies exactly 0, linear in the lever, capped), the footprint-independence of
 the displacement bound, the tangent-slide property (the normal component of the
 offset is 0) and the 181-ray mesa scan (42 rays move, mean shift 0.024 with the
 scan window crossing the edge).
+
+**Follow-up commit (same pass): the default is the owner's pick.** He swept the
+`VV_SHADOW_JITTER` lever on the device and reported "confirmed, stays consistent
+with distance now. `VV_SHADOW_JITTER=0.002` feels just right, it's enough to hide
+stepping and bands." The shipped constants are therefore
+`kShadowJitterDefault = 0.002` and `kShadowJitterFloor = 0.02` voxel (the floor
+stays 10x the slope, capped at one voxel at slope 0.10), i.e. exactly the setting
+he verified - the arithmetic is unchanged, only the default moved, so his A/B
+still reproduces byte for byte. The suite's effect half now runs its scan and its
+400-ray check at an explicit 0.05 lever (a constant named in the test) instead of
+at the default, because at 0.002 only a fraction of a scan's rays are brushed; the
+constants half still pins the shader's own default. Rebuilt and re-tested at that
+commit: release + debug `ctest` 100% (6.84 s / 30.11 s), runtime `.spv` md5
+release `74ad055c3070a1a1d6eb168ae5e770a0`, debug
+`82dc95a2423f9a30d1692374d23be95b`.
