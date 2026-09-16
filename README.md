@@ -134,7 +134,7 @@ camera-centered 6x6-chunk box over the full world height, kept on the camera's
 chunk by a background build) is sphere-traced toward the sun with the plain
 Quilez `k*h/t` penumbra estimate, so shadow edges are soft on vertical / side
 casters too and not just on flat tops (`kShadowSharpness` in the shader tunes
-the softness). The field lives in two halves and the box uniform says where the live
+the softness, and `VV_SHADOW_JITTER` tunes the per-point ray jitter below). The field lives in two halves and the box uniform says where the live
 half starts, so the copy never blocks a frame and a box only goes live together
 with the seeds it describes. Only the box is
 field-aware: a shadow ray that leaves it hands over to the 2.5D penumbra
@@ -176,20 +176,33 @@ out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
 0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
 corners is what keeps the current penumbra dark, and no bias brings that back.
 
-Pass 54 caps the sphere trace's step at one voxel (`kMaxSdfStep`). The field
-resolves a voxel, so a longer step can hop over the voxel-scale structure the
-penumbra estimate is read from - and because the visibility is a min over the
-samples, it then jumps between whichever samples the march happened to land on,
-so the terminator comes out stepped instead of smooth. That is what the
-ray-traced-SDF papers attribute penumbra banding to (arXiv 2210.06160) and what
-their "restrict the maximum step size" fix removes. Measured with a probe over
-the shipping box (3721 terrain rays) plus a synthetic contact edge scanned at
-0.02-voxel spacing: the edge profile's summed second difference drops 0.29 ->
-0.13 (a 2.2x smoother terminator) and its worst neighbour step 0.037 -> 0.017,
-while the terrain picture moves by 0.0004 mean visibility (2.1% of rays over
-1/255, none over 0.07, no verdict flips); the field phase costs 21.9 -> 77.3 of
-its 160 samples per ray, and no ray is cut off by the budget. The 0.7 step
-factor, the 8.0 sharpness and the 160-sample budget are unchanged.
+Pass 55 jitters the shadow ray's DIRECTION per shaded point - the owner's
+corrected directive ("by dithering i meant jittering the actual rays, not the
+output image; that's different, color banding"). The penumbra estimate is a min
+over discrete samples, so its error is a coherent function of where the shaded
+point is: neighbouring points walk almost the same samples, the error
+correlates across the surface, and it reads as bands sweeping a penumbra and as
+stepped contacts. Tilting the sun by a disc-uniform offset of slope 0.02
+(~1.1 degrees, 16% of the 0.125-radian sun disc `kShadowSharpness` models)
+decorrelates that error into noise of the same magnitude instead of structure.
+The hash is the shaded point's world position quantised to 1/8 voxel, so the
+grain is fixed in the world rather than crawling when the camera moves, and the
+direction keeps its LENGTH (the march's `t` is a distance, so a rescaled
+direction would rescale the penumbra). It costs two hashes per shadow ray
+against ~174 taps; the samples the march takes are unchanged, the mean
+visibility is unchanged to 0.0007 on a 0.05-voxel contact scan (36 of 181
+samples moved, max 0.135), and 13% of random surface rays move. The exact
+binary path (`VV_SDF_SHADOWS=0`) keeps the true sun, bit for bit, and
+`VV_SHADOW_JITTER=<slope>` overrides the magnitude on-device (0 = the
+pre-pass-55 estimate, bit-identical; the startup log prints what was chosen).
+
+Pass 54's one-voxel step cap (`kMaxSdfStep`) was rejected on-device ("looks
+like it did not solve anything, only performs worse now") and is reverted. Its
+probe numbers still stand as measurements - the edge profile's summed second
+difference dropped 0.29 -> 0.13 and its worst neighbour step 0.037 -> 0.017 for
+0.0004 mean visibility of terrain change - but they did not read on screen,
+and the field phase really did go 21.9 -> 77.3 of its 160 samples per ray. Ray
+jitter is what replaced it.
 
 The rebake's own arithmetic got cheaper in pass 53: the two chamfer sweeps now
 scan a cell's seven candidates in one go and write the cell once, instead of

@@ -154,6 +154,27 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
                  "covers %u)\n",
                  m_sdfMarginChunks,
                  vv::vulkan::VoxelResources::kSdfHalfChunks);
+    // Pass 55: the shadow ray's direction is jittered per shaded point, which
+    // turns the discrete march's coherent sampling error (bands across a
+    // penumbra, stepped contacts) into uncorrelated noise. The lever is a
+    // slope: kShadowJitterDefault (shader, ~1.1 degrees, 16% of the modelled
+    // sun disc) when unset, 0 for the exact pre-pass-55 estimate, and up to
+    // 0.5 to overshoot on purpose. It rides pc.camera.w to the shader.
+    if (const char* jitterEnv = std::getenv("VV_SHADOW_JITTER")) {
+      const float parsed = std::strtof(jitterEnv, nullptr);
+      m_shadowJitter = std::clamp(parsed, 0.0f, 0.5f);
+    }
+    if (m_shadowJitter < 0.0f) {
+      std::fprintf(stderr,
+                   "[vulkan] shadow ray jitter: shader default "
+                   "(kShadowJitterDefault)\n");
+    } else if (m_shadowJitter == 0.0f) {
+      std::fprintf(stderr,
+                   "[vulkan] shadow ray jitter: off (pre-pass-55 estimate)\n");
+    } else {
+      std::fprintf(stderr, "[vulkan] shadow ray jitter: %.4f slope\n",
+                   static_cast<double>(m_shadowJitter));
+    }
   }
 
   // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
@@ -3133,7 +3154,7 @@ bool VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd,
   push.screen = glm::uvec4(m_swapchainExtent.width, m_swapchainExtent.height,
                            isBgra, m_frameCounter);
   push.camera = glm::vec4(m_camera.tanHalfFovRadians(), m_fogDensity, 0.0f,
-                          0.0f);
+                          m_shadowJitter);
   push.chunkSize =
       glm::uvec4(m_voxelConfig.chunkSizeX, m_voxelConfig.worldHeight,
                  m_voxelConfig.chunkSizeZ, m_voxelConfig.maxTraceSteps);

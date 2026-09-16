@@ -485,6 +485,85 @@ private:
 // Sphere-traced soft shadow (iquilezles.org/articles/rmshadows/ with a proper
 // 3D SDF). March the ray toward the sun, step by the SDF distance
 // (conservatively scaled, so an approximate SDF can never skip a surface),
+// Pass 55 (shader mirror): the shadow ray's DIRECTION is jittered per shaded
+// point, hashed from the world position quantised to 1/8 voxel, so the discrete
+// march's sampling error decorrelates across the surface instead of banding.
+// Mirrors shadowRayJitter/hash13 in resources/shaders/pixels_rgba.comp: a
+// disc-uniform offset of slope `jitter` (zero mean), with the direction's
+// LENGTH preserved, because the march's t is a distance. `jitter = 0` is the
+// pre-pass-55 estimate, which is what the tests below characterise; the
+// shipped magnitude lives in the shader (kShadowJitter) and
+// testSdfShaderMirrorConstants holds the two together.
+// The shipped jitter, i.e. the shader's kShadowJitterDefault /
+// kShadowJitterGrain (testSdfShaderMirrorConstants holds the pairing). A
+// slope, not an angle in degrees: 0.02 ~= 1.1 degrees, 16% of the 0.125
+// radian sun disc that kShadowSharpness = 8 models.
+inline constexpr float kShadowJitterDefault = 0.02f;
+inline constexpr float kShadowJitterGrain = 8.0f;  // hash cell = 1/8 voxel
+
+inline float shadowJitterHash(float x, float y, float z) {
+    float px = x * 0.1031f, py = y * 0.1031f, pz = z * 0.1031f;
+    px -= std::floor(px);
+    py -= std::floor(py);
+    pz -= std::floor(pz);
+    const float d = px * (py + 33.33f) + py * (pz + 33.33f) +
+                    pz * (px + 33.33f);
+    px += d;
+    py += d;
+    pz += d;
+    const float h = (px + py) * pz;
+    return h - std::floor(h);
+}
+
+inline void shadowRayJitter(const float o[3], float d[3],
+                            float jitter = kShadowJitterDefault,
+                            float grain = kShadowJitterGrain) {
+    if (jitter <= 0.0f) {
+        return;
+    }
+    const float cx = std::floor(o[0] * grain);
+    const float cy = std::floor(o[1] * grain);
+    const float cz = std::floor(o[2] * grain);
+    const float u1 = shadowJitterHash(cx, cy, cz);
+    const float u2 = shadowJitterHash(cx + 17.0f, cy + 31.0f, cz + 7.0f);
+    const float r = jitter * std::sqrt(u1);  // sqrt = area-uniform in the disc
+    const float phi = 6.2831853f * u2;
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len <= 1e-6f) {
+        return;
+    }
+    const float ix = 1.0f / len;
+    const float dx = d[0] * ix, dy = d[1] * ix, dz = d[2] * ix;
+    const float hx = (std::abs(dy) < 0.9f) ? 0.0f : 1.0f;
+    const float hy = (std::abs(dy) < 0.9f) ? 1.0f : 0.0f;
+    float ax = hy * dz - 0.0f * dy;
+    float ay = 0.0f * dx - hx * dz;
+    float az = hx * dy - hy * dx;
+    const float alen = std::sqrt(ax * ax + ay * ay + az * az);
+    if (alen <= 1e-9f) {
+        return;
+    }
+    ax /= alen;
+    ay /= alen;
+    az /= alen;
+    const float bx = dy * az - dz * ay;
+    const float by = dz * ax - dx * az;
+    const float bz = dx * ay - dy * ax;
+    const float off = r;
+    const float ox = (ax * std::cos(phi) + bx * std::sin(phi)) * off;
+    const float oy = (ay * std::cos(phi) + by * std::sin(phi)) * off;
+    const float oz = (az * std::cos(phi) + bz * std::sin(phi)) * off;
+    const float nx = dx + ox, ny = dy + oy, nz = dz + oz;
+    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nlen <= 1e-9f) {
+        return;
+    }
+    const float s = len / nlen;
+    d[0] = nx * s;
+    d[1] = ny * s;
+    d[2] = nz * s;
+}
+
 // and fold k*h/t into the running min. h is the 3D distance to the nearest
 // solid surface, so every shadow edge shares the same continuous penumbra.
 // o/d are in voxel units (field-local); d must be a unit vector with
@@ -503,15 +582,15 @@ private:
 // ray itself (a hit, a low sun, or the march never left it): outVisibility
 // is then the final answer.
 //
-// Pass 54: `maxStep` mirrors the shader's kMaxSdfStep (the field resolves one
-// voxel, so a longer step can hop over the voxel-scale structure the penumbra
-// is read from and the terminator comes out stepped); `outSteps` reports how
-// many samples the field phase took, so a test can pin that cost.
+// Pass 55: `jitter` mirrors the shader's kShadowJitter (the ray's direction is
+// tilted per shaded point, so the sampling error decorrelates instead of
+// banding); 0 keeps the pre-pass-55 estimate. `outSteps` reports how many
+// samples the field phase took, so a test can pin that cost.
 inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
                                     const float d[3], float outExit[3],
                                     float* outExitT, float* outVisibility,
                                     float sharpness = 8.0f, int steps = 160,
-                                    float maxStep = 1.0f,
+                                    float jitter = kShadowJitterDefault,
                                     int* outSteps = nullptr) {
     if (outExitT != nullptr) {
         *outExitT = 0.0f;
@@ -524,6 +603,10 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         }
         return false;
     }
+    // Pass 55 (shader mirror): march the JITTERED direction; tExit and the
+    // exit point follow the same ray the samples were taken on.
+    float dir[3] = {d[0], d[1], d[2]};
+    shadowRayJitter(o, dir, jitter);
     // Pass 40 (shader mirror): hand the ray over at the box CROSSING, not at
     // the first sample past it, so a step (up to 0.7 * h) cannot skip a
     // caster sitting in the strip just outside the box. 0 when the origin
@@ -534,9 +617,9 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         o[2] >= 0.0f && o[2] < hi[2]) {
         tExit = 1e30f;
         for (int a = 0; a < 3; ++a) {
-            if (std::abs(d[a]) > 1e-6f) {
-                const float face = (d[a] > 0.0f) ? hi[a] : 0.0f;
-                tExit = std::min(tExit, (face - o[a]) / d[a]);
+            if (std::abs(dir[a]) > 1e-6f) {
+                const float face = (dir[a] > 0.0f) ? hi[a] : 0.0f;
+                tExit = std::min(tExit, (face - o[a]) / dir[a]);
             }
         }
     }
@@ -546,9 +629,9 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
         // Left the field: report where, so the caller can keep marching.
         if (t >= tExit) {
             if (outExit != nullptr) {
-                outExit[0] = o[0] + d[0] * tExit;
-                outExit[1] = o[1] + d[1] * tExit;
-                outExit[2] = o[2] + d[2] * tExit;
+                outExit[0] = o[0] + dir[0] * tExit;
+                outExit[1] = o[1] + dir[1] * tExit;
+                outExit[2] = o[2] + dir[2] * tExit;
             }
             if (outExitT != nullptr) {
                 *outExitT = tExit;
@@ -558,9 +641,9 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
             }
             return true;
         }
-        const float px = o[0] + d[0] * t;
-        const float py = o[1] + d[1] * t;
-        const float pz = o[2] + d[2] * t;
+        const float px = o[0] + dir[0] * t;
+        const float py = o[1] + dir[1] * t;
+        const float pz = o[2] + dir[2] * t;
         const float h = sdf.sample(px, py, pz);
         if (h < 1e-3f) {
             if (outVisibility != nullptr) {
@@ -572,19 +655,17 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
             visibility,
             std::clamp(sharpness * h / std::max(t, 1e-4f), 0.0f, 1.0f));
         // Conservative step: 0.7x the SDF keeps the march from overshooting a
-        // surface the chamfer field slightly over-estimates, and (pass 54) a
-        // cap keeps a step from hopping over the voxel-scale structure the
-        // penumbra estimate is read from - the shader's kMaxSdfStep.
-        t += std::clamp(h * 0.7f, 0.05f, maxStep);
+        // surface the chamfer field slightly over-estimates.
+        t += std::max(h * 0.7f, 0.05f);
         if (outSteps != nullptr) {
             *outSteps = i + 1;
         }
     }
     // Budget spent inside the field: the shader hands the rest over as well.
     if (outExit != nullptr) {
-        outExit[0] = o[0] + d[0] * t;
-        outExit[1] = o[1] + d[1] * t;
-        outExit[2] = o[2] + d[2] * t;
+        outExit[0] = o[0] + dir[0] * t;
+        outExit[1] = o[1] + dir[1] * t;
+        outExit[2] = o[2] + dir[2] * t;
     }
     if (outExitT != nullptr) {
         *outExitT = t;
@@ -600,13 +681,14 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
 // the voxels it was built from) and probes. Returns visibility in [0, 1].
 inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
                                 const float d[3], float sharpness = 8.0f,
-                                int steps = 160, float maxStep = 1.0f) {
+                                int steps = 160,
+                                float jitter = kShadowJitterDefault) {
     if (d[1] <= 0.05f) {
         return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
     }
     float visibility = 1.0f;
     sphereTracedShadowExits(sdf, o, d, nullptr, nullptr, &visibility,
-                            sharpness, steps, maxStep, nullptr);
+                            sharpness, steps, jitter, nullptr);
     return visibility;
 }
 

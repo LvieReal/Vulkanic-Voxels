@@ -34,8 +34,12 @@ function(vv_add_tests)
     # testSdfShaderMirrorConstants reads that file to pin the constants the
     # mirror hardcodes (pass 54; the pass-51 uniform bug is the same failure
     # mode: a GPU-side contract drifting away from its CPU counterpart).
+    # VV_SRC_DIR lets the same test read VulkanRenderer.cpp: pass 55's jitter
+    # slope reaches the shader through pc.camera.w, so the WRITER is part of
+    # the contract too (pass 51 again: a shader uniform nobody wrote).
     target_compile_definitions(voxel_tests PRIVATE
-        VV_SHADER_DIR="${CMAKE_SOURCE_DIR}/resources/shaders")
+        VV_SHADER_DIR="${CMAKE_SOURCE_DIR}/resources/shaders"
+        VV_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
 
     # Same float32 bit-exactness contract as the game target
     # (terrain/Noise.hpp): no FMA contraction on GCC/Clang.

@@ -1705,12 +1705,21 @@ the chunks instead of the cells).
   what the check has to hit.)
 - Release + debug builds warning-free, `ctest` 100% in both.
 
-## Pass 54: the shadow artifacts - the march's step gets a one-voxel cap
+## Pass 54 (REJECTED on-device, reverted in pass 55): the march's step cap
 
 The owner's directive for this pass: the 3D SDF shadows show (a) stair-stepping
 where a shadow contact is hard and (b) banding across penumbrae, which he
 believed dithering would fix. He asked for the proper fixes to be researched
 rather than guessed, so the pass began on the web and ended in a probe.
+
+**Outcome: rejected.** On-device verdict: "looks like it did not solve anything,
+only performs worse now." The cap cost 21.9 -> 77.3 of the march's 160 field
+samples per ray and bought nothing the eye could see, so pass 55 reverts it
+(`t += max(h * 0.7, 0.05)` again, `kMaxSdfStep` gone from the shader, the mirror
+and the tests) and replaces it with the ray jitter the owner actually meant.
+Everything below is kept as measurement, not as a shipped design: the probe
+numbers are real (the profile *was* smoother), they just did not predict what the
+picture looks like - which is the lesson this pass cost.
 
 ### What the research says
 
@@ -1780,13 +1789,19 @@ steps/ray and a mean visibility of 0.06 instead of 22 steps and 0.66.
   penumbra in proportion (the fake penumbra is 0.125*t wide) and darkens the
   picture, not lightens it: 4.0 moves 21.7% of rays. It is the honest "how soft
   do you want contacts" knob, not a fix - left for the owner to ask for.
-- **What is left is the step cap**, which is also the literature's banding fix:
-  the visibility is a min over samples, and a step longer than the one voxel the
-  field resolves lands on an arbitrary subset of samples - so the terminator
-  wobbles with the sampling. Cap it and the profile becomes a smooth function of
-  the ray: contact wobble 0.29 -> 0.13 and worst step 0.037 -> 0.017 at 1.0
-  (77.3 vs 21.9 samples/ray, no ray cut off by the 160-sample budget), with the
-  terrain picture moving by 0.0004 mean visibility.
+- **The step cap worked on paper and failed on the device.** The visibility is
+  a min over samples, and a step longer than the one voxel the field resolves
+  lands on an arbitrary subset of samples - so the terminator wobbles with the
+  sampling. Capping at 1.0 voxel did smooth the profile (contact wobble
+  0.29 -> 0.13, worst step 0.037 -> 0.017, terrain picture moving by 0.0004 mean
+  visibility, no ray cut off by the budget) - and the owner saw neither of the
+  two artifacts improve. It costs 77.3 vs 21.9 field samples per ray, i.e. real
+  frames per second, for a change below the visible threshold. Do not re-ship it
+  and do not offer the 1.5 / 0.5 variants as follow-ups.
+- **Jittering the OUTPUT was never the fix** (his correction, pass 55): "by
+  dithering i meant jittering the actual rays, not the output image (that's
+  different, color banding)". The IGN debanding in `packColor` is not evidence
+  against ray jitter - different error, different scale.
 
 ### Honest limits
 
@@ -1805,21 +1820,89 @@ steps/ray and a mean visibility of 0.06 instead of 22 steps and 0.66.
   ~30% of the SDF shadow pass. 1.5 costs 20% and gets ~70% of the smoothing;
   0.5 is 6.5x for the last 15%. The constant is one line.
 
-### Verification
+### Verification (as it stood in pass 54)
 
-- `testSdfSoftShadow3d` gained (4): a 0.05-voxel scan across the mesa's west
-  shadow edge on the ground, asserting that the capped profile's wobble stays
-  bounded (1.33 measured), that the uncapped march is measurably worse on the
-  same scan (1.45), and that no ray in the capped march reaches the 160-sample
-  budget (worst 67).
-- `testSdfShaderMirrorConstants` (new) reads `resources/shaders/pixels_rgba.comp`
-  through `VV_SHADER_DIR` (cmake/Tests.cmake) and pins what the CPU mirror
-  hardcodes: `kShadowSharpness = 8.0`, `kMaxSdfStep = 1.0`, the 160-step budget
-  and the capped step expression - then proves the mirror's *defaults* are those
-  constants by comparing a default call against an explicit (8.0, 160, 1.0) call
-  bit for bit on 400 rays. Pass 51 is why that pairing is worth a test.
-- Mutation check: setting the mirror's default cap to 1e9 fails exactly two
-  checks ("the step cap smooths a shadow terminator" and "the mirror's defaults
-  are exactly 8.0 / 160 / 1.0") and nothing else; restored, the suite is green.
-- Release + debug builds warning-free, `ctest` 100% in both; `glslangValidator`
-  exit 0 for the new shader and the runtime `.spv` copies are in sync.
+- `testSdfSoftShadow3d` gained (4), a 0.05-voxel scan across the mesa's west
+  shadow edge on the ground pinning the capped profile's wobble, the uncapped
+  march being measurably worse on the same scan, and the 160-sample budget.
+- `testSdfShaderMirrorConstants` (new) read `resources/shaders/pixels_rgba.comp`
+  through `VV_SHADER_DIR` (cmake/Tests.cmake) and pinned `kShadowSharpness`,
+  `kMaxSdfStep` and the capped step expression, then proved the mirror's
+  *defaults* were those constants by comparing a default call against an
+  explicit (8.0, 160, 1.0) call bit for bit. That pairing test survives - pass 55
+  points it at the jitter instead (and at the renderer that writes the lever).
+- Mutation check: setting the mirror's default cap to 1e9 failed exactly two
+  checks and nothing else; restored, the suite was green. Both ctests 100% at
+  `efd798f`.
+
+## Pass 55: jitter the shadow ray's DIRECTION
+
+The owner's corrected directive: "by dithering i meant jittering the actual rays, not the output image (that's different, color banding)".
+
+**What it does.** `shadowRayJitter(hitPosVox, sunV)` tilts the sun by a
+disc-uniform offset of slope `kShadowJitterDefault = 0.02` (a 1.1-degree cone,
+16% of the 0.125-radian sun disc `kShadowSharpness = 8` models), hashed from the
+shaded point's world position quantised to `kShadowJitterGrain = 8` cells per
+voxel. Uniform in the disc area (`r = slope * sqrt(u1)`), zero mean, and the
+direction keeps its LENGTH: the march's `t` is a distance along `sunV`, so a
+rescaled direction would rescale the whole penumbra. It is applied once, in
+`sunShadow`, to the two SOFT paths only (`sunRayEscapesSdf3d` inside the box,
+`sunRayEscapesSdf` for the 2.5D fallback); the exact binary `sunRayEscapes` path
+keeps the true sun and stays bit-identical, which is the standing constraint.
+
+**Why this and not the cap.** The estimate's error is *coherent*: the visibility
+is a min over discrete samples, so two neighbouring shaded points walk almost the
+same sample set, their errors agree, and the error reads as structure - bands
+across a penumbra, steps along a contact. Jitter makes the same error
+*incoherent* without changing its magnitude; the cap tried to make the error
+smaller and paid 3.5x the samples for something no eye could see. With TAA
+rejected (pass 9) the noise is not resolved away, so the magnitude has to be
+chosen to look like grain rather than like blotches - hence the lever.
+
+**The lever.** `VV_SHADOW_JITTER=<slope>` (renderer: `m_shadowJitter`, clamped to
+[0, 0.5]) rides to the shader in `pc.camera.w`, whose `.z` was already unused
+(`camera.w` was written as 0.0 every frame, so nothing else reads it). Unset
+(`< 0`) = `kShadowJitterDefault`; `0` = the pre-pass-55 estimate, bit-identical;
+the startup log prints which. `pc.camera.w` is the *only* new push-constant
+input, and `testSdfShaderMirrorConstants` now reads `VulkanRenderer.cpp` too
+(`VV_SRC_DIR`) to check that the writer exists - pass 51's failure mode was a
+shader input nobody wrote.
+
+**Measured** (`testSdfSoftShadow3d` block (4), 0.05-voxel scan across the mesa's
+west shadow edge, 181 samples; the mirror now defaults to the shipped jitter, so
+the tests march the picture the GPU renders):
+
+| | plain (jitter 0) | shipped (0.02) |
+| --- | --- | --- |
+| mean visibility | 0.5184 | 0.5177 |
+| samples moved | - | 36 of 181 (max 0.135) |
+| field samples/ray | 23.98 | 23.22 |
+
+Zero bias (|d| 0.0007 - the disc-uniform offset is what buys that), the tilt
+stays inside the slope by construction (max 0.0200 rad measured), the length
+error is 1.05e-07 (float-level), and the jitter *costs no samples* - it slightly
+reduces them, since a tilted ray can leave the box a step earlier. The
+`shader mirror` test adds a second scan (400 random surface rays off the near
+box): 53 of 400 rays move, mean visibility |d| 0.0001.
+
+**What it is not.** Not output dithering (that is `packColor`'s IGN debanding,
+already there, and it cannot reach a 0.01-0.15 error in the float visibility).
+Not TAA (owner-rejected, one ray per pixel): the noise is meant to be seen as
+grain, and the default is deliberately at the small end - if it reads as noise on
+the device, 0 turns it off without a rebuild.
+
+**Honest limits.** The jitter decorrelates the error but does not remove it, and
+it does not move the terminator: the SDF contact edge still sits ~0.3-1 voxel
+wider than the exact geometry (the fake penumbra's creep) and still carries a
++/-0.17-voxel sawtooth locked to the caster's voxel grid (measured in pass 54's
+contact scan; the exact path's own edge is a straight line with a 0.016-voxel
+ramp, i.e. genuinely harder than the SDF's). Removing either means changing the
+penumbra form (a look decision) or a finer field - both out of scope here.
+Blocked-ray share moves a little (terrain probe: 19.2% -> 23.8% at 0.02) because
+a tilted ray can now strike a caster it previously grazed past; the mean
+visibility rises by the same token, i.e. the shadow *area* is preserved.
+
+**Verification.** Release + debug builds warning-free, `ctest` 100% in both;
+`glslangValidator` exit 0 for the shader; the runtime `.spv` copies refreshed
+(release `da672af3e0184c981cf6a1dfd9384853`, debug `e63e2cdca70238319cdef4e87b5b4d60`)
+- a shader edit that never reaches `bin/resources` was a real failure mode here.

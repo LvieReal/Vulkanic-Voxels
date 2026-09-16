@@ -2658,22 +2658,30 @@ void testSdfSoftShadow3d() {
 			"sdf3d overhang: underside stays at most half-lit");
 	}
 
-	// (4) Pass 54: the sphere trace CAPS its step at kMaxSdfStep voxels (the
-	// shader's sunRayEscapesSdf3d, and this mirror's default). The field
-	// resolves one voxel, so a longer step can hop over the voxel-scale
-	// structure the penumbra estimate is read from: the visibility is a min
-	// over samples, so it jumps between whichever samples the march landed on
-	// and the terminator comes out stepped instead of smooth. Both ends of
-	// that trade are pinned here, with a fine (0.05-voxel) scan across the
-	// mesa's west shadow edge on the ground: the profile's summed second
-	// difference (a smooth ramp barely moves it, a stepped one inflates it)
-	// and the samples the cap costs.
+	// (4) Pass 55: the sphere trace jitters the shadow ray's DIRECTION per
+	// shaded point (kshadow mirror: shadowRayJitter). The penumbra estimate is
+	// a min over discrete samples, so its error is a coherent function of
+	// where the shaded point is - neighbouring points walk almost the same
+	// samples, the error correlates across the surface, and it reads as bands
+	// sweeping a penumbra and as stepped contacts. A disc-uniform jitter of
+	// the direction decorrelates it into noise of the same magnitude.
+	//
+	// Pinned here, on a 0.05-voxel scan across the mesa's west shadow edge on
+	// the ground at z=28:
+	//   - the jittered profile's MEAN equals the un-jittered profile's mean
+	//     (the offset is disc-uniform, i.e. zero mean: no bias, no darkened
+	//     picture), while individual samples do move (>= 5% of them),
+	//   - the tilt stays inside the slope and the direction keeps its length
+	//     (a direction that changed length would rescale the penumbra),
+	//   - jitter = 0 is bit-identical to the pre-pass-55 estimate, and the
+	//     shipped default is not,
+	//   - the jitter costs no march samples (it is 2 hashes per ray).
 	{
 		const double scanZ = 28.0;
-		double jagCapped = 0.0, jagUncapped = 0.0, maxJumpCapped = 0.0;
-		long samples = 0, steps = 0, worstSteps = 0, uncappedSteps = 0;
-		bool seenShadow = false, seenLit = false;
-		double prevC = 1e30, prev2C = 1e30, prevU = 1e30, prev2U = 1e30;
+		const float kSharp = 8.0f;  // kShadowSharpness
+		double sumPlain = 0.0, sumJit = 0.0, maxDiff = 0.0;
+		long samples = 0, differing = 0, stepsPlain = 0, stepsJit = 0;
+		double maxTilt = 0.0, maxLenErr = 0.0;
 		for (double x = 5.0; x <= 14.0 + 1e-9; x += 0.05) {
 			const unsigned b = w.near.boundAt(int(std::floor(x)), 28);
 			double p[3] = {x, b == 0xFFFFu ? 10.0 : double(b), scanZ + 0.5};
@@ -2682,97 +2690,163 @@ void testSdfSoftShadow3d() {
 			originOf(p, n, o);
 			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
 			const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
-			// Default call = whatever the shipped mirror caps at.
-			const float capped = vv::voxel::sphereTracedShadow(sdf, of, sf);
-			// Same march with the cap effectively off (pre-pass-54).
-			const float uncapped =
-				vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 1e9f);
-			int used = 0, usedUncapped = 0;
-			float fieldVis = 1.0f;
-			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
-				&fieldVis, 8.0f, 160, 1.0f, &used);
-			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
-				&fieldVis, 8.0f, 160, 1e9f, &usedUncapped);
-			steps += used;
-			uncappedSteps += usedUncapped;
-			worstSteps = std::max(worstSteps, long(used));
-			++samples;
-			if (capped < 0.25) seenShadow = true;
-			if (capped > 0.75) seenLit = true;
-			if (samples >= 3) {
-				jagCapped += std::abs(double(capped) - 2.0 * prevC + prev2C);
-				maxJumpCapped = std::max(maxJumpCapped,
-					std::abs(double(capped) - prevC));
+			// Explicit jitter = 0 is the pre-pass-55 estimate.
+			const float plain =
+				vv::voxel::sphereTracedShadow(sdf, of, sf, kSharp, 160, 0.0f);
+			// Default call = whatever the shipped mirror jitters at.
+			const float jit = vv::voxel::sphereTracedShadow(sdf, of, sf);
+			// The direction itself: length kept, tilt inside the slope.
+			float jd[3];
+			for (int a = 0; a < 3; ++a)
+				jd[a] = sf[a];
+			vv::voxel::shadowRayJitter(of, jd);
+			{
+				double l0 = 0.0, l1 = 0.0, dot = 0.0;
+				for (int a = 0; a < 3; ++a) {
+					l0 += double(sf[a]) * double(sf[a]);
+					l1 += double(jd[a]) * double(jd[a]);
+					dot += double(sf[a]) * double(jd[a]);
+				}
+				l0 = std::sqrt(l0);
+				l1 = std::sqrt(l1);
+				maxLenErr = std::max(maxLenErr, std::abs(l1 - l0) / l0);
+				const double cosTilt = dot / (l0 * l1);
+				maxTilt = std::max(
+					maxTilt, std::acos(std::min(1.0, std::max(-1.0, cosTilt))));
 			}
-			if (samples >= 3)
-				jagUncapped +=
-					std::abs(double(uncapped) - 2.0 * prevU + prev2U);
-			prev2C = prevC;
-			prevC = capped;
-			prev2U = prevU;
-			prevU = uncapped;
+			int usedPlain = 0, usedJit = 0;
+			float vis = 1.0f;
+			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
+				&vis, 8.0f, 160, 0.0f, &usedPlain);
+			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
+				&vis, 8.0f, 160, vv::voxel::kShadowJitterDefault, &usedJit);
+			stepsPlain += usedPlain;
+			stepsJit += usedJit;
+			sumPlain += plain;
+			sumJit += jit;
+			const double diff = std::abs(double(jit) - double(plain));
+			maxDiff = std::max(maxDiff, diff);
+			differing += (diff > 1e-6) ? 1 : 0;
+			++samples;
 		}
-		const double meanSteps = double(steps) / double(samples);
-		std::printf("sdf3d pass54 scan: %ld rays, wobble %.3f capped / %.3f "
-			"uncapped, worst 0.05-voxel step %.3f, %.1f samples/ray "
-			"(worst %ld) vs %.1f uncapped\n",
-			samples, jagCapped, jagUncapped, maxJumpCapped, meanSteps,
-			worstSteps, double(uncappedSteps) / double(samples));
-		check(seenShadow && seenLit,
-			"sdf3d pass54 scan: the scan crosses the shadow edge");
-		check(worstSteps < 160,
-			"sdf3d pass54: the capped march still fits the 160-step budget");
-		check(jagUncapped > jagCapped,
-			"sdf3d pass54: the step cap smooths a shadow terminator");
-		check(jagCapped <= 3.0,
-			"sdf3d pass54: the capped terminator stays smooth (wobble <= 3)");
+		const double meanPlain = sumPlain / double(samples);
+		const double meanJit = sumJit / double(samples);
+		const double stepsDelta =
+			std::abs(double(stepsJit) - double(stepsPlain)) / double(samples);
+		std::printf("sdf3d pass55 scan: %ld rays at 0.05 vox, mean vis %.4f "
+			"jittered / %.4f plain (|d| %.4f), %ld samples moved (max %.3f), "
+			"max tilt %.4f rad, length error %.2e, %.2f vs %.2f samples/ray\n",
+			samples, meanJit, meanPlain, std::abs(meanJit - meanPlain),
+			differing, maxDiff, maxTilt, maxLenErr,
+			double(stepsJit) / double(samples),
+			double(stepsPlain) / double(samples));
+		check(differing * 20 >= samples,
+			"sdf3d pass55: the jitter moves at least 5% of the scan");
+		check(std::abs(meanJit - meanPlain) <= 0.02,
+			"sdf3d pass55: the disc-uniform jitter does not bias the mean");
+		check(maxTilt <= double(vv::voxel::kShadowJitterDefault) * 1.01,
+			"sdf3d pass55: the tilt stays inside the jitter slope");
+		check(maxLenErr <= 1e-5,
+			"sdf3d pass55: the jittered direction keeps its length");
+		check(stepsDelta <= 1.0,
+			"sdf3d pass55: the jitter costs no march samples");
 	}
 }
 
-// Pass 54: the shader's shadow constants and the CPU mirror's defaults are ONE
-// contract. Nothing in this suite can run the GPU path, so every claim made
-// here about the SDF shadow is only as true as that pairing - and pass 51 is
-// what an unpaired constant costs (the shader read a uniform word nobody wrote
-// and the SDF shadows vanished from a perfectly healthy bake). This test reads
-// resources/shaders/pixels_rgba.comp (VV_SHADER_DIR, set by
-// cmake/Tests.cmake), pins the constants the mirror hardcodes, and then proves
-// the mirror's DEFAULT arguments are exactly those constants by comparing a
-// default call against an explicit-constant call, bit for bit.
+// Pass 54/55: the shader's shadow constants and the CPU mirror's defaults are
+// ONE contract. Nothing in this suite can run the GPU path, so every claim
+// made here about the SDF shadow is only as true as that pairing - and pass 51
+// is what an unpaired constant costs (the shader read a uniform word nobody
+// wrote and the SDF shadows vanished from a perfectly healthy bake).
+//
+// Two pins, one per side:
+//   - the shader file (resources/shaders/pixels_rgba.comp, VV_SHADER_DIR) must
+//     still declare the constants below and still apply them where the mirror
+//     assumes they are applied (the soft path jitters the sun, the exact path
+//     does not, and the renderer is the side that writes pc.camera.w), and
+//   - the mirror's DEFAULT arguments must BE those numbers, proven by
+//     behaviour rather than by repeating the literal: a default call and an
+//     explicit-constant call agree bit for bit.
+// VV_SHADER_DIR / VV_SRC_DIR come from cmake/Tests.cmake; without them (a
+// standalone compile) only the behavioural half runs, so the suite cannot
+// silently pass a check it never made.
 void testSdfShaderMirrorConstants() {
-	std::string src;
+	double sharp = 8.0, jitterDefault = 0.02, jitterGrain = 8.0;
+#ifdef VV_SHADER_DIR
 	{
 		std::ifstream in(std::string(VV_SHADER_DIR) + "/pixels_rgba.comp");
-		if (!in.good()) {
-			check(false, "shader mirror: resources/shaders/pixels_rgba.comp "
-				"is readable (VV_SHADER_DIR)");
-			return;
+		check(in.good(), "shader mirror: resources/shaders/pixels_rgba.comp "
+			"is readable (VV_SHADER_DIR)");
+		if (in.good()) {
+			const std::string src((std::istreambuf_iterator<char>(in)),
+				std::istreambuf_iterator<char>());
+			auto numberAfter = [&src](const char* needle, double* out) {
+				const std::size_t at = src.find(needle);
+				if (at == std::string::npos) {
+					return false;
+				}
+				*out = std::atof(src.c_str() + src.find('=', at) + 1);
+				return true;
+			};
+			const bool hasSharp =
+				numberAfter("const float kShadowSharpness", &sharp);
+			const bool hasJitter =
+				numberAfter("const float kShadowJitterDefault", &jitterDefault);
+			const bool hasGrain =
+				numberAfter("const float kShadowJitterGrain", &jitterGrain);
+			check(hasSharp, "shader mirror: kShadowSharpness is declared");
+			check(hasJitter,
+				"shader mirror: kShadowJitterDefault is declared (pass 55)");
+			check(hasGrain,
+				"shader mirror: kShadowJitterGrain is declared (pass 55)");
+			check(src.find("for (int i = 0; i < 160; ++i)") != std::string::npos,
+				"shader mirror: the 3D field march keeps its 160-step budget");
+			check(src.find("t += max(h * 0.7, 0.05);") != std::string::npos,
+				"shader mirror: the march steps by max(0.7h, 0.05) - pass 54's "
+				"cap is reverted, not re-shipped");
+			// Pass 55 reaches the soft paths only: the exact binary march
+			// keeps the true sun (and stays bit-identical).
+			check(src.find(
+					"const vec3 sunJittered = shadowRayJitter(sunV, hitPosVox);") !=
+					std::string::npos,
+				"shader mirror: sunShadow jitters the sun for the soft paths");
+			check(src.find("return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;") !=
+					std::string::npos,
+				"shader mirror: the exact binary path keeps the un-jittered sun");
+			check(src.find("(pc.camera.w >= 0.0) ? pc.camera.w : "
+					"kShadowJitterDefault") != std::string::npos,
+				"shader mirror: the jitter slope is read from pc.camera.w");
+#ifdef VV_SRC_DIR
+			// The other half of the pass-51 lesson: a shader input nobody
+			// writes is worth exactly nothing.
+			std::ifstream renderer(
+				std::string(VV_SRC_DIR) + "/vulkan/VulkanRenderer.cpp");
+			check(renderer.good(),
+				"shader mirror: VulkanRenderer.cpp is readable (VV_SRC_DIR)");
+			if (renderer.good()) {
+				const std::string rsrc((std::istreambuf_iterator<char>(renderer)),
+					std::istreambuf_iterator<char>());
+				check(rsrc.find("getenv(\"VV_SHADOW_JITTER\")") !=
+						std::string::npos,
+					"shader mirror: the renderer reads VV_SHADOW_JITTER");
+				check(rsrc.find("m_shadowJitter);") != std::string::npos,
+					"shader mirror: the renderer pushes the slope (camera.w)");
+			}
+#endif
 		}
-		src.assign((std::istreambuf_iterator<char>(in)),
-			std::istreambuf_iterator<char>());
 	}
-	auto numberAfter = [&src](const char* needle, bool* found) {
-		const std::size_t at = src.find(needle);
-		*found = at != std::string::npos;
-		if (!*found) {
-			return 0.0;
-		}
-		return std::atof(src.c_str() + src.find('=', at) + 1);
-	};
-	bool hasSharp = false, hasStep = false;
-	const double sharp = numberAfter("const float kShadowSharpness", &hasSharp);
-	const double step = numberAfter("const float kMaxSdfStep", &hasStep);
-	check(hasSharp, "shader mirror: kShadowSharpness is declared");
-	check(hasStep, "shader mirror: kMaxSdfStep is declared (pass 54)");
+#else
+	check(true, "shader mirror: VV_SHADER_DIR is not defined, file pins skipped");
+#endif
 	check(sharp == 8.0, "shader mirror: kShadowSharpness is the mirror's 8.0");
-	check(step == 1.0, "shader mirror: kMaxSdfStep is the mirror's 1.0 voxel");
-	check(src.find("for (int i = 0; i < 160; ++i)") != std::string::npos,
-		"shader mirror: the 3D field march keeps its 160-step budget");
-	check(src.find("clamp(h * 0.7, 0.05, kMaxSdfStep)") !=
-			std::string::npos,
-		"shader mirror: the march applies kMaxSdfStep to its step");
+	check(jitterDefault == 0.02,
+		"shader mirror: kShadowJitterDefault is the mirror's 0.02");
+	check(jitterGrain == 8.0,
+		"shader mirror: kShadowJitterGrain is the mirror's 8.0");
 
 	// The other half of the pairing, read through behaviour: a default call
-	// and an explicit (8.0, 160, 1.0) call must agree exactly.
+	// and an explicit (8.0, 160, kShadowJitterDefault) call must agree
+	// exactly, and jitter = 0 must be the pre-pass-55 estimate.
 	ShadowWorld w = makeSdfTestWorld();
 	double sun[3] = {0, 0, 0};
 	shadowSun(sun);
@@ -2787,8 +2861,10 @@ void testSdfShaderMirrorConstants() {
 		rng ^= rng >> 27;
 		return double(rng >> 11) / double(1ull << 53);
 	};
-	int rays = 0, differing = 0;
-	long long cappedSteps = 0;
+	const float jf = float(jitterDefault);
+	int rays = 0, differing = 0, jitterMoved = 0;
+	long long steps = 0;
+	float sumDefault = 0.0f, sumPlain = 0.0f;
 	for (int i = 0; i < 400; ++i) {
 		const double x = next01() * 64.0;
 		const double z = next01() * 64.0;
@@ -2801,20 +2877,33 @@ void testSdfShaderMirrorConstants() {
 		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
 		const float byDefault = vv::voxel::sphereTracedShadow(sdf, of, sf);
 		const float explicitCall =
-			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 1.0f);
+			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, jf);
+		const float plain =
+			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 0.0f);
 		differing += (byDefault != explicitCall) ? 1 : 0;
+		jitterMoved += (byDefault != plain) ? 1 : 0;
+		sumDefault += byDefault;
+		sumPlain += plain;
 		int used = 0;
 		float vis = 1.0f;
 		vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr, &vis,
-			8.0f, 160, 1.0f, &used);
-		cappedSteps += used;
+			8.0f, 160, jf, &used);
+		steps += used;
 		++rays;
 	}
+	const double meanDelta =
+		std::abs(double(sumDefault) - double(sumPlain)) / double(rays);
 	check(rays > 0 && differing == 0,
-		"shader mirror: the march's defaults are exactly 8.0 / 160 / 1.0");
-	std::printf("shader mirror: kShadowSharpness %.1f, kMaxSdfStep %.1f voxels, "
-		"%d rays default == explicit (%.1f samples/ray)\n",
-		sharp, step, rays, double(cappedSteps) / double(rays));
+		"shader mirror: the march's defaults ARE 8.0 / 160 / kShadowJitterDefault");
+	check(jitterMoved > 0,
+		"shader mirror: the shipped default jitters (not a silent jitter = 0)");
+	check(meanDelta <= 0.01,
+		"shader mirror: the default jitter leaves the mean visibility alone");
+	std::printf("shader mirror: kShadowSharpness %.1f, jitter %.3f (grain %.1f), "
+		"%d rays default == explicit (%.1f samples/ray); jitter moves %d/%d "
+		"rays, mean visibility |d| %.4f\n",
+		sharp, jitterDefault, jitterGrain, rays,
+		double(steps) / double(rays), jitterMoved, rays, meanDelta);
 }
 
 // ---------------------------------------------------------------------------

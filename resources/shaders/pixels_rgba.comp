@@ -7,7 +7,9 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 // src/render/SceneData.hpp.
 layout(push_constant) uniform Push {
     uvec4 screen;   // x=width, y=height, z=bgra, w=frame
-    vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance)
+    vec4 camera;    // x=tanHalfFov, y=fogDensity (= 1 / fogCutDistance);
+                    // w = VV_SHADOW_JITTER, the pass-55 shadow-ray jitter
+                    // slope (< 0 = unset, use kShadowJitterDefault; 0 = off)
     uvec4 chunkSize; // x=chunkX, y=worldHeight, z=chunkZ, w=maxTraceSteps
     vec4 voxelSize; // xyz=voxel size in world units
     ivec4 region;   // x,z = region origin (min corner) in chunk coords;
@@ -584,42 +586,78 @@ float shadowOpacity(uint type)
 // it for harder shadows (32 ~= 2 degrees), lower it for softer.
 const float kShadowSharpness = 8.0;
 
-// Pass 54: the largest step the 3D SDF sphere trace may take, in voxels.
+// Pass 55: jitter the shadow ray's DIRECTION per shaded point.
 //
-// The field resolves ONE voxel, so a step longer than that can hop over the
-// voxel-scale structure the penumbra estimate is built from. The visibility
-// is a min over samples, so it then jumps between whichever samples the march
-// happened to land on, and the shadow terminator comes out stepped instead of
-// smooth - the "stair-stepping" at hard contacts (where the penumbra is only
-// 0.125*t wide and the sampling is the whole signal) and the banding across
-// wide penumbras. Capping the step is the RTSDF paper's banding fix
-// (arXiv 2210.06160: "restrict the maximum step size"): the estimate becomes
-// a smooth function of the ray instead of a sampling pattern.
+// This is the "jitter the ray" fix (rmshadows / the ray-traced-SDF papers,
+// arXiv 2210.06160). The penumbra is a min over DISCRETE samples, so its error
+// is a coherent function of where the shaded point is: neighbouring pixels
+// walk almost the same samples, so the error correlates across the surface and
+// reads as bands sweeping across a penumbra (and as stepped contacts). Jitter
+// decorrelates it: the same error becomes fine, uncorrelated noise, which the
+// eye integrates, while its magnitude stays put.
 //
-// Measured with the pass-54 probe (3721 rays over the shipping band box + a
-// 60-row contact-edge scan at 0.02-voxel spacing, both against a CPU field
-// built by the shipping code; the probe is not committed):
+// Dithering the OUTPUT cannot do this - packColor's IGN debanding only hides
+// the 8-bit quantisation, and this error is three orders of magnitude larger.
 //
-//   step cap     steps/ray   edge jaggedness   worst 0.02-vox step   picture
-//   none             21.9          0.29                0.037          -
-//   3.0              36.2          0.29                0.037        0.0003
-//   2.0              46.1          0.26                0.019        0.0004
-//   1.5              56.4          0.21                0.028        0.0004
-//   1.25             64.7          0.16                0.019        0.0004
-//   1.0              77.3          0.13                0.017        0.0004
-//   0.5             141.7          0.07                0.017        0.0004
+// kShadowJitter is a slope (the tangent of the angle), taken from a disc of
+// that radius around the sun. The sun ITSELF is 1/kShadowSharpness = 0.125, so
+// this stays well inside the light's own disc and the direction's expected
+// value is unchanged (the offset is disc-uniform, i.e. zero mean).
 //
-// ("edge jaggedness" = the summed second difference of the visibility profile
-// across the terminator, i.e. how much the edge wobbles where a smooth ramp
-// would not; "picture" = mean |visibility change| against the uncapped march
-// over the terrain rays, so 0.0004 is a picture that does not move.)
+// The hash is taken from the WORLD position quantised to 1/8 voxel: fixed in
+// the world (no grain crawling over the surface when the camera moves) and a
+// few pixels across at a sane viewing distance - coarser than that would read
+// as blotches, much finer would crawl as the camera moves. Cost: two hashes
+// and a handful of ALU per shadow RAY, against ~174 taps of eight fetches.
 //
-// 1.0 takes the edge's wobble down 2.2x for 3.5x the field-phase steps
-// (21.9 -> 77.3 of the 160-step budget, so no ray is cut off - measured); the
-// terrain picture moves by 2.1% of rays over 1/255 and none over 0.07. The
-// field phase is roughly an eighth of a shadow ray's taps (pass 52: 174 taps
-// per ray), so this is a ~30% cost on the SDF shadow pass for the fix.
-const float kMaxSdfStep = 1.0;
+// The slope is a LEVER (VV_SHADOW_JITTER, pc.camera.w) so the magnitude can be
+// A/B'd on-device without a rebuild: 0 turns the jitter off and reproduces the
+// pre-pass-55 picture exactly, and any positive value is the tangent of the
+// tilt angle (kShadowJitterDefault ~= 1.1 degrees).
+const float kShadowJitterDefault = 0.02;
+const float kShadowJitterGrain = 8.0;  // hash cell = 1/8 voxel
+
+float shadowJitterSlope()
+{
+    return (pc.camera.w >= 0.0) ? pc.camera.w : kShadowJitterDefault;
+}
+
+// Hash13 (Dave Hoskins' "hash without sine"): cheap, deterministic, well
+// distributed in 3D. Two calls with different offsets give the two disc
+// parameters.
+float shadowJitterHash(vec3 p)
+{
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+// The sun direction, tilted by a disc-uniform offset of slope
+// `shadowJitterSlope()` around it. The input's LENGTH is preserved: the
+// march's t is a distance, so a direction that changed length would rescale
+// the penumbra estimate. A slope of 0 returns the sun untouched.
+vec3 shadowRayJitter(vec3 sunV, vec3 hitPosVox)
+{
+    const float slope = shadowJitterSlope();
+    if (slope <= 0.0) {
+        return sunV;
+    }
+    const vec3 cell = floor(hitPosVox * kShadowJitterGrain);
+    const float u1 = shadowJitterHash(cell);
+    const float u2 = shadowJitterHash(cell + vec3(17.0, 31.0, 7.0));
+    const float r = slope * sqrt(u1);       // sqrt = area-uniform
+    const float phi = 6.2831853 * u2;
+    const float len = length(sunV);
+    const vec3 dir = sunV / max(len, 1e-6);
+    // Orthonormal frame around the sun, picking the axis the sun is least
+    // aligned with so the cross product never degenerates.
+    const vec3 helper = (abs(dir.y) < 0.9) ? vec3(0.0, 1.0, 0.0)
+                                           : vec3(1.0, 0.0, 0.0);
+    const vec3 tangentA = normalize(cross(helper, dir));
+    const vec3 tangentB = cross(dir, tangentA);
+    const vec3 off = tangentA * cos(phi) + tangentB * sin(phi);
+    return normalize(dir + off * r) * len;
+}
 
 // One penumbra sample of the SDF soft shadow (technique:
 // iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t.
@@ -787,12 +825,7 @@ float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
         if (h < 1e-3)
             return 0.0;  // hit the surface: fully shadowed from here
         visibility = min(visibility, shadowPenumbra(h, t));
-        // Pass 54: cap the step (kMaxSdfStep). The min step only has to keep
-        // the march moving; the max keeps it from hopping over the voxel-scale
-        // structure the penumbra is read from. max(h*0.7, 0.05) <= h always,
-        // and the clamp is <= 0.7h whenever it bites, so the trace still never
-        // enters the surface it is measuring.
-        t += clamp(h * 0.7, 0.05, kMaxSdfStep);
+        t += max(h * 0.7, 0.05);
     }
     return sunRayEscapesSdf(origin + sunV * t, sunV, t, visibility);
 }
@@ -957,6 +990,10 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
 // SAME traversal with the Quilez penumbra estimate, returning fractional
 // visibility. Far-LOD hits shadow through the same march: from beyond the
 // region it self-selects the cheap far-cell path.
+//
+// Pass 55: the soft paths trace a JITTERED sun (shadowRayJitter), so the
+// estimate's sampling error decorrelates across the surface instead of
+// banding. The exact path below keeps the true sun, bit for bit.
 float sunShadow(vec3 hitPosVox, vec3 n)
 {
     const vec3 sunWorld = normalize(scene.lightDir.xyz);
@@ -969,13 +1006,17 @@ float sunShadow(vec3 hitPosVox, vec3 n)
     // self-shadow acne; the hit face's outward cell is air by construction.
     const vec3 origin = hitPosVox + n * 1e-3 + sunV * 1e-2;
     if (scene.misc.w > 0.5) {
+        // Pass 55: the soft paths march a JITTERED sun, so their sampling
+        // error decorrelates across the surface instead of banding. The exact
+        // path below keeps the true sun (and stays bit-identical).
+        const vec3 sunJittered = shadowRayJitter(sunV, hitPosVox);
         // Pass 38: the proper 3D voxel SDF sphere trace when a field is
         // uploaded (sdfBox.box.w >= 0). The 2.5D top-plane penumbra is the
         // fallback until the background build lands (and if it ever stalls).
         if (sdfBox.box.w >= 0) {
-            return sunRayEscapesSdf3d(origin, sunV);
+            return sunRayEscapesSdf3d(origin, sunJittered);
         }
-        return sunRayEscapesSdf(origin, sunV, 0.0, 1.0);
+        return sunRayEscapesSdf(origin, sunJittered, 0.0, 1.0);
     }
     return sunRayEscapes(origin, sunV) ? 1.0 : 0.0;
 }
