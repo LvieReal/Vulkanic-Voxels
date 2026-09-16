@@ -176,6 +176,21 @@ out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
 0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
 corners is what keeps the current penumbra dark, and no bias brings that back.
 
+Pass 54 caps the sphere trace's step at one voxel (`kMaxSdfStep`). The field
+resolves a voxel, so a longer step can hop over the voxel-scale structure the
+penumbra estimate is read from - and because the visibility is a min over the
+samples, it then jumps between whichever samples the march happened to land on,
+so the terminator comes out stepped instead of smooth. That is what the
+ray-traced-SDF papers attribute penumbra banding to (arXiv 2210.06160) and what
+their "restrict the maximum step size" fix removes. Measured with a probe over
+the shipping box (3721 terrain rays) plus a synthetic contact edge scanned at
+0.02-voxel spacing: the edge profile's summed second difference drops 0.29 ->
+0.13 (a 2.2x smoother terminator) and its worst neighbour step 0.037 -> 0.017,
+while the terrain picture moves by 0.0004 mean visibility (2.1% of rays over
+1/255, none over 0.07, no verdict flips); the field phase costs 21.9 -> 77.3 of
+its 160 samples per ray, and no ray is cut off by the budget. The 0.7 step
+factor, the 8.0 sharpness and the 160-sample budget are unchanged.
+
 The rebake's own arithmetic got cheaper in pass 53: the two chamfer sweeps now
 scan a cell's seven candidates in one go and write the cell once, instead of
 seven relaxation calls that each loaded, compared and stored the cell - the same

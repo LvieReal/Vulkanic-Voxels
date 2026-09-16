@@ -30,6 +30,13 @@ function(vv_add_tests)
     target_link_libraries(voxel_tests PRIVATE ${VV_GLFW_TARGET} Threads::Threads)
     target_compile_definitions(voxel_tests PRIVATE GLFW_INCLUDE_NONE=1)
 
+    # The SDF shadow tests mirror resources/shaders/pixels_rgba.comp, and
+    # testSdfShaderMirrorConstants reads that file to pin the constants the
+    # mirror hardcodes (pass 54; the pass-51 uniform bug is the same failure
+    # mode: a GPU-side contract drifting away from its CPU counterpart).
+    target_compile_definitions(voxel_tests PRIVATE
+        VV_SHADER_DIR="${CMAKE_SOURCE_DIR}/resources/shaders")
+
     # Same float32 bit-exactness contract as the game target
     # (terrain/Noise.hpp): no FMA contraction on GCC/Clang.
     if(NOT MSVC)

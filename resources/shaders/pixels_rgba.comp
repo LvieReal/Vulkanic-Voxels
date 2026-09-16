@@ -580,9 +580,46 @@ float shadowOpacity(uint type)
 }
 
 // SDF soft-shadow sharpness: the inverse of the sun's angular size. 8 ~= a
-// 7-degree light, whose penumbra spans a few voxels (a soft "game sun");
-// raise it for harder shadows (32 ~= 2 degrees), lower it for softer.
+// 7-degree sun, whose penumbra spans a few voxels (a soft "game sun"); raise
+// it for harder shadows (32 ~= 2 degrees), lower it for softer.
 const float kShadowSharpness = 8.0;
+
+// Pass 54: the largest step the 3D SDF sphere trace may take, in voxels.
+//
+// The field resolves ONE voxel, so a step longer than that can hop over the
+// voxel-scale structure the penumbra estimate is built from. The visibility
+// is a min over samples, so it then jumps between whichever samples the march
+// happened to land on, and the shadow terminator comes out stepped instead of
+// smooth - the "stair-stepping" at hard contacts (where the penumbra is only
+// 0.125*t wide and the sampling is the whole signal) and the banding across
+// wide penumbras. Capping the step is the RTSDF paper's banding fix
+// (arXiv 2210.06160: "restrict the maximum step size"): the estimate becomes
+// a smooth function of the ray instead of a sampling pattern.
+//
+// Measured with the pass-54 probe (3721 rays over the shipping band box + a
+// 60-row contact-edge scan at 0.02-voxel spacing, both against a CPU field
+// built by the shipping code; the probe is not committed):
+//
+//   step cap     steps/ray   edge jaggedness   worst 0.02-vox step   picture
+//   none             21.9          0.29                0.037          -
+//   3.0              36.2          0.29                0.037        0.0003
+//   2.0              46.1          0.26                0.019        0.0004
+//   1.5              56.4          0.21                0.028        0.0004
+//   1.25             64.7          0.16                0.019        0.0004
+//   1.0              77.3          0.13                0.017        0.0004
+//   0.5             141.7          0.07                0.017        0.0004
+//
+// ("edge jaggedness" = the summed second difference of the visibility profile
+// across the terminator, i.e. how much the edge wobbles where a smooth ramp
+// would not; "picture" = mean |visibility change| against the uncapped march
+// over the terrain rays, so 0.0004 is a picture that does not move.)
+//
+// 1.0 takes the edge's wobble down 2.2x for 3.5x the field-phase steps
+// (21.9 -> 77.3 of the 160-step budget, so no ray is cut off - measured); the
+// terrain picture moves by 2.1% of rays over 1/255 and none over 0.07. The
+// field phase is roughly an eighth of a shadow ray's taps (pass 52: 174 taps
+// per ray), so this is a ~30% cost on the SDF shadow pass for the fix.
+const float kMaxSdfStep = 1.0;
 
 // One penumbra sample of the SDF soft shadow (technique:
 // iquilezles.org/articles/rmshadows/): the plain Quilez estimate k*h/t.
@@ -750,7 +787,12 @@ float sunRayEscapesSdf3d(vec3 origin, vec3 sunV)
         if (h < 1e-3)
             return 0.0;  // hit the surface: fully shadowed from here
         visibility = min(visibility, shadowPenumbra(h, t));
-        t += max(h * 0.7, 0.05);
+        // Pass 54: cap the step (kMaxSdfStep). The min step only has to keep
+        // the march moving; the max keeps it from hopping over the voxel-scale
+        // structure the penumbra is read from. max(h*0.7, 0.05) <= h always,
+        // and the clamp is <= 0.7h whenever it bites, so the trace still never
+        // enters the surface it is measuring.
+        t += clamp(h * 0.7, 0.05, kMaxSdfStep);
     }
     return sunRayEscapesSdf(origin + sunV * t, sunV, t, visibility);
 }

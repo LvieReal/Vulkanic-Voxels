@@ -502,10 +502,17 @@ private:
 // sunRayEscapesSdf3d, pass 40). Returns false when the field resolved the
 // ray itself (a hit, a low sun, or the march never left it): outVisibility
 // is then the final answer.
+//
+// Pass 54: `maxStep` mirrors the shader's kMaxSdfStep (the field resolves one
+// voxel, so a longer step can hop over the voxel-scale structure the penumbra
+// is read from and the terminator comes out stepped); `outSteps` reports how
+// many samples the field phase took, so a test can pin that cost.
 inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
                                     const float d[3], float outExit[3],
                                     float* outExitT, float* outVisibility,
-                                    float sharpness = 8.0f, int steps = 160) {
+                                    float sharpness = 8.0f, int steps = 160,
+                                    float maxStep = 1.0f,
+                                    int* outSteps = nullptr) {
     if (outExitT != nullptr) {
         *outExitT = 0.0f;
     }
@@ -565,8 +572,13 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
             visibility,
             std::clamp(sharpness * h / std::max(t, 1e-4f), 0.0f, 1.0f));
         // Conservative step: 0.7x the SDF keeps the march from overshooting a
-        // surface the chamfer field slightly over-estimates.
-        t += std::max(h * 0.7f, 0.05f);
+        // surface the chamfer field slightly over-estimates, and (pass 54) a
+        // cap keeps a step from hopping over the voxel-scale structure the
+        // penumbra estimate is read from - the shader's kMaxSdfStep.
+        t += std::clamp(h * 0.7f, 0.05f, maxStep);
+        if (outSteps != nullptr) {
+            *outSteps = i + 1;
+        }
     }
     // Budget spent inside the field: the shader hands the rest over as well.
     if (outExit != nullptr) {
@@ -588,13 +600,13 @@ inline bool sphereTracedShadowExits(const SdfField& sdf, const float o[3],
 // the voxels it was built from) and probes. Returns visibility in [0, 1].
 inline float sphereTracedShadow(const SdfField& sdf, const float o[3],
                                 const float d[3], float sharpness = 8.0f,
-                                int steps = 160) {
+                                int steps = 160, float maxStep = 1.0f) {
     if (d[1] <= 0.05f) {
         return 1.0f;  // low/sunset sun: no cheap ascend bound, skip
     }
     float visibility = 1.0f;
     sphereTracedShadowExits(sdf, o, d, nullptr, nullptr, &visibility,
-                            sharpness, steps);
+                            sharpness, steps, maxStep, nullptr);
     return visibility;
 }
 

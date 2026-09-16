@@ -1704,3 +1704,122 @@ the chunks instead of the cells).
   of range there - which is why the mutation was invisible; the live path is
   what the check has to hit.)
 - Release + debug builds warning-free, `ctest` 100% in both.
+
+## Pass 54: the shadow artifacts - the march's step gets a one-voxel cap
+
+The owner's directive for this pass: the 3D SDF shadows show (a) stair-stepping
+where a shadow contact is hard and (b) banding across penumbrae, which he
+believed dithering would fix. He asked for the proper fixes to be researched
+rather than guessed, so the pass began on the web and ended in a probe.
+
+### What the research says
+
+- **Banding in a ray-traced SDF is a resolution/scampling artifact.**
+  arXiv 2210.06160 (ray-traced SDFs) and the follow-ups name three mitigations:
+  the Aaltonen/iq triangulated closest-approach estimate, **restricting the
+  maximum step size**, and jittering the ray plus TAA. iquilezles.org/articles/
+  rmshadows is the reference for both estimates; shadergif.com's AA guide and
+  the r/GraphicsProgramming SDF threads are where the cone/footprint hit
+  threshold comes from (treat the ray as a cone: hit when `h < t*tan`).
+- **Dithering cannot be the banding fix here**: `packColor` already applies the
+  IGN `+/-0.5 LSB` debanding, and the banding is in the float visibility
+  profile, not in the 8-bit output - so there is nothing for dithering to hide.
+- TAA was rejected by the owner at pass 9, and Aaltonen's *two-sphere* form at
+  pass 34; the triangulated form is distinct but had to prove itself.
+
+### The probe (not committed; `/tmp/probe_shadow_art*.cpp`)
+
+`SdfField::sampleCorners` on fields built by the shipping CPU code (the real
+band box: origin (-96,0,-96), 192x110x192, seedBits (8,7,8)) plus a synthetic
+scene (floor, a DIAGONAL wall whose face steps 1 voxel in x every 2 in z, and a
+tall thin pillar). Metrics: terrain mean visibility / share of rays that move;
+for the contact edge, the terminator's 0.5-crossing per row (interpolated, so
+the scan's own resolution cannot masquerade as a staircase), the ramp width, the
+worst neighbour step, and the summed second difference ("wobble"); for the
+penumbra, the same on a fine scan. An `exact` control marches the analytic voxel
+solid at 0.02 voxels - the ground truth the SDF path is supposed to match.
+
+Three measurement traps were hit and are worth remembering: a row spacing of 10
+voxels samples a 2:1 voxel staircase at the same phase every time and reads a
+*perfect* line; an all-dark profile reads as "staircase 0.000" (no crossing
+found) rather than as "everything is black"; and a pre-rewrite probe marched
+every ray to the budget without stopping at the box exit, which produced 134
+steps/ray and a mean visibility of 0.06 instead of 22 steps and 0.66.
+
+### What the probe measured (3721 terrain rays at stride 2; 60 contact rows at
+
+0.02 voxels; a 0.02-voxel penumbra scan)
+
+| variant | terrain meanvis | rays moved >1/255 | steps/ray | contact wobble | worst step | terminator staircase |
+| --- | --- | --- | --- | --- | --- | --- |
+| shipped (uncapped) | 0.6556 | - | 21.9 | 0.29 | 0.037 | 0.081 |
+| Aaltonen triangulation | 0.6540 | 3.8% | 21.9 | 0.32 | 0.094 | 0.107 |
+| footprint/cone threshold | 0.6524 | 15.9% | 19.8 | 0.29 | - | 0.081 |
+| minimum penumbra via `t` clamp | 0.0070 | 80.5% | 21.9 | - | - | - |
+| post-loop penumbra floor | 0.6563 | 11.9% | 21.9 | 1.53 | 0.995 | 0.081 |
+| softer kK (4 / 6) | 0.6332 / 0.6480 | 21.7% / 18.6% | 21.9 | 0.19 / 0.23 | 0.025 / 0.028 | 0.113 / 0.104 |
+| step cap 1.5 | 0.6553 | 2.4% | 56.4 | 0.21 | 0.028 | 0.085 |
+| step cap 1.0 | 0.6553 | 2.1% | 77.3 | 0.13 | 0.017 | 0.104 |
+| step cap 0.5 | 0.6552 | 2.3% | 141.7 | 0.07 | 0.017 | 0.089 |
+| exact voxel control | 1.0000 | - | - | 2.00 | 1.000 | 0.000 |
+
+### What that rules out, and what it leaves
+
+- **The triangulation is measured out**: 0 extra samples, but on the terrain the
+  8-corner gather already compares the closest of eight candidates, so
+  interpolating between two samples changes 3.8% of rays by 0.0016 and makes the
+  synthetic contact edge *worse* (wobble 0.29 -> 0.32). Do not ship it.
+- **The cone/footprint threshold is measured out**: it fattens the shadow
+  (blocked 19.2% -> 26.2%) instead of anti-aliasing it, because a footprint
+  epsilon on a point-light ray moves the hit test outward.
+- **Both "minimum penumbra" forms are measured out**: flooring the march
+  distance `t` makes the ray's own surface a caster and drops the terrain to
+  mean 0.007; a post-loop floor cannot lighten a hit, and where it does act it
+  puts a hard kink in the ramp (wobble 1.53, worst step 0.995).
+- **Softer `kShadowSharpness`** does soften contacts, but it softens *every*
+  penumbra in proportion (the fake penumbra is 0.125*t wide) and darkens the
+  picture, not lightens it: 4.0 moves 21.7% of rays. It is the honest "how soft
+  do you want contacts" knob, not a fix - left for the owner to ask for.
+- **What is left is the step cap**, which is also the literature's banding fix:
+  the visibility is a min over samples, and a step longer than the one voxel the
+  field resolves lands on an arbitrary subset of samples - so the terminator
+  wobbles with the sampling. Cap it and the profile becomes a smooth function of
+  the ray: contact wobble 0.29 -> 0.13 and worst step 0.037 -> 0.017 at 1.0
+  (77.3 vs 21.9 samples/ray, no ray cut off by the 160-sample budget), with the
+  terrain picture moving by 0.0004 mean visibility.
+
+### Honest limits
+
+- The terminator still sits ~0.9 voxels wider than the exact geometry (the fake
+  penumbra's own creep) and still has a +/-0.17-voxel sawtooth locked to the
+  caster's voxel grid; the cap dilutes the *profile's* wobble (what the edge
+  looks like) but does not move the terminator or remove that sawtooth. Removing
+  the creep means changing the penumbra form (a look decision), and removing the
+  sawtooth means a finer field or TAA.
+- The exact reference's own contact edge is *harder* (0.016-voxel ramp, worst
+  step 1.0) than the SDF's. Where a shadow contact is genuinely hard, no
+  march-side change can make it soft - only a wider penumbra can, which is the
+  kK trade above.
+- The cap costs samples: 21.9 -> 77.3 of the field phase's 160. That phase is
+  roughly an eighth of a shadow ray's taps (pass 52: 174 taps/ray), so this is
+  ~30% of the SDF shadow pass. 1.5 costs 20% and gets ~70% of the smoothing;
+  0.5 is 6.5x for the last 15%. The constant is one line.
+
+### Verification
+
+- `testSdfSoftShadow3d` gained (4): a 0.05-voxel scan across the mesa's west
+  shadow edge on the ground, asserting that the capped profile's wobble stays
+  bounded (1.33 measured), that the uncapped march is measurably worse on the
+  same scan (1.45), and that no ray in the capped march reaches the 160-sample
+  budget (worst 67).
+- `testSdfShaderMirrorConstants` (new) reads `resources/shaders/pixels_rgba.comp`
+  through `VV_SHADER_DIR` (cmake/Tests.cmake) and pins what the CPU mirror
+  hardcodes: `kShadowSharpness = 8.0`, `kMaxSdfStep = 1.0`, the 160-step budget
+  and the capped step expression - then proves the mirror's *defaults* are those
+  constants by comparing a default call against an explicit (8.0, 160, 1.0) call
+  bit for bit on 400 rays. Pass 51 is why that pairing is worth a test.
+- Mutation check: setting the mirror's default cap to 1e9 fails exactly two
+  checks ("the step cap smooths a shadow terminator" and "the mirror's defaults
+  are exactly 8.0 / 160 / 1.0") and nothing else; restored, the suite is green.
+- Release + debug builds warning-free, `ctest` 100% in both; `glslangValidator`
+  exit 0 for the new shader and the runtime `.spv` copies are in sync.

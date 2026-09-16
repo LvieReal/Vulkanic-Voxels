@@ -2657,6 +2657,164 @@ void testSdfSoftShadow3d() {
 		check(soft <= 0.5 + 1e-3f,
 			"sdf3d overhang: underside stays at most half-lit");
 	}
+
+	// (4) Pass 54: the sphere trace CAPS its step at kMaxSdfStep voxels (the
+	// shader's sunRayEscapesSdf3d, and this mirror's default). The field
+	// resolves one voxel, so a longer step can hop over the voxel-scale
+	// structure the penumbra estimate is read from: the visibility is a min
+	// over samples, so it jumps between whichever samples the march landed on
+	// and the terminator comes out stepped instead of smooth. Both ends of
+	// that trade are pinned here, with a fine (0.05-voxel) scan across the
+	// mesa's west shadow edge on the ground: the profile's summed second
+	// difference (a smooth ramp barely moves it, a stepped one inflates it)
+	// and the samples the cap costs.
+	{
+		const double scanZ = 28.0;
+		double jagCapped = 0.0, jagUncapped = 0.0, maxJumpCapped = 0.0;
+		long samples = 0, steps = 0, worstSteps = 0, uncappedSteps = 0;
+		bool seenShadow = false, seenLit = false;
+		double prevC = 1e30, prev2C = 1e30, prevU = 1e30, prev2U = 1e30;
+		for (double x = 5.0; x <= 14.0 + 1e-9; x += 0.05) {
+			const unsigned b = w.near.boundAt(int(std::floor(x)), 28);
+			double p[3] = {x, b == 0xFFFFu ? 10.0 : double(b), scanZ + 0.5};
+			double n[3] = {0.0, 1.0, 0.0};
+			double o[3];
+			originOf(p, n, o);
+			const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+			const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+			// Default call = whatever the shipped mirror caps at.
+			const float capped = vv::voxel::sphereTracedShadow(sdf, of, sf);
+			// Same march with the cap effectively off (pre-pass-54).
+			const float uncapped =
+				vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 1e9f);
+			int used = 0, usedUncapped = 0;
+			float fieldVis = 1.0f;
+			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
+				&fieldVis, 8.0f, 160, 1.0f, &used);
+			vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr,
+				&fieldVis, 8.0f, 160, 1e9f, &usedUncapped);
+			steps += used;
+			uncappedSteps += usedUncapped;
+			worstSteps = std::max(worstSteps, long(used));
+			++samples;
+			if (capped < 0.25) seenShadow = true;
+			if (capped > 0.75) seenLit = true;
+			if (samples >= 3) {
+				jagCapped += std::abs(double(capped) - 2.0 * prevC + prev2C);
+				maxJumpCapped = std::max(maxJumpCapped,
+					std::abs(double(capped) - prevC));
+			}
+			if (samples >= 3)
+				jagUncapped +=
+					std::abs(double(uncapped) - 2.0 * prevU + prev2U);
+			prev2C = prevC;
+			prevC = capped;
+			prev2U = prevU;
+			prevU = uncapped;
+		}
+		const double meanSteps = double(steps) / double(samples);
+		std::printf("sdf3d pass54 scan: %ld rays, wobble %.3f capped / %.3f "
+			"uncapped, worst 0.05-voxel step %.3f, %.1f samples/ray "
+			"(worst %ld) vs %.1f uncapped\n",
+			samples, jagCapped, jagUncapped, maxJumpCapped, meanSteps,
+			worstSteps, double(uncappedSteps) / double(samples));
+		check(seenShadow && seenLit,
+			"sdf3d pass54 scan: the scan crosses the shadow edge");
+		check(worstSteps < 160,
+			"sdf3d pass54: the capped march still fits the 160-step budget");
+		check(jagUncapped > jagCapped,
+			"sdf3d pass54: the step cap smooths a shadow terminator");
+		check(jagCapped <= 3.0,
+			"sdf3d pass54: the capped terminator stays smooth (wobble <= 3)");
+	}
+}
+
+// Pass 54: the shader's shadow constants and the CPU mirror's defaults are ONE
+// contract. Nothing in this suite can run the GPU path, so every claim made
+// here about the SDF shadow is only as true as that pairing - and pass 51 is
+// what an unpaired constant costs (the shader read a uniform word nobody wrote
+// and the SDF shadows vanished from a perfectly healthy bake). This test reads
+// resources/shaders/pixels_rgba.comp (VV_SHADER_DIR, set by
+// cmake/Tests.cmake), pins the constants the mirror hardcodes, and then proves
+// the mirror's DEFAULT arguments are exactly those constants by comparing a
+// default call against an explicit-constant call, bit for bit.
+void testSdfShaderMirrorConstants() {
+	std::string src;
+	{
+		std::ifstream in(std::string(VV_SHADER_DIR) + "/pixels_rgba.comp");
+		if (!in.good()) {
+			check(false, "shader mirror: resources/shaders/pixels_rgba.comp "
+				"is readable (VV_SHADER_DIR)");
+			return;
+		}
+		src.assign((std::istreambuf_iterator<char>(in)),
+			std::istreambuf_iterator<char>());
+	}
+	auto numberAfter = [&src](const char* needle, bool* found) {
+		const std::size_t at = src.find(needle);
+		*found = at != std::string::npos;
+		if (!*found) {
+			return 0.0;
+		}
+		return std::atof(src.c_str() + src.find('=', at) + 1);
+	};
+	bool hasSharp = false, hasStep = false;
+	const double sharp = numberAfter("const float kShadowSharpness", &hasSharp);
+	const double step = numberAfter("const float kMaxSdfStep", &hasStep);
+	check(hasSharp, "shader mirror: kShadowSharpness is declared");
+	check(hasStep, "shader mirror: kMaxSdfStep is declared (pass 54)");
+	check(sharp == 8.0, "shader mirror: kShadowSharpness is the mirror's 8.0");
+	check(step == 1.0, "shader mirror: kMaxSdfStep is the mirror's 1.0 voxel");
+	check(src.find("for (int i = 0; i < 160; ++i)") != std::string::npos,
+		"shader mirror: the 3D field march keeps its 160-step budget");
+	check(src.find("clamp(h * 0.7, 0.05, kMaxSdfStep)") !=
+			std::string::npos,
+		"shader mirror: the march applies kMaxSdfStep to its step");
+
+	// The other half of the pairing, read through behaviour: a default call
+	// and an explicit (8.0, 160, 1.0) call must agree exactly.
+	ShadowWorld w = makeSdfTestWorld();
+	double sun[3] = {0, 0, 0};
+	shadowSun(sun);
+	vv::voxel::SdfField sdf;
+	sdf.build(w.near.wx, w.near.wh, w.near.wz,
+		[&](int x, int y, int z) { return w.near.at(x, y, z) != 0; });
+
+	std::uint64_t rng = 0xc2b2ae3d27d4eb4full;
+	auto next01 = [&rng]() {
+		rng ^= rng >> 12;
+		rng ^= rng << 25;
+		rng ^= rng >> 27;
+		return double(rng >> 11) / double(1ull << 53);
+	};
+	int rays = 0, differing = 0;
+	long long cappedSteps = 0;
+	for (int i = 0; i < 400; ++i) {
+		const double x = next01() * 64.0;
+		const double z = next01() * 64.0;
+		const unsigned b = w.near.boundAt(int(std::floor(x)), int(std::floor(z)));
+		double o[3] = {x, b == 0xFFFFu ? 10.0 : double(b), z};
+		for (int a = 0; a < 3; ++a) {
+			o[a] += (a == 1 ? 1e-3 : 0.0) + sun[a] * 1e-2;
+		}
+		const float of[3] = {float(o[0]), float(o[1]), float(o[2])};
+		const float sf[3] = {float(sun[0]), float(sun[1]), float(sun[2])};
+		const float byDefault = vv::voxel::sphereTracedShadow(sdf, of, sf);
+		const float explicitCall =
+			vv::voxel::sphereTracedShadow(sdf, of, sf, 8.0f, 160, 1.0f);
+		differing += (byDefault != explicitCall) ? 1 : 0;
+		int used = 0;
+		float vis = 1.0f;
+		vv::voxel::sphereTracedShadowExits(sdf, of, sf, nullptr, nullptr, &vis,
+			8.0f, 160, 1.0f, &used);
+		cappedSteps += used;
+		++rays;
+	}
+	check(rays > 0 && differing == 0,
+		"shader mirror: the march's defaults are exactly 8.0 / 160 / 1.0");
+	std::printf("shader mirror: kShadowSharpness %.1f, kMaxSdfStep %.1f voxels, "
+		"%d rays default == explicit (%.1f samples/ray)\n",
+		sharp, step, rays, double(cappedSteps) / double(rays));
 }
 
 // ---------------------------------------------------------------------------
@@ -4326,6 +4484,7 @@ int main() {
 	testSunShadowMarch();
 	testSunShadowSdfMarch();
 	testSdfSoftShadow3d();
+	testSdfShaderMirrorConstants();
 	testSdfBoxBuild();
 	testSdfBoxBand();
 	testSdfSeedEncoding();
