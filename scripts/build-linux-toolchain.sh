@@ -6,7 +6,7 @@
 #
 # Motivation: the Arena.ai agent sandbox only allows HTTPS to github.com and
 # pypi.org; Debian mirrors, freedesktop.org etc. are unreachable, so the usual
-# `apt install libglfw3-dev libvulkan-dev ...` does not work there. This
+# `apt install libvulkan-dev glslang-tools ...` does not work there. This
 # script builds everything the project needs from GitHub tarballs:
 #
 #   - CMake 3.31 + Ninja          (pip wheels, into $PREFIX/venv)
