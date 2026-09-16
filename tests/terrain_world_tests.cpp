@@ -34,6 +34,8 @@
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
+
+#include "ambient_mirror.hpp"
 namespace {
 
 int g_failures = 0;
@@ -4737,11 +4739,14 @@ void testCommandLine() {
 		const vv::core::CommandLineResult r = parseCommandLine(
 				{"--sdf-shadows", "--shadow-jitter", "0.02", "--sdf-margin", "2",
 				 "--far-lod", "--validation", "--perf", "--present", "fifo",
-				 "--platform", "wayland", "--debug-term", "--debug-hole", "7,-3"});
+				 "--platform", "wayland", "--debug-term", "--debug-hole", "7,-3",
+				 "--ambient-floor", "0.2"});
 		check(r.ok(), "command line: the full option set parses");
 		const GameOptions& o = r.options;
 		check(o.sdfShadows && o.farLod && o.validation && o.perf && o.debugTerm,
 				"command line: a flag sets its field");
+		check(o.ambient && o.ambientFloorSet && o.ambientFloor == 0.2f,
+				"command line: --ambient-floor takes a sky fraction");
 		check(o.shadowJitterSet && o.shadowJitter == 0.02f,
 				"command line: --shadow-jitter takes a slope");
 		check(o.sdfMarginSet && o.sdfMargin == 2,
@@ -4766,6 +4771,50 @@ void testCommandLine() {
 				"command line: --no-validation is the default, explicitly");
 	}
 
+	// The pass-62 ambient switches: ON by default (the upgrade IS the shipped
+	// look), off means the pre-62 formula, and the floor is clamped to a
+	// fraction of the sky so neither end of the lever can be nonsensical.
+	{
+		check(parseCommandLine({}).options.ambient &&
+					!parseCommandLine({}).options.ambientFloorSet,
+				"command line: the ambient upgrade is on by default (no lever needed)");
+		const vv::core::CommandLineResult off =
+				parseCommandLine({"--no-ambient"});
+		check(off.ok() && !off.options.ambient,
+				"command line: --no-ambient returns to the pre-62 formula");
+		const vv::core::CommandLineResult backOn =
+				parseCommandLine({"--no-ambient", "--ambient"});
+		check(backOn.ok() && backOn.options.ambient,
+				"command line: --ambient undoes --no-ambient (the last one wins)");
+		const vv::core::CommandLineResult clamped =
+				parseCommandLine({"--ambient-floor", "5"});
+		check(clamped.ok() && clamped.options.ambientFloor == 1.0f,
+				"command line: --ambient-floor clamps to 1 (a flat fill)");
+		const vv::core::CommandLineResult negative =
+				parseCommandLine({"--ambient-floor", "-3"});
+		check(negative.ok() && negative.options.ambientFloor == 0.0f,
+				"command line: --ambient-floor clamps to 0 (black caves)");
+		const vv::core::CommandLineResult badFloor =
+				parseCommandLine({"--ambient-floor", "dim"});
+		check(!badFloor.ok() && badFloor.error.find("--ambient-floor") !=
+						std::string::npos,
+				"command line: --ambient-floor rejects a non-number");
+		const vv::core::CommandLineResult missingFloor =
+				parseCommandLine({"--ambient-floor"});
+		check(!missingFloor.ok(),
+				"command line: --ambient-floor needs its value");
+		const vv::core::CommandLineResult withFloor =
+				parseCommandLine({"--ambient-floor", "0.25"});
+		check(withFloor.options.ambientFloorSet &&
+					vv::core::describeOptions(withFloor.options).find(
+						"ambient-floor 0.250") != std::string::npos,
+				"command line: the startup line reports a non-default floor");
+		const vv::core::CommandLineResult defaultFloor =
+				parseCommandLine({"--ambient-floor", "0.12"});
+		check(defaultFloor.options.ambientFloorSet,
+				"command line: an explicit 0.12 is still reported (it is a choice)");
+	}
+
 	// --help and the usage text: the flag names a user needs are in it, and
 	// the parser never needs a window to answer it.
 	{
@@ -4777,8 +4826,9 @@ void testCommandLine() {
 		bool complete = true;
 		for (const char* name :
 				 {"--sdf-shadows", "--shadow-jitter", "--sdf-margin", "--far-lod",
-					"--validation", "--perf", "--present", "--platform",
-					"--debug-term", "--debug-hole", "--help"}) {
+					"--no-ambient", "--ambient-floor", "--validation", "--perf",
+					"--present", "--platform", "--debug-term", "--debug-hole",
+					"--help"}) {
 			complete = complete && usage.find(name) != std::string::npos;
 		}
 		check(complete, "command line: the usage lists every flag");
@@ -4886,6 +4936,339 @@ void testCommandLine() {
 }
 
 
+
+// --- pass 62: the ambient sky visibility -----------------------------------
+//
+// The ambient used to be the sky sampled along the VIEW ray, cut by
+// (0.55 + 0.45 * shadow) - so a cave kept 55% of a sky term and a wall's
+// ambient changed when the camera turned. It is now the sky the SURFACE can
+// see: a 6-azimuth horizon scan over the column heights plus two coarse SDF
+// rays, all in one mean of eight, with a floor so caves stay readable.
+//
+// The mirror lives in tests/ambient_mirror.hpp (the probe harness includes it
+// too). These checks are: the SHADER's text (the constants, both formulas, the
+// writer - the pass-51 lesson), the mirror's arithmetic against exact
+// hand-derived values, the SDF rays on a real field, and the floor.
+
+namespace {
+constexpr float kTestTop = 61.0f;  // flat terrain: highest solid 60, +1
+
+std::uint32_t flatColumnTop(int, int, void*) { return 61u; }
+
+// The tall column at cell (1, 0) only: with the sample at (0.5, y, 0.5), that
+// is exactly where the FIRST azimuth (a = 0, d = 1) lands, and no other
+// azimuth/distance pair of the scan reaches it - so exactly one of the six
+// azimuths reports a horizon and the expected mean is exact.
+std::uint32_t singleSpire(int x, int z, void*) {
+	return (x == 1 && z == 0) ? 71u : 61u;
+}
+
+// The roof of a cave: the highest solid is 16 voxels above the sample, so all
+// six azimuths report the same horizon (the ceiling's own column).
+std::uint32_t caveRoof(int, int, void*) { return 77u; }
+
+std::uint32_t allAir(int, int, void*) { return 0u; }
+
+// Matches an open SDF field whose solid slab ends at y = 6 (highest solid 5).
+std::uint32_t openGroundTop(int, int, void*) { return 6u; }
+} // namespace
+
+void testAmbientVisibility() {
+	using vv::ambient::ambientFloor;
+	using vv::ambient::horizonVisibility;
+	using vv::ambient::kAmbientAzimuths;
+	using vv::ambient::kAmbientFloorDefault;
+	using vv::ambient::kAmbientGroundTint;
+	using vv::ambient::kAmbientHorizonBias;
+	using vv::ambient::kAmbientSdfRange;
+	using vv::ambient::kAmbientSdfHit;
+	using vv::ambient::kAmbientSdfLift;
+	using vv::ambient::skyVisibility;
+
+	// --- the shader's text ---------------------------------------------------
+#ifdef VV_SHADER_DIR
+	{
+		std::ifstream in(std::string(VV_SHADER_DIR) + "/voxels.comp");
+		check(in.good(), "ambient: resources/shaders/voxels.comp is readable");
+		if (in.good()) {
+			const std::string shader((std::istreambuf_iterator<char>(in)),
+				std::istreambuf_iterator<char>());
+			const auto has = [&shader](const char* needle) {
+				return shader.find(needle) != std::string::npos;
+			};
+			// The constants, spelled the way the mirror spells them.
+			check(has("const int kAmbientAzimuths = 6;") &&
+					has("const int kAmbientDistances = 6;") &&
+					has("float[6](1.0, 2.0, 4.0, 8.0, 16.0, 32.0)") &&
+					has("const float kAmbientHorizonBias = 1.0;") &&
+					has("const float kAmbientSdfRange = 32.0;") &&
+					has("const float kAmbientSdfLift = 1.0;") &&
+					has("const float kAmbientSdfHit = 0.5;") &&
+					has("const float kAmbientSdfAboveRatio = 1.3;") &&
+					has("const float kAmbientSdfAboveTan = 0.08;") &&
+					has("const float kAmbientSdfMaxSin = 0.966;") &&
+					has("const float kAmbientSdfMaxTan = 3.732;") &&
+					has("const float kAmbientFloorDefault = 0.12;"),
+				"ambient: the shader constants match the mirror");
+			check(has("const vec3 kAmbientGroundTint = vec3(0.45, 0.40, 0.32);"),
+				"ambient: the ground bounce tint is what the mirror mirrors");
+			// The scan: the height atlas, the exact sine, the mean.
+			check(has("resolveColumn(cell.x, cell.y, slot, local)") &&
+					has("columnHeightAt(slot, local)") &&
+					has("max(top - p.y - kAmbientHorizonBias, 0.0) / d") &&
+					has("const float sinTheta = tMax / sqrt(1.0 + tMax * tMax);") &&
+					has("total += 1.0 - sinTheta;"),
+				"ambient: the horizon scan is the height atlas, exact sine, mean");
+			// The two SDF rays and the mean of eight.
+			check(has("float ambientSdfRay(vec3 p, vec3 dir)") &&
+					has("if (scene.misc.w <= 0.5 || sdfBox.box.w < 0)") &&
+					has("t += max(h * 1.5, 4.0);") &&
+					has("visibility += ambientSdfRay(p, normalize(n));") &&
+					has("visibility += ambientSdfRay(p, silhouetteDir);") &&
+					has("return clamp(visibility / 8.0, 0.0, 1.0);"),
+				"ambient: the two SDF rays join the same mean of eight");
+			// The silhouette ray: the scan's worst azimuth, sine -> tangent
+			// guarded below 1 (a horizon straight up would divide by zero),
+			// then aimed just ABOVE the horizon it found - aimed exactly at it
+			// the ray grazes the caster (an SDF distance of ~0.5 reads as
+			// clear) and escapes, which is what the first version did.
+			check(has("const float sinClamped = min(worstSin, "
+							"kAmbientSdfMaxSin);") &&
+					has("tanTheta * kAmbientSdfAboveRatio + "
+							"kAmbientSdfAboveTan,") &&
+					has("kAmbientSdfMaxTan)") &&
+					has("normalize(vec3(cos(worstAzimuth), tanAbove, "
+							"sin(worstAzimuth)))"),
+				"ambient: the silhouette ray clears the 2.5D horizon to probe "
+				"above it");
+			// The shading site: view-independence is the point, so the sky is
+			// sampled at the NORMAL, and the floor keeps a cave readable.
+			check(has("const vec3 skyIrr = skyBaseColor(n);") &&
+					has("const vec3 dome = mix(groundBounce, skyIrr, hemi);") &&
+					has("ambient = dome * skyVis + skyIrr * ambientFloor();"),
+				"ambient: the ambient samples the sky at the NORMAL and is floored");
+			check(has("rim = skyIrr * (0.12 * pow(1.0 - view, 5.0)) * skyVis;"),
+				"ambient: the rim follows the same visibility");
+			// The acceptance criterion, made mechanical: inside the pass-62
+			// branch NOTHING may depend on the view ray, so a 360-degree camera
+			// turn cannot move a surface's ambient.
+			const std::string branchOpen = "if (scene.ambient.x > 0.5) {";
+			const std::size_t branchStart = shader.find(branchOpen);
+			const std::size_t branchEnd =
+				shader.find("} else {", branchStart + branchOpen.size());
+			check(branchStart != std::string::npos &&
+					branchEnd != std::string::npos &&
+					branchEnd > branchStart,
+				"ambient: the pass-62 branch is present and closed");
+			if (branchStart != std::string::npos &&
+					branchEnd > branchStart) {
+				const std::string branch =
+					shader.substr(branchStart + branchOpen.size(),
+						branchEnd - branchStart - branchOpen.size());
+				check(branch.find("sRdWorld") == std::string::npos,
+					"ambient: the ambient branch never reads the view ray (a 360-deg "
+					"turn cannot change a surface's ambient)");
+				check(branch.find("ambientSkyVisibility(hitPos, n)") !=
+							std::string::npos,
+					"ambient: ... it reads the SURFACE's own sky visibility");
+			}
+			// The control path: the pre-62 formula, character for character.
+			check(has("ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);") &&
+					has("vec3 skyAmb = skyBaseColor(sRdWorld);"),
+				"ambient: --no-ambient keeps the pre-62 formula verbatim");
+			check(has("if (scene.ambient.x > 0.5) {") &&
+					has("return (scene.ambient.y >= 0.0) ? scene.ambient.y : "
+							"kAmbientFloorDefault;"),
+				"ambient: the uniform selects the path and carries the floor");
+		}
+	}
+#endif
+
+#ifdef VV_SRC_DIR
+	{
+		// The writer (pass 51: a uniform nobody writes is worth nothing).
+		std::ifstream renderer(
+			std::string(VV_SRC_DIR) + "/vulkan/VulkanRenderer.cpp");
+		std::ifstream sceneUniform(
+			std::string(VV_SRC_DIR) + "/render/SceneUniform.cpp");
+		std::ifstream sceneData(
+			std::string(VV_SRC_DIR) + "/render/SceneData.hpp");
+		std::ifstream options(std::string(VV_SRC_DIR) + "/core/CommandLine.cpp");
+		check(renderer.good() && sceneUniform.good() && sceneData.good() &&
+					options.good(),
+			"ambient: the writer files are readable (VV_SRC_DIR)");
+		if (renderer.good() && sceneUniform.good() && sceneData.good() &&
+				options.good()) {
+			const auto text = [](std::ifstream& f) {
+				return std::string((std::istreambuf_iterator<char>(f)),
+					std::istreambuf_iterator<char>());
+			};
+			const std::string rsrc = text(renderer);
+			const std::string usrc = text(sceneUniform);
+			const std::string dsrc = text(sceneData);
+			const std::string osrc = text(options);
+			check(dsrc.find("glm::vec4 ambient{};") != std::string::npos,
+				"ambient: the scene UBO has the field");
+			check(usrc.find("ubo.ambient = ambientParams;") != std::string::npos,
+				"ambient: SceneUniform writes it");
+			check(rsrc.find("vvOptions.ambient ? 1.0f : 0.0f") !=
+						std::string::npos &&
+					rsrc.find("vvOptions.ambientFloorSet ? vvOptions.ambientFloor : "
+							"-1.0f") != std::string::npos,
+				"ambient: the renderer fills it from the parsed options");
+			check(osrc.find("\"--ambient\"") != std::string::npos &&
+					osrc.find("\"--no-ambient\"") != std::string::npos &&
+					osrc.find("\"--ambient-floor\"") != std::string::npos,
+				"ambient: the command line exposes it (and the control)");
+		}
+	}
+#endif
+
+	// --- the horizon scan, against exact values ------------------------------
+	{
+		// A flat plain with the floor at the sample's own height: every sample
+		// reads exactly the bias (61 - 60.5 - 1 = -0.5 -> clamped to 0), so the
+		// horizon is 0 and the sky is fully visible in every azimuth.
+		float worstAzimuth = 0.0f;
+		float worstSin = 0.0f;
+		const float flat = horizonVisibility(8.5f, 60.5f, 8.5f, flatColumnTop,
+			nullptr, &worstAzimuth, &worstSin);
+		// The scan reports the SUM over its six azimuths (the caller adds the two
+		// SDF rays and divides by 8), so unobstructed is 6.0 = a mean of 1.0.
+		check(flat == static_cast<float>(kAmbientAzimuths),
+			"ambient: a flat plain reports an unobstructed horizon (every azimuth)");
+		check(worstSin == 0.0f && worstAzimuth == 0.0f,
+			"ambient: ... with a horizon of exactly 0, not a quantisation step");
+
+		// The same plain, one voxel higher: still unobstructed (the bias is what
+		// covers the height map's +1 quantisation), and one voxel LOWER would
+		// read a 1-voxel step - which is why the bias exists.
+		check(horizonVisibility(8.5f, 61.5f, 8.5f, flatColumnTop, nullptr,
+						nullptr, nullptr) == static_cast<float>(kAmbientAzimuths),
+			"ambient: one voxel of terrain quantisation does not darken the sky");
+		const float oneBelow = horizonVisibility(8.5f, 59.5f, 8.5f, flatColumnTop,
+			nullptr, nullptr, nullptr);
+		check(oneBelow < 6.0f * 0.7f,
+			"ambient: ... while a sample below the flat top does see the step");
+
+		// All-air columns (nothing loaded): no obstruction either.
+		check(horizonVisibility(8.5f, 60.5f, 8.5f, allAir, nullptr, nullptr,
+						nullptr) == static_cast<float>(kAmbientAzimuths),
+			"ambient: unloaded columns are open sky, not a wall");
+
+		// One 9.5-voxel-high column at cell (1, 0), i.e. exactly the first
+		// azimuth's d = 1 sample: tan = 9.5, sin = 9.5 / sqrt(1 + 9.5^2), so
+		// that azimuth reports 1 - sin and the other five report 1.
+		const float spire = horizonVisibility(0.5f, 60.5f, 0.5f, singleSpire,
+			nullptr, nullptr, nullptr);
+		const float spireTan = 71.0f - 60.5f - kAmbientHorizonBias;
+		const float spireExpected =
+			5.0f + (1.0f - spireTan / std::sqrt(1.0f + spireTan * spireTan));
+		check(std::fabs(spire - spireExpected) < 1e-6f,
+			"ambient: one blocked azimuth reports its exact horizon");
+		const float spireMean = spire / static_cast<float>(kAmbientAzimuths);
+		check(spireMean > 0.8f && spireMean < 0.85f,
+			"ambient: ... and one blocked azimuth of six is a small dent (0.834)");
+
+		// A cave: every column reads a ceiling well above the sample, so every
+		// azimuth has a horizon - and the higher the ceiling, the darker.
+		const float caveScan =
+			horizonVisibility(0.5f, 60.5f, 0.5f, caveRoof, nullptr, nullptr, nullptr);
+		check(caveScan < 6.0f * 0.01f,
+			"ambient: a low cave roof reports almost no sky from the columns alone");
+		const float higherRoof =
+			horizonVisibility(0.5f, 20.5f, 0.5f, caveRoof, nullptr, nullptr, nullptr);
+		check(higherRoof <= caveScan,
+			"ambient: a sample further below the ceiling is never brighter");
+	}
+
+	// --- the two SDF rays, on a real field ----------------------------------
+	{
+		// Open ground: a solid slab whose top is y = 6, sampled at y = 6.5 with
+		// the matching column top (6). Both rays escape 32 voxels -> 1.0 each,
+		// so the estimate is the full mean.
+		vv::voxel::SdfField openField;
+		openField.build(24, 24, 24, [](int, int y, int) { return y < 6; });
+		const float up[3] = {0.0f, 1.0f, 0.0f};
+		const float open = skyVisibility(&openField, 12.5f, 6.5f, 12.5f, up,
+			openGroundTop, nullptr);
+		check(open > 0.99f,
+			"ambient: open ground under a live field is fully sky-lit");
+		check(skyVisibility(nullptr, 12.5f, 6.5f, 12.5f, up, openGroundTop,
+						nullptr) == 1.0f,
+			"ambient: without a field the two SDF rays contribute 1.0");
+
+		// A cave under a rock ceiling: the air layer 3..7 between a floor slab
+		// and a solid layer from y = 8 up. The sample at y = 5.5 is 2.5 voxels
+		// under the ceiling, so BOTH rays meet it after their lift step:
+		// t = 1 -> 5, h < 0.5 -> 5 / 32 = 0.15625 each. The columns (the
+		// terrain surface far above, top 24) agree: tan 17.5 at d = 1.
+		vv::voxel::SdfField caveField;
+		caveField.build(24, 24, 24, [](int, int y, int) {
+			return y < 3 || y >= 8;
+		});
+		const auto surfaceTop = [](int, int, void*) -> std::uint32_t { return 24u; };
+		const float ceilingTan = 24.0f - 5.5f - kAmbientHorizonBias;
+		const float ceilingSin =
+			ceilingTan / std::sqrt(1.0f + ceilingTan * ceilingTan);
+		const float scanOnly = 6.0f * (1.0f - ceilingSin);  // the sum over azimuths
+		const float sdfRay = 5.0f / kAmbientSdfRange;
+		const float caveExpect = (scanOnly + 2.0f * sdfRay) / 8.0f;
+		const float cave = skyVisibility(&caveField, 12.5f, 5.5f, 12.5f, up,
+			surfaceTop, nullptr);
+		check(std::fabs(cave - caveExpect) < 1e-5f,
+			"ambient: an underground point is the scan plus the two roof rays, "
+			"exactly");
+		check(cave < 0.05f,
+			"ambient: ... so a cave sits near zero, not at the old 55% of sky");
+
+		// The rays are what closed the gap: the columns alone cannot see a
+		// ceiling, and without a field the two eighths would report open sky.
+		const float caveNoField =
+			skyVisibility(nullptr, 12.5f, 5.5f, 12.5f, up, surfaceTop, nullptr);
+		check(std::fabs(caveNoField - (scanOnly + 2.0f) / 8.0f) < 1e-5f,
+			"ambient: without the field the same point reads brighter (open rays)");
+		check(cave < caveNoField * 0.5f,
+			"ambient: the two SDF rays are what darken the cave");
+	}
+
+	// --- the floor -----------------------------------------------------------
+	{
+		check(kAmbientFloorDefault > 0.0f && kAmbientFloorDefault < 0.3f,
+			"ambient: the default floor is a fill, not a light");
+		check(ambientFloor(-1.0f) == kAmbientFloorDefault,
+			"ambient: an unset uniform takes the shader's default floor");
+		check(ambientFloor(0.0f) == 0.0f,
+			"ambient: --ambient-floor 0 is exactly zero (black caves)");
+		check(ambientFloor(1.0f) == 1.0f,
+			"ambient: --ambient-floor 1 is a flat fill (the debug end of the lever)");
+		// The consequence at the shading site: ambient = dome * skyVis +
+		// skyIrr * floor, so a fully occluded point keeps the floor and an open
+		// one keeps all of it - "dark, not black".
+		const float caveAmbient = ambientFloor(-1.0f);  // skyVis = 0
+		check(caveAmbient > 0.0f && caveAmbient <= kAmbientFloorDefault,
+			"ambient: a cave keeps the floor and nothing else");
+	}
+
+	std::printf("ambient: %d azimuths x 6 distances (36 column samples), "
+							"bias %.1f vox, SDF rays %.0f vox range, floor %.2f; "
+							"scan mean flat %.3f spire %.4f cave %.4f\n",
+		kAmbientAzimuths, static_cast<double>(kAmbientHorizonBias),
+		static_cast<double>(kAmbientSdfRange),
+		static_cast<double>(kAmbientFloorDefault),
+		static_cast<double>(horizonVisibility(8.5f, 60.5f, 8.5f, flatColumnTop,
+			nullptr, nullptr, nullptr) / static_cast<float>(kAmbientAzimuths)),
+		static_cast<double>(horizonVisibility(0.5f, 60.5f, 0.5f, singleSpire,
+			nullptr, nullptr, nullptr) / static_cast<float>(kAmbientAzimuths)),
+		static_cast<double>(horizonVisibility(0.5f, 60.5f, 0.5f, caveRoof, nullptr,
+			nullptr, nullptr) / static_cast<float>(kAmbientAzimuths)));
+	(void)kTestTop;
+	(void)kAmbientGroundTint;
+	(void)kAmbientSdfHit;
+	(void)kAmbientSdfLift;
+}
+
+
 int main() {
 	testVertexAO();
 	testNoiseDeterministic();
@@ -4919,6 +5302,7 @@ int main() {
 	testSdfHandoverPolicy();
 	testStreamPriority();
 	testCommandLine();
+	testAmbientVisibility();
 	testVoxelTextures();
 	testKeyBindings();
 	testImageDecode();

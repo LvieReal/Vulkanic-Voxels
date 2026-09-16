@@ -1,5 +1,6 @@
 #include "core/CommandLine.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -140,6 +141,23 @@ CommandLineResult parseCommandLine(const std::vector<std::string>& arguments) {
       o.shadowSharp = true;
     } else if (arg == "--no-shadow-sharp") {
       o.shadowSharp = false;
+    } else if (arg == "--ambient") {
+      o.ambient = true;
+    } else if (arg == "--no-ambient") {
+      o.ambient = false;
+    } else if (arg == "--ambient-floor") {
+      std::string value;
+      if (!valueFor(i, value, result.error)) {
+        return result;
+      }
+      float floor = 0.0f;
+      if (!parseFloat(value, floor)) {
+        result.error = "option '--ambient-floor' needs a number, got '" +
+                       value + "'";
+        return result;
+      }
+      o.ambientFloorSet = true;
+      o.ambientFloor = std::clamp(floor, 0.0f, 1.0f);
     } else if (arg == "--far-lod") {
       o.farLod = true;
     } else if (arg == "--no-far-lod") {
@@ -259,6 +277,11 @@ std::string commandLineUsage() {
       "                             0 turns it off (default 0.002)\n"
       "  --sdf-margin <chunks>      how far the camera may drift before the\n"
       "                             SDF field is rebuilt (default 1)\n"
+      "  --no-ambient               the pre-62 ambient formula (the sky as the\n"
+      "                             camera ray sees it); the default is the sky\n"
+      "                             the SURFACE sees, so caves go dark\n"
+      "  --ambient-floor <0..1>     how much sky a fully occluded point still\n"
+      "                             gets, as a fraction (default 0.12)\n"
       "  --far-lod                  enable the coarse far-terrain LOD field\n"
       "  --validation               enable the Khronos validation layer\n"
       "  --perf                     log slow frames and the SDF bake cost\n"
@@ -284,6 +307,15 @@ std::string describeOptions(const GameOptions& o) {
     }
     out += item;
   };
+  if (!o.ambient) {
+    add("no-ambient");
+  }
+  if (o.ambientFloorSet) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "ambient-floor %.3f",
+                  static_cast<double>(o.ambientFloor));
+    add(buffer);
+  }
   if (o.sdfShadows) {
     add("sdf-shadows");
   }

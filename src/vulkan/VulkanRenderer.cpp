@@ -269,9 +269,18 @@ void VulkanRenderer::drawFrame() {
     farFade = static_cast<float>(
         std::min(elapsed / kFarFadeSeconds, 1.0));
   }
-  m_sceneUniform.update(m_camera, m_timeSeconds, m_lighting,
-                        glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
-                                  m_sdfShadows ? 1.0f : 0.0f, 0.0f));
+  // Pass 62: the ambient sky-visibility term and its cave floor ride the
+  // scene uniform (SceneUBO.ambient). < 0 in y = the shader's own default, so
+  // "unset" never has to be spelled out twice (the pass-51 lesson: a uniform
+  // whose writer and reader disagree is worse than no uniform).
+  const vv::core::GameOptions& vvOptions = vv::core::options();
+  m_sceneUniform.update(
+      m_camera, m_timeSeconds, m_lighting,
+      glm::vec4(m_debugTerminators ? 1.0f : 0.0f, farFade,
+                m_sdfShadows ? 1.0f : 0.0f, 0.0f),
+      glm::vec4(vvOptions.ambient ? 1.0f : 0.0f,
+                vvOptions.ambientFloorSet ? vvOptions.ambientFloor : -1.0f,
+                0.0f, 0.0f));
 
   if (m_swapchain == VK_NULL_HANDLE) {
     // A recreate failed above and left no swapchain to acquire from. Retry;

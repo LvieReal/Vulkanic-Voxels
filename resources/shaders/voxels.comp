@@ -45,6 +45,9 @@ layout(std140, set = 0, binding = 2) uniform Scene {
     vec4 skyLow;
     vec4 skyHigh;
     vec4 misc; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = SDF shadows
+    vec4 ambient; // x = ambient sky-visibility term on/off (pass 62; 0 =
+                  // the pre-62 view-ray formula, bit for bit); y = the cave
+                  // floor (minimum sky fraction, < 0 = kAmbientFloorDefault)
 } scene;
 
 // Chunk table: one u32 atlas slot index per region grid cell
@@ -1046,6 +1049,175 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
     return visibility;
 }
 
+// ---- Ambient sky visibility (pass 62) ------------------------------------
+//
+// What the ambient is FOR, and what it was doing wrong: it used to be a
+// hemisphere blend of the sky sampled along the VIEW ray, cut by
+// (0.55 + 0.45 * shadow). A cave therefore kept 55% of a sky term - "there is
+// practically no ambient light here" is exactly what was missing - and the
+// ambient on a given surface moved when the camera turned.
+//
+// The ambient is now the sky the SURFACE's own hemisphere can actually see:
+//
+//   * the dome is sampled AT THE NORMAL (view-independent by construction),
+//     blended with a dim ground bounce by the same hemispheric weight,
+//   * a horizon scan over the column heights - 6 azimuths x 6 distances -
+//     finds how much of the horizontal sky is blocked. This is what makes a
+//     cave dark: a roof is the HIGHEST SOLID of the columns around the point,
+//     so it enters the scan as an extremely high horizon at short distance,
+//   * two short rays through the 3D SDF (when a field is live) resolve what a
+//     2.5D column scan cannot: the overhang/arch above the point (the 6
+//     azimuths miss a roof that only hangs over the sample), and the
+//     obstruction in the direction the scan itself found worst.
+//
+// All eight directions share ONE mean, so the estimate reads as "the fraction
+// of the hemisphere that reports sky", and the two SDF rays carry 2/8 of its
+// weight: two of the eight directions are the zenith (up the normal) and the
+// sky above the worst horizon. A ray with nothing to hit therefore reports the
+// sky it sees, which is why the floor of the estimate is 2/8 and not zero - a
+// slot canyon really does show sky straight up. A floor term keeps a fully
+// sheltered point readable instead of black (--ambient-floor).
+//
+// The scan reads the NEAR region's columns (binding 5, via resolveColumn);
+// beyond the loaded region a sample reads as open sky, like the marches.
+// Measured on the shipped terrain (default config, seed 1337, 56k+ columns in
+// six regions, 1-voxel scans): every column is solid-below / air-above, so the
+// world has no roofs, arches or tunnels and the two SDF rays escape there - the
+// sheltering this pass adds comes from the scan (a valley floor scans to 0.53,
+// the darkest notch in a 321x321-voxel window to 0.09). The rays are the
+// 3D-correct half for terrain that does grow a roof; the unit tests pin both,
+// with a synthetic cave under a live field.
+//
+// Cost, honestly: the scan is 36 column resolves (one chunk-table fetch + one
+// packed u16 height fetch each, both from buffers the marches already read),
+// and the two SDF rays are coarse marches (step max(1.5h, 4 voxels) over 32
+// voxels, <= 8 samples each, ~8 gathers per sample) - roughly one extra shadow
+// ray's worth of work per shaded pixel, paid once per pixel instead of per ray.
+// scene.ambient.x = 0 restores the pre-62 formula verbatim (--no-ambient).
+const int kAmbientAzimuths = 6;
+const int kAmbientDistances = 6;
+const float kAmbientDistancesVox[kAmbientDistances] =
+    float[6](1.0, 2.0, 4.0, 8.0, 16.0, 32.0);
+// The height atlas stores "highest solid + 1" per column, so a column flush
+// with the surface still reads one voxel high; subtracting it is what makes a
+// flat plain report a horizon of exactly 0 instead of a spurious 0.5/1 voxel
+// step at d = 1 (which alone would cost ~55% of the sky in every azimuth).
+const float kAmbientHorizonBias = 1.0;
+// The SDF occlusion rays: they are an ambient estimate, not a shadow - a
+// coarse march is the point (a fine one would cost a whole shadow ray per
+// ray). Range in voxels; lift keeps the origin off its own surface.
+const float kAmbientSdfRange = 32.0;
+const float kAmbientSdfLift = 1.0;
+const float kAmbientSdfHit = 0.5;
+// The silhouette ray aims just ABOVE the horizon the 2.5D scan found: a ray
+// aimed exactly at it grazes the caster (the SDF distance there is ~0.5, which
+// the march treats as clear) and escapes. Aimed above, it answers the question
+// the scan cannot: is there rock over that horizon, or does the sky resume?
+const float kAmbientSdfAboveRatio = 1.3;
+const float kAmbientSdfAboveTan = 0.08;  // ~4.6 degrees
+// 75 degrees: the elevation ceiling for that ray, so the sine -> tangent
+// conversion stays finite and a vertical horizon still probes sensibly.
+const float kAmbientSdfMaxSin = 0.966;
+const float kAmbientSdfMaxTan = 3.732;
+const vec3 kAmbientGroundTint = vec3(0.45, 0.40, 0.32);
+const float kAmbientFloorDefault = 0.12;  // scene.ambient.y < 0 = use this
+
+float ambientFloor()
+{
+    return (scene.ambient.y >= 0.0) ? scene.ambient.y : kAmbientFloorDefault;
+}
+
+// Sky visibility from the height field alone: the SUM over the six azimuths of
+// (1 - sin(horizon elevation)) - the caller adds the two SDF rays and divides
+// by 8, so these are six of its eight terms - plus the worst azimuth (the
+// direction the two SDF rays use) and its sine.
+//
+// The elevation of one azimuth is the MAX over the sampled distances of
+// tan = (column top - point height) / distance: tan is monotonic in the
+// elevation, so the max over samples IS the highest horizon, and one sqrt per
+// azimuth turns it into the sine the visibility needs.
+float ambientHorizonVisibility(vec3 p, out float worstAzimuth, out float worstSin)
+{
+    float total = 0.0;
+    worstSin = 2.0;  // above any real sine: the first azimuth always wins
+    worstAzimuth = 0.0;
+    for (int a = 0; a < kAmbientAzimuths; ++a) {
+        const float azimuth =
+            float(a) * (6.2831853 / float(kAmbientAzimuths));
+        const vec2 dirXZ = vec2(cos(azimuth), sin(azimuth));
+        float tMax = 0.0;
+        for (int i = 0; i < kAmbientDistances; ++i) {
+            const float d = kAmbientDistancesVox[i];
+            const ivec2 cell = ivec2(floor(p.xz + dirXZ * d));
+            uint slot = 0u;
+            ivec2 local = ivec2(0);
+            if (!resolveColumn(cell.x, cell.y, slot, local)) {
+                continue;  // unloaded / outside the region: no obstruction
+            }
+            const float top = float(columnHeightAt(slot, local));
+            tMax = max(tMax, max(top - p.y - kAmbientHorizonBias, 0.0) / d);
+        }
+        const float sinTheta = tMax / sqrt(1.0 + tMax * tMax);
+        total += 1.0 - sinTheta;
+        if (sinTheta < worstSin) {
+            worstSin = sinTheta;
+            worstAzimuth = azimuth;
+        }
+    }
+    return total;  // sum over the azimuths: mean of eight is the caller's job
+}
+
+// One coarse occlusion ray through the 3D SDF, 0..1: how much of the sky
+// survives along `dir`. A ray that leaves the range without meeting anything
+// is open sky (1.0); one that meets a surface at t reports the fraction
+// t / range it traveled. Outside the box the SDF reads 1e30 = open space, so a
+// point the box does not cover simply gets no occlusion information from here.
+float ambientSdfRay(vec3 p, vec3 dir)
+{
+    if (scene.misc.w <= 0.5 || sdfBox.box.w < 0) {
+        return 1.0;  // no field: this ray contributes nothing either way
+    }
+    float t = kAmbientSdfLift;
+    for (int i = 0; i < 8; ++i) {
+        const float h = sampleSdf3d(p + dir * t);
+        if (h < kAmbientSdfHit) {
+            return clamp(t / kAmbientSdfRange, 0.0, 1.0);
+        }
+        t += max(h * 1.5, 4.0);
+        if (t >= kAmbientSdfRange) {
+            break;
+        }
+    }
+    return 1.0;
+}
+
+// The fraction of the sky the point p (world voxels, on the surface) can see,
+// with `n` its normal. See the block comment above for what each term is.
+float ambientSkyVisibility(vec3 p, vec3 n)
+{
+    float worstAzimuth = 0.0;
+    float worstSin = 0.0;
+    float visibility = ambientHorizonVisibility(p, worstAzimuth, worstSin);
+    // The two SDF rays: up the normal (where a cosine-weighted hemisphere
+    // carries most of its energy), and into the scan's worst azimuth slightly
+    // above the horizon it reported there (kAmbientSdfAboveRatio: see the
+    // constant). The sine is capped below 1 before the sine -> tangent
+    // conversion - a horizon straight up (a roof against the sample) would
+    // divide by zero, and 75 degrees already points into any obstruction that
+    // reads as vertical.
+    const float sinClamped = min(worstSin, kAmbientSdfMaxSin);
+    const float tanTheta =
+        sinClamped / sqrt(max(1e-6, 1.0 - sinClamped * sinClamped));
+    const float tanAbove = min(
+        tanTheta * kAmbientSdfAboveRatio + kAmbientSdfAboveTan,
+        kAmbientSdfMaxTan);
+    const vec3 silhouetteDir =
+        normalize(vec3(cos(worstAzimuth), tanAbove, sin(worstAzimuth)));
+    visibility += ambientSdfRay(p, normalize(n));
+    visibility += ambientSdfRay(p, silhouetteDir);
+    return clamp(visibility / 8.0, 0.0, 1.0);
+}
+
 // Sun visibility at a hit position (voxel space): one ascending shadow ray
 // - column DDA + height-bound voxel walk, coarse far cells beyond the near
 // region. By default the exact binary march (1.0 lit / 0.0 shadowed);
@@ -1178,15 +1350,37 @@ vec3 shadeSurfaceHit(uint sType, vec3 sNormal, float sTHit, bool sFarHit,
     }
 
     // Lighting model ported from the owner's WGSL reference renderer:
-    // hemispheric sky ambient + direct sun + fresnel rim, from the sky
-    // THIS ray sees - WITHOUT the sun disc/glow (skyBaseColor).
-    vec3 skyAmb = skyBaseColor(sRdWorld);
+    // hemispheric sky ambient + direct sun + fresnel rim, from the sunless
+    // sky (skyBaseColor - never the sun disc/glow).
     float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
     vec3 direct =
         scene.lightColor.xyz * (0.2 * ndl + 0.8 * pow(ndl, 8.0)) * shadow;
     float view = max(dot(n, -sRdWorld), 0.0);
-    vec3 rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
+
+    vec3 ambient;
+    vec3 rim;
+    if (scene.ambient.x > 0.5) {
+        // Pass 62: the sky the SURFACE can see (ambientSkyVisibility), sampled
+        // at the NORMAL - so the ambient of a given surface no longer changes
+        // when the camera turns - blended with a dim ground bounce by the
+        // hemispheric weight, and floored so a cave is dark, not black. The
+        // old (0.55 + 0.45 * shadow) cut is gone: it removed at most 45% of a
+        // sky term in a cave while darkening every sun-shadowed face outdoors,
+        // and the visibility term replaces what it was standing in for. The
+        // rim is sky light too, so it follows the same visibility.
+        const vec3 skyIrr = skyBaseColor(n);
+        const vec3 groundBounce = scene.skyLow.xyz * kAmbientGroundTint;
+        const float skyVis = ambientSkyVisibility(hitPos, n);
+        const vec3 dome = mix(groundBounce, skyIrr, hemi);
+        ambient = dome * skyVis + skyIrr * ambientFloor();
+        rim = skyIrr * (0.12 * pow(1.0 - view, 5.0)) * skyVis;
+    } else {
+        // --no-ambient: the pre-62 formula, character for character (the
+        // control the upgrade is judged against, and bit-identical to it).
+        vec3 skyAmb = skyBaseColor(sRdWorld);
+        ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
+        rim = skyAmb * (0.12 * pow(1.0 - view, 5.0));
+    }
 
     vec3 color = base * (ambient + direct + rim) * ao;
 

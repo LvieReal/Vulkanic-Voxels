@@ -38,6 +38,10 @@ struct SceneUBO final {
 	glm::vec4 skyLow{};
 	glm::vec4 skyHigh{};
 	glm::vec4 misc{}; // x = timeSeconds, y = VV_DEBUG_TERM, z = far fade-in, w = SDF shadows
+	glm::vec4 ambient{}; // x = the ambient sky-visibility term (pass 62; 0 =
+											// the pre-62 view-ray formula, bit for bit), y = the cave
+											// floor (minimum sky fraction; < 0 = the shader default,
+											// --ambient-floor); z,w unused
 };
 
 }  // namespace vv::render

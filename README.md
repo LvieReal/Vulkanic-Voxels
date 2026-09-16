@@ -124,6 +124,8 @@ that makes sense (`--no-far-lod`), and the last one on the command line wins.
 | `--shadow-jitter <slope>` | strength of the per-pixel shadow-ray jitter, `0` = off (default `0.002`) |
 | `--sdf-margin <chunks>` | how far the camera may drift before the SDF field is rebuilt (default 1) |
 | `--shadow-sharp` | force the exact binary sun shadows |
+| `--no-ambient` | use the pre-pass-62 ambient (the sky sampled along the camera ray) instead of the sky the surface sees |
+| `--ambient-floor <0..1>` | how much sky a fully sheltered point still gets (default `0.12`; `0` = black) |
 | `--far-lod` | enable the coarse far-terrain LOD field (off by default) |
 | `--validation` | enable the Khronos validation layer |
 | `--perf` | log slow frames and the SDF bake's cost split |

@@ -27,6 +27,13 @@ struct GameOptions final {
   // --help / -h: print the usage and exit without touching a window.
   bool help = false;
 
+  // Ambient sky visibility (pass 62; new options are FLAGS ONLY - the VV_*
+  // fallback exists for the switches that predate the command line, and the
+  // complaint this pass answered was exactly "stop making me use variables").
+  bool ambient = true;             // --no-ambient: the pre-62 ambient formula
+  bool ambientFloorSet = false;
+  float ambientFloor = 0.0f;       // --ambient-floor <0..1> (sky fraction)
+
   // Rendering experiments.
   bool sdfShadows = false;    // --sdf-shadows
   bool shadowSharp = false;   // --shadow-sharp (wins over --sdf-shadows)

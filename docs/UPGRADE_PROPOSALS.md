@@ -8,6 +8,16 @@ the C++ tree as of `7063297`.
 
 ---
 
+> **Status: shipped as pass 62** (see `docs/PASSES.md`). Implemented as
+> recommended below (B1 + 2 SDF rays) with three additions found while building
+> it: the silhouette ray aims just *above* the horizon the scan reported (aimed
+> at it the ray grazes the caster and escapes), the scan reads the near region's
+> columns only (the far-LOD heights are camera-anchored and would pop), and - the
+> honest surprise - **the shipped terrain has no caves, overhangs or tunnels to
+> judge the cave case on** (measured: every column is solid-below/air-above). The
+> cave evidence is therefore a synthetic one in the tests; the world's own
+> shelters (valleys, notches, the lee of ridges) do come out darker.
+
 ## 1. Ambient light: the caves are the problem
 
 ### 1.1 What the shader does today

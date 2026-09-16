@@ -2212,3 +2212,144 @@ documented windowless failure, `VV_PLATFORM=null` alone still does the same, and
 `VV_FAR_LOD=1 game --no-far-lod` reports only `platform null` - the flag won.
 This box has no window, so the renderer's own `[vulkan] …` lines are not
 reachable here; the renderer wiring is covered by the suite's source pins.
+
+## Pass 62: the ambient is the sky the SURFACE sees (it was the sky the CAMERA ray saw)
+
+OWNER: "proceed with ambient light upgrade. i pick the recommended approach
+(b1 + 2 sdf rays)." (the recommendation in `docs/UPGRADE_PROPOSALS.md` §1, the
+pass-59 proposal).
+
+**What was wrong.** The ambient was
+
+```glsl
+vec3 skyAmb  = skyBaseColor(sRdWorld);   // the sky along the VIEW ray
+vec3 ambient = mix(skyAmb * 0.35, skyAmb, hemi) * (0.55 + 0.45 * shadow);
+```
+
+Two defects, both visible:
+
+- **It followed the camera.** The sky was sampled along the pixel's view ray, so
+  the ambient on a given wall changed when the camera turned (worst at grazing
+  angles, where the ray's elevation swings most). A diffuse ambient term is
+  view-independent by definition - the rim keeps the view ray, the ambient must
+  not have it.
+- **It was not an occlusion term.** `(0.55 + 0.45 * shadow)` removes at most 45%
+  of a *sky* value, and a cave is `shadow = 0` everywhere, so a cave kept 55% of
+  a sky term. "There is practically no ambient light here" could never appear.
+  The coupling is also the wrong shape: the north face of a hill is `shadow = 0`
+  too, and it *is* sky-lit.
+
+**What shipped** (`resources/shaders/voxels.comp`, a new "Ambient sky
+visibility" block; `scene.ambient` in the scene UBO; on by default):
+
+- The dome term is sampled **at the hit normal**, `skyBaseColor(n)`, blended with
+  a dim warm ground bounce (`scene.skyLow * vec3(0.45, 0.40, 0.32)`) by the
+  existing hemispheric weight `hemi = n.y*0.5+0.5`. No view ray anywhere in it.
+- The sky is scaled by a per-pixel **sky visibility**:
+  - **B1 - the horizon scan**: 6 azimuths x 6 distances (1, 2, 4, 8, 16, 32
+    voxels) against the near region's per-column height atlas (binding 5, the
+    same `ColumnHeights` the marches read, resolved through `resolveColumn`).
+    Each azimuth's horizon is the *maximum* over its samples of
+    `tan = (columnTop - shadingPoint.y - 1) / d` - tan is monotonic in the
+    elevation, so the max is the highest horizon - and one `sqrt` turns it into
+    `sin`. The scan reports the SUM over azimuths of `1 - sin`.
+  - **2 SDF rays**: one up the normal (a cosine-weighted hemisphere carries most
+    of its energy overhead), one into the scan's worst azimuth *just above* the
+    horizon it reported. `visibility = (scanSum + ray1 + ray2) / 8` - one mean of
+    eight, so the rays carry 2/8 of the weight and a ray with nothing to hit
+    reports the sky it sees (from the bottom of a slot canyon the zenith really
+    is visible).
+  - The **bias of one voxel** in the horizon is what makes a flat plain read a
+    horizon of exactly 0: the atlas stores *highest solid + 1*, so a column flush
+    with the shading point still reads one voxel high, and without the bias a
+    flat field would lose ~55% of its sky in every azimuth.
+- A **floor** (`scene.ambient.y`, `--ambient-floor`, default 0.12) is added on
+  top, so a fully occluded point keeps a fraction of the sky it would have seen -
+  dark, not black.
+- The **rim** is sky light too, so it follows the same visibility (it used to be
+  the one unoccluded sky term, strongest exactly where a cave wall is seen at a
+  grazing angle).
+
+**Levers** (flags, pass-61 style; both are new and flag-only):
+
+- `--no-ambient` is the **control**: it selects the pre-62 formula verbatim
+  (`skyAmb = skyBaseColor(sRdWorld)`, the same `mix(...) * (0.55 + 0.45*shadow)`
+  and the same unoccluded rim), so the shipped picture can be compared against
+  the upgrade without a rebuild. `--ambient` restores the default (last one
+  wins).
+- `--ambient-floor <0..1>` sets the floor (clamped; `0` = black caves, `1` = a
+  flat fill for orientation).
+
+`scene.ambient.x` carries the switch, `scene.ambient.y` the floor (`< 0` = the
+shader's own default, so "unset" is spelled once). The uniform is filled in the
+renderer's per-frame `SceneUniform::update` from `vv::core::options()`; the tests
+pin the writer, the parser and the shader text (the pass-51 lesson).
+
+**Measured, on the real terrain** (the game's default `TerrainConfig`, seed 1337;
+`tests/ambient_mirror.hpp` is the CPU mirror, driven by a scratch probe over
+`topSolidVoxels` columns; the game's SDF box is 192x110x192, the probe uses
+96^3):
+
+| scene | 6-azimuth scan mean | sky visibility (scan + 2 rays) |
+| --- | --- | --- |
+| noon open field | 0.953 | 0.965 |
+| mountain ridge (highest) | 1.000 | 1.000 |
+| hillside, normal leans | 0.501 | 0.625 |
+| valley floor (lowest in a 512-voxel window) | 0.530 | 0.647 |
+| darkest surface point in a 321x321-voxel window | 0.093 | 0.320 |
+
+The shelters this world has (valleys, the lee of ridges, notches) lose a third to
+two thirds of their ambient; open ground and ridges keep all of it. The old
+formula could not express the difference: its dark end was 0.55 *everywhere*
+(`shadow = 0`), its bright end 1.0 - and both moved when the camera turned.
+
+**Finding: the shipped terrain has no caves, overhangs or tunnels.** Every column
+solid-below / air-above, checked with 1-voxel scans of `typeAt` and
+`topSolidVoxels` in six regions (56k+ columns total, plus a 17-voxel sweep over
++/-1200 voxels: 20,164 more) - zero air cells under a solid top. The "overhang
+warp" in the density model folds the *surface*; it does not put rock over air. So
+the two SDF rays escape in every scene above (they act as the zenith term), and
+"cave" acceptance cannot be judged on the current world: the darkest thing the
+terrain offers is the 0.093 notch in the table. The rays are still the
+3D-correct half of the design and the unit tests pin them on a synthetic cave
+under a live field (both rays meet the ceiling after the lift step, `t/32 = 0.156`
+each, the point reads 0.04 instead of 0.25) - if the terrain ever grows a roof,
+the term is already there.
+
+**Look change on the noon field, measured** (sunlit, up-facing surface; ambient
+plus the sun term, not ambient alone): red -21..-23%, green -13..-15%, blue
+-2..+5% depending on the view ray. The old ambient on the field was the
+*below-horizon* sky sampled through the camera (red ~0.75-0.78); the new value
+(0.504 / 0.694 / 1.064) is within a few percent of the cosine-weighted sky
+integral for an up-facing surface (0.51 / 0.67 / 0.97 + the horizon haze band) -
+i.e. the field got *more correct*, a little darker and less washed out. Shadowed
+open ground moves the other way, +23% in red, because it is sky-lit and always
+was: the old 0.55 cut was standing in for occlusion. `--no-ambient` restores the
+old numbers exactly if the owner prefers them.
+
+**Tests** (`testAmbientVisibility`, new; `tests/ambient_mirror.hpp`, new). The
+shader's text is pinned (every constant, both formulas, the scan, the two rays,
+the mean of eight, and - mechanically - that the pass-62 branch contains no
+`sRdWorld`, which is the 360-degree-turn acceptance criterion). The mirror is
+checked against exact hand-derived values: a flat plain is exactly 6.0 (every
+azimuth unobstructed) and one voxel up is too; a single spire at exactly the
+first azimuth's d = 1 cell gives 5 + (1 - 9.5/sqrt(1+9.5^2)); a roof 16 voxels up
+scans to 0.0021; a synthetic cave under a live 24^3 field is exactly
+`(6*scan + 2*(5/32)) / 8`; the floor defaults, clamps and its two ends. The
+command-line tests cover `--no-ambient`, `--ambient`, last-one-wins, the clamped
+floor values, the non-numeric and missing-value failures and the startup line.
+
+**Verified in the sandbox.** Release + debug configured and built warning-free,
+`ctest` 100% (1/1) on both; the standalone g++ suite is green; the shader
+compiles with `glslangValidator` and through the build's own step (release SPV
+md5 `fe1ca032e9ce4fe8a3ee90dbc36ff269`, debug `b999c61149cfebed7a62b0b628c5e71d`;
+`voxels.comp` itself `0e30ad219e400c63afc41cb3f4252167`). This box has no GPU or
+window, so the on-device look and the 360-degree-turn check belong to the owner.
+
+**Not done, deliberately.** The scan samples the near region only (binding 5, via
+`resolveColumn`); the far-LOD heights (binding 6) are not in it, because the near
+region is authoritative at 32 voxels and the far fields are camera-anchored - a
+scan that reached into them would pop as the region moves. The ambient *gain*
+(the overall level) is not a lever yet: `--ambient-floor` moves the cave end, and
+`--no-ambient` is the control. If the field reads too dark, the next pass adds
+`--ambient-gain` rather than re-tuning the shipped numbers.

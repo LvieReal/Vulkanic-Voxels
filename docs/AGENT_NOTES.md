@@ -86,6 +86,8 @@ this list; the startup log prints what is not at its default.
 | `--shadow-jitter <slope>` | cone slope of the per-pixel shadow-ray jitter; default `0.002` (the owner's on-device pick), `0` = off and bit-identical, clamped to 0.5; the contact floor is 10x the slope, capped at one voxel |
 | `--sdf-margin <chunks>` | how far the camera may drift before the SDF box rebuilds; default 1, `0` = every chunk crossing, clamped to the box coverage |
 | `--shadow-sharp` | force the exact binary shadows even with `--sdf-shadows` |
+| `--no-ambient` | the pre-pass-62 ambient: the sky sampled along the view ray, `mix(skyAmb*0.35, skyAmb, hemi) * (0.55 + 0.45*shadow)`. The control the pass-62 upgrade is judged against. `--ambient` (default) = the sky the surface sees |
+| `--ambient-floor <0..1>` | the minimum sky fraction a fully sheltered point keeps (default `0.12`, clamped; `0` = black caves, `1` = flat fill). Rides `scene.ambient.y`; `< 0` means "unset, use the shader default" |
 | `--far-lod` | opt into the coarse far-LOD terrain field (off by default) |
 | `--validation` | enable the Khronos validation layer (debug runs: `run_debug.bat --validation`) |
 | `--perf` | log frames over 25 ms, and each SDF bake's worker/render split |
@@ -145,14 +147,27 @@ session restore the toolchain is gone - rebuild it with
 `scripts/build-linux-toolchain.sh`, or use the recipe above, which needs nothing
 but `g++`.
 
-## Where the tree stands (pass 61)
+## Where the tree stands (pass 62)
 
 - Passes 39-58 are verified on-device. Pass 54 (one-voxel march step cap) and
   pass 55 (direction jitter) were rejected and are not in the tree; pass 56's
   origin-jitter mechanism and pass 57's distance-flat rule are the shipped
   shadow work, with the default at the owner's own pick (`--shadow-jitter
   0.002`).
-  Pass 59 (the shader rename) is the only one still waiting for its launch check.
+  Waiting for their on-device check: pass 59 (the shader rename), pass 61 (the
+  command line) and pass 62 (the ambient).
+- **Ambient (pass 62)**: on by default; `--no-ambient` is the pre-62 control, and
+  the ambient is view-independent - the pass-62 branch of the shader never reads
+  the view ray (a test pins that). Sky visibility = (6-azimuth horizon scan over
+  the near column heights + 2 SDF rays) / 8, plus `--ambient-floor`. The mirror
+  the tests march against is `tests/ambient_mirror.hpp` - change the shader and
+  the mirror together (the suite pins both).
+- **The shipped terrain has no caves, overhangs or tunnels** (measured, pass 62:
+  56k+ columns in six regions plus a 17-voxel sweep over +/-1200 voxels, zero air
+  cells under a solid top - the density warp folds the surface, it does not put
+  rock over air). "Cave" acceptance has to be judged on the darkest notch the
+  terrain has (scan mean 0.093), not on a roof; the SDF rays are the half of the
+  design that would matter if a roof ever exists.
 - SDF soft shadows remain an **experiment** behind `--sdf-shadows`. The exact
   binary sun march is the reference and must stay bit-identical.
 - The SDF bake runs on a background thread (~57 ms of worker time on the owner's
@@ -164,5 +179,5 @@ but `g++`.
 - **Switches are command-line flags since pass 61** (`--sdf-shadows`,
   `--shadow-jitter`, …); the `VV_*` variables remain as a fallback. See the
   table above.
-- Next feature work, proposed and not scheduled: the ambient-light upgrade and
-  the GPU SDF bake, both in `docs/UPGRADE_PROPOSALS.md`.
+- Next feature work, proposed and not scheduled: the GPU SDF bake
+  (`docs/UPGRADE_PROPOSALS.md` §2). The ambient proposal (§1) shipped as pass 62.
