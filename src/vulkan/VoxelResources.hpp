@@ -8,6 +8,7 @@
 
 #include "voxel/Chunk.hpp"
 #include "voxel/SdfHandover.hpp"  // kSdfHalves
+#include "voxel/SdfUniform.hpp"   // kSdfBoxUniformBytes
 #include "voxel/VoxelConfig.hpp"
 #include "voxel/VoxelTextures.hpp"
 
@@ -138,10 +139,13 @@ class VoxelResources final {
 	// (2*kSdfHalfChunks*chunkSizeX, worldHeight, 2*kSdfHalfChunks*chunkSizeZ).
 	static constexpr std::uint32_t kSdfHalfChunks = 3;  // box = 2*kSdfHalfChunks chunks
 	// The SDF box uniform (binding 13) is ivec4 box + uvec4 dims + uvec4
-	// seedBits (pass 50). ONE definition: the buffer, the descriptor range and
-	// writeSdfBox all have to agree, and a range shorter than the block makes
-	// the shader read outside it.
-	static constexpr std::uint32_t kSdfBoxUniformBytes = 3u * 16u;
+	// seedBits (pass 50). ONE definition, and since pass 51 that definition is
+	// the word layout in voxel/SdfUniform.hpp, which the writer and the tests
+	// both go through: the buffer, the descriptor range and writeSdfBox all
+	// have to agree, and a range shorter than the block makes the shader read
+	// outside it.
+	static constexpr std::uint32_t kSdfBoxUniformBytes =
+			vv::voxel::SdfBoxUniform::kBytes;
 	// Starts the copy of a complete SDF (the argmin seed per cell) into the
 	// buffer: staging fill + one transfer submit, and RETURNS WITHOUT WAITING
 	// (pass 42 - the wait used to be a frame hitch). The caller publishes the

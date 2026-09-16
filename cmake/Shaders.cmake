@@ -42,12 +42,23 @@ function(vv_enable_shader_pipeline target_name)
     add_custom_target(${target_name}_shaders ALL DEPENDS ${shader_spv_files})
     add_dependencies(${target_name} ${target_name}_shaders)
 
-    add_custom_command(
-        TARGET ${target_name} POST_BUILD
+    # Copying SPIR-V next to the executable is a build STEP, not a POST_BUILD
+    # side effect of linking. POST_BUILD only ran when the executable was
+    # relinked, so a shader-only rebuild (the glslang step does not touch the
+    # link) could leave the OLD .spv next to the binary while
+    # build/.../resources/shaders held the new one. The app loads the one next
+    # to itself (core/executableDir(), no version check), which is how a change
+    # to resources/shaders can silently not reach the running game - seen after
+    # pass 50, reproduced by touching a .comp and rebuilding: the copy stayed
+    # older than the compiled SPIR-V.
+    add_custom_target(${target_name}_shader_assets ALL
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${shader_runtime_dir}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${shader_spv_files} "${shader_runtime_dir}"
+        DEPENDS ${shader_spv_files}
         COMMENT "Copying SPIR-V shaders to runtime resources/shaders directory"
+        VERBATIM
     )
+    add_dependencies(${target_name} ${target_name}_shader_assets)
 
     set_property(TARGET ${target_name} PROPERTY VV_SHADER_SPV_FILES "${shader_spv_files}")
 endfunction()

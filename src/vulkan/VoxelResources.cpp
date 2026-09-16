@@ -1357,16 +1357,6 @@ void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
 	if (m_mappedSdfBox == nullptr) {
 		return;
 	}
-	std::uint32_t* w = static_cast<std::uint32_t*>(m_mappedSdfBox);
-	// Payload first, `box.w` (the active word the shader tests) LAST: a
-	// dispatch that samples this buffer mid-write must not see "active"
-	// next to an origin that is still the previous build's (pass 42).
-	w[0] = static_cast<std::uint32_t>(boxX);
-	w[1] = static_cast<std::uint32_t>(boxY);
-	w[2] = static_cast<std::uint32_t>(boxZ);
-	w[4] = active ? nx : 0u;
-	w[5] = active ? ny : 0u;
-	w[6] = active ? nz : 0u;
 	// dims.w = the base CELL OFFSET of the live half in the seed buffer (pass
 	// 49), not the half index: the halves are strided by the BUFFER's cell
 	// count, so a shorter (band-cropped) field copied into the spare half can
@@ -1376,11 +1366,23 @@ void VoxelResources::writeSdfBox(std::int32_t boxX, std::int32_t boxY,
 	// The seed indices are u32 in the shader and in the field's own encoding,
 	// so the bound is representable by construction (m_sdfCells is 4.7 M for
 	// the default world).
-	w[7] = active ? static_cast<std::uint32_t>(static_cast<std::uint64_t>(half) *
-															 m_sdfCells)
-								: 0u;
-	std::atomic_thread_fence(std::memory_order_release);
-	w[3] = active ? 1u : 0xFFFFFFFFu;  // box.w: 1 active, -1 inactive
+	const std::uint32_t baseCell = static_cast<std::uint32_t>(
+			static_cast<std::uint64_t>(half) * m_sdfCells);
+	// The whole 12-word block comes from the ONE layout struct (SdfBoxUniform),
+	// and storeSdfBoxUniform writes every word of it: payload first, `box.w`
+	// (the active word the shader tests) LAST behind a release fence, so a
+	// dispatch that samples this buffer mid-write cannot see "active" next to
+	// an origin that is still the previous build's (pass 42).
+	//
+	// Pass 51: pass 50 added seedBits to the block and to this signature but
+	// stored none of the three words, so the shader decoded every cell with
+	// zero masks - the field stopped occluding and the 3D shadows disappeared.
+	// Going through the layout struct is what makes "forgot a word" impossible:
+	// makeSdfBoxUniform assigns all twelve and the tests read all twelve.
+	vv::voxel::storeSdfBoxUniform(
+			vv::voxel::makeSdfBoxUniform(boxX, boxY, boxZ, nx, ny, nz, seedBitsX,
+																	 seedBitsY, seedBitsZ, active, baseCell),
+			static_cast<std::uint32_t*>(m_mappedSdfBox));
 }
 
 void VoxelResources::clearSdfBox() {

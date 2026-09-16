@@ -151,6 +151,14 @@ integer division is a long instruction sequence on a GPU, and the shader runs
 that decode up to 27 times per sphere-trace step, so it showed up as the
 hottest code in an Nsight capture. The decoded cell is identical - this is a
 pure arithmetic change, nothing about the field or the picture moves.
+The widths travel to the shader in the box uniform, written word-for-word
+through one layout definition (`vv::voxel::SdfBoxUniform`,
+`src/voxel/SdfUniform.hpp`) that the writer and the tests both go through, so a
+word of the block cannot go missing unnoticed (pass 51: pass 50 added the
+`seedBits` words and never stored them - zero masks, every gather degenerate,
+and the 3D shadows silently disappeared). Copying the compiled SPIR-V next to
+the executable is a build step as well, not a side effect of linking, so a
+shader-only rebuild always replaces the `.spv` the game actually loads.
 
 Two things keep the rebake cheap (pass 49). The box's empty sky is cropped: the
 build keeps the highest solid cell of its footprint plus 16 voxels of penumbra

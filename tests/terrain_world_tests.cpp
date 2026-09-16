@@ -29,6 +29,7 @@
 #include "voxel/SdfBox.hpp"
 #include "voxel/SdfField.hpp"
 #include "voxel/SdfHandover.hpp"
+#include "voxel/SdfUniform.hpp"
 #include "voxel/VoxelTextures.hpp"
 #include "voxel/VoxelTypes.hpp"
 #include "voxel/World.hpp"
@@ -2942,6 +2943,115 @@ void testSdfSeedEncoding() {
 							seeds, mismatches, double(insideW), double(besideW));
 }
 
+// The binding-13 uniform: the words the CPU writes and the shader reads
+// (pass 51). Pass 50 added seedBits to the block and to writeSdfBox's
+// signature but stored none of the three words, so the shader decoded every
+// cell with zero masks and the 3D shadows vanished - a pure CPU-side layout
+// bug that no device was needed to catch. This test walks the block word by
+// word through the SAME functions the renderer calls.
+void testSdfBoxUniform() {
+	using vv::voxel::makeSdfBoxUniform;
+	using vv::voxel::SdfBoxUniform;
+	using vv::voxel::storeSdfBoxUniform;
+
+	// std140: three vec4-sized members, 16 bytes each, and box.w is the word
+	// the shader tests first. The uniform buffer, the descriptor range
+	// (VulkanRenderer) and the tests all size themselves from these.
+	check(SdfBoxUniform::kWords == 12 && SdfBoxUniform::kBytes == 48u &&
+					SdfBoxUniform::kBytes == 3u * 16u && SdfBoxUniform::kActiveWord == 3u,
+			"sdf box uniform: ivec4 box + uvec4 dims + uvec4 seedBits = 48 bytes");
+
+	// The shipping box: 6x6 chunks x the banded height, 192x110x192 cells at
+	// 8+7+8 bits, live half 1 (the base cell offset dims.w carries).
+	const std::uint32_t nx = 192, ny = 110, nz = 192;
+	const std::uint32_t baseCell = 4055040u;  // 1 * the buffer's 4,055,040 cells
+	const SdfBoxUniform live = makeSdfBoxUniform(-96, 0, -96, nx, ny, nz, 8u, 7u,
+																							 8u, true, baseCell);
+	// Every word, in the offsets the shader reads: it is not enough that the
+	// values exist - they have to land in the mapped buffer.
+	check(live.words[0] == std::uint32_t(std::int32_t(-96)) &&
+					live.words[1] == 0u && live.words[2] == std::uint32_t(std::int32_t(-96)),
+			"sdf box uniform: box.xyz is the origin in world voxels");
+	check(live.words[3] == 1u, "sdf box uniform: box.w = 1 for a live field");
+	check(live.words[4] == nx && live.words[5] == ny && live.words[6] == nz,
+			"sdf box uniform: dims.xyz is the box size in cells");
+	check(live.words[7] == baseCell,
+			"sdf box uniform: dims.w is the live half's base cell offset");
+	check(live.words[8] == 8u && live.words[9] == 7u && live.words[10] == 8u,
+			"sdf box uniform: seedBits.xyz carries the packing widths");
+	check(live.words[11] == 0u,
+			"sdf box uniform: the block's tail padding stays zero");
+
+	// Stored into mapped memory through the renderer's own writer: poison the
+	// destination first, so a word the writer forgets (the pass-51 bug) is
+	// still 0xDEADBEEF here instead of the value the shader needs.
+	std::uint32_t mapped[SdfBoxUniform::kWords];
+	for (std::uint32_t& w : mapped) {
+		w = 0xDEADBEEFu;
+	}
+	storeSdfBoxUniform(live, mapped);
+	bool stored = true;
+	for (std::size_t i = 0; i < SdfBoxUniform::kWords; ++i) {
+		if (mapped[i] != live.words[i]) {
+			stored = false;
+		}
+	}
+	check(stored, "sdf box uniform: the writer stores every word of the block");
+	check(mapped[8] == 8u && mapped[9] == 7u && mapped[10] == 8u,
+			"sdf box uniform: the seed bits really reach mapped memory");
+
+	// An inactive box (before the first upload, or after a refused build):
+	// box.w = -1 so the shader's very first test falls through, and no
+	// geometry, base or bits that could resolve a stale cell.
+	const SdfBoxUniform idle =
+			makeSdfBoxUniform(-96, 0, -96, nx, ny, nz, 8u, 7u, 8u, false, baseCell);
+	check(idle.words[3] == 0xFFFFFFFFu,
+			"sdf box uniform: box.w = -1 when no field is live");
+	bool zeroed = true;
+	for (std::size_t i = 0; i < SdfBoxUniform::kWords; ++i) {
+		if (i != SdfBoxUniform::kActiveWord && idle.words[i] != 0u) {
+			zeroed = false;
+		}
+	}
+	check(zeroed, "sdf box uniform: an inactive box carries no geometry");
+
+	// End to end over the uniform: the words above drive the shader's decode,
+	// so a packed seed must come back as the cell it names - for a box whose
+	// spans are not powers of two (8+2+3 = 13 bits, decoded straight out of
+	// the stored block).
+	const int fx = 200, fy = 3, fz = 5;
+	vv::voxel::SdfField field;
+	field.build(fx, fy, fz, [](int x, int y, int z) {
+		return x == 199 && y == 2 && z == 3;
+	});
+	const vv::voxel::SdfField::SeedBits bits = field.seedBits();
+	const SdfBoxUniform odd = makeSdfBoxUniform(0, 0, 0, std::uint32_t(fx),
+																						 std::uint32_t(fy), std::uint32_t(fz), bits.x,
+																						 bits.y, bits.z, true, 0u);
+	storeSdfBoxUniform(odd, mapped);
+	const std::uint32_t maskX = (1u << mapped[8]) - 1u;
+	const std::uint32_t maskY = (1u << mapped[9]) - 1u;
+	const std::uint32_t shiftY = mapped[8];
+	const std::uint32_t shiftZ = mapped[8] + mapped[9];
+	std::size_t decoded = 0, mismatches = 0;
+	for (std::uint32_t v : field.seeds()) {
+		if (v == vv::voxel::kSdfEmptySeed) {
+			continue;
+		}
+		++decoded;
+		if ((v & maskX) != 199u || ((v >> shiftY) & maskY) != 2u ||
+				(v >> shiftZ) != 3u) {
+			++mismatches;
+		}
+	}
+	check(decoded > 0 && mismatches == 0,
+			"sdf box uniform: seeds decode through the uniform's own bits");
+	std::printf("sdf box uniform: %u words / %u bytes, %zu seeds decoded "
+							"through the stored bits\n",
+							unsigned(SdfBoxUniform::kWords), unsigned(SdfBoxUniform::kBytes),
+							decoded);
+}
+
 void testSdfBoxBuild() {
 	using vv::voxel::Chunk;
 	using vv::voxel::ChunkCoord;
@@ -3778,6 +3888,7 @@ int main() {
 	testSdfBoxBuild();
 	testSdfBoxBand();
 	testSdfSeedEncoding();
+	testSdfBoxUniform();
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();

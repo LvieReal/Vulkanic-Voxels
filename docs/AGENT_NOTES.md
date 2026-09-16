@@ -1394,3 +1394,103 @@ division sequences *per fetched seed*.
   -V` exit 0, `VV_PLATFORM=null` smoke unchanged (exit 1).
 - NOT PROVEN HERE: the actual frame-time win (no GPU in the sandbox) - the
   owner's Nsight run on the same scene is the measurement that counts.
+
+## Pass 51: the seed bits never reached the shader (the uniform writer)
+
+Owner report, right after pass 50: "sdf (3d) shadows disappeared right after this
+change", with his own guess attached - "i bet it's something to do with
+shader/uniforms". His logs said the same thing about everything else: the bakes
+were normal (192 x 110 x 192 and 192 x 107 x 192, ~15 MB of seeds, band + build
+on the worker, snapshot + upload on the render thread). So the field was built,
+seeded, packed and uploaded exactly as pass 50 intended, and the GPU still
+resolved nothing.
+
+He was right about the uniforms, in the most literal way: `writeSdfBox` took the
+three new `seedBits` arguments (pass 50 added them to the signature, to the call
+site, to the 48-byte block and to the descriptor range) but never STORED them.
+The block's 12 words are only ever touched by this one writer and the buffer is
+`memset` to zero when it is created, so words 8..10 - `uvec4 seedBits.xyz` - read
+as `(0,0,0)` on the GPU for the entire run. The shader then computed
+
+```glsl
+uint seedMaskX = (1u << sdfBox.seedBits.x) - 1u;   // (1u << 0) - 1 == 0
+uint seedMaskY = (1u << sdfBox.seedBits.y) - 1u;   // 0
+uint seedShiftZ = sdfBox.seedBits.x + sdfBox.seedBits.y;  // 0
+```
+
+so every 3x3x3 gather decoded to the same degenerate voxel `(0, 0, s)` instead of
+the cell the seed names: `sdfCubeDistance` returned "far away" for essentially
+every query, the field stopped occluding, and the SDF contribution went to
+visibility 1.0 - no shadows, no artifacts, no error, exactly the report.
+
+### How it was found
+
+- A CPU probe (`/tmp/probe_seed_decode.cpp`, not committed: it builds the
+  shipping banded 192 x 110 x 192 field with the real CPU code, then runs the
+  shader's `sampleSdf3d` + the shadow march over 3481 upward rays from the
+  terrain surface) first ruled out the field itself: with the pass-50 decode the
+  packed seeds give 12.5% of rays blocked and mean visibility 0.695; the
+  pass-49 pair (linear index decode over a linear-index field) is bit-identical,
+  and the old divisions applied to the new packed seeds see nothing (0.0%,
+  1.000). Encoder and decoder agreed - which meant the shader was not reading
+  what the probe was reading.
+- Reading `writeSdfBox` next to the block declaration is where it shows: the
+  function stored words 0..7 and the active word, and the block declares three
+  more. Adding the missing leg to the probe - the shader's own arithmetic, but
+  with the masks read out of the block's stored words - reproduces the owner's
+  picture: `ZEROBITS (as shipped) 0.0% blocked, mean visibility 1.000`.
+
+### What changed
+
+- `src/voxel/SdfUniform.hpp` (new): the binding-13 block as a word-for-word
+  layout definition - `SdfBoxUniform` (`kWords = 12`, `kBytes = 48`, box.w is
+  `kActiveWord`), `makeSdfBoxUniform()` (assigns all twelve words; an inactive
+  box is the zero block with box.w = -1, the shader's first test) and
+  `storeSdfBoxUniform()` (payload first, box.w LAST behind the release fence -
+  the pass-42 ordering rule now lives inside the writer instead of being
+  restated at the call site). It is pure C++ - no Vulkan, no device - so the
+  test suite can walk it.
+- `VoxelResources::writeSdfBox` is now a call to those two functions, and
+  `kSdfBoxUniformBytes` is `SdfBoxUniform::kBytes`: the buffer size, the
+  descriptor range and the writer all come from the one layout. A word can only
+  go missing now if `makeSdfBoxUniform` does not assign it, and the tests read
+  all twelve.
+
+### Verification
+
+- `testSdfBoxUniform` (new): the block is 12 words / 48 bytes / 3 x 16 with
+  box.w at word 3; the shipping box's words carry the origin, dims, the live
+  half's base cell offset and the 8/7/8 bit widths, with the tail padding zero;
+  the writer's own store path fills all twelve words (the destination is
+  poisoned with 0xDEADBEEF first, so a forgotten word stays visible); the
+  inactive block is zero except box.w = -1; and 3000 seeds of a 200 x 3 x 5
+  field decode through the bits READ BACK OUT OF THE STORED WORDS.
+- Mutation check of that test: making `storeSdfBoxUniform` skip words 8..10 (the
+  pass-51 bug itself) fails 3 checks; assigning zero to words[8] fails 3;
+  restored, the suite is green again.
+- CPU probe, five decoders over the same shipping field and rays: NEW (pass 50)
+  12.5% blocked / 0.695 mean visibility, ZEROBITS (as shipped) 0.0% / 1.000,
+  UNIFORM (pass 51 - masks read out of the block the fixed writer stores)
+  12.5% / 0.695, i.e. bit-identical to what pass 50 intended. The old divisions
+  over the new packed bytes stay blind (0.0% / 1.000), which is what a stale
+  `pixels_rgba.comp.spv` would also look like - see the next paragraph.
+- Release + debug warning-free, `ctest` green (4.7 s / 22.6 s),
+  `glslangValidator -V` exit 0.
+
+### The other way a shader change can fail to reach the game
+
+Pass 50 changed the shader AND the CPU, so the executable relinked and the
+POST_BUILD copy of the SPIR-V ran with it - but that is luck, not a rule:
+`cmake/Shaders.cmake` copied `*.spv` next to the binary only as a POST_BUILD
+step of the game target, which runs when the target LINKS. A shader-only rebuild
+(the glslang step does not touch the link) left `build/.../resources/shaders`
+newer than the `bin/resources/shaders` copy the renderer loads
+(`VulkanRenderer::createComputePipeline` -> `core::executableDir()`, no version
+check anywhere), so the game would keep rendering with the old shader while the
+source said otherwise. Reproduced by mtime (compiled 06:53:15, runtime copy still
+06:40:45), then made a build step: `${target_name}_shader_assets` is an
+always-run custom target that copies `*.spv` into `$<TARGET_FILE_DIR>`, with the
+shader compile as its dependency, and the game target depends on it. Verified
+with a real shader change and no C++ change: `[2/3] Copying SPIR-V shaders...`
+with no link step in the log, the exe's mtime untouched and both copies back in
+sync - the case that used to silently keep the old shader.
