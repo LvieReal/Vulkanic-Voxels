@@ -1061,10 +1061,11 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
 //
 //   * the dome is sampled AT THE NORMAL (view-independent by construction),
 //     blended with a dim ground bounce by the same hemispheric weight,
-//   * a horizon scan over the column heights - 6 azimuths x 6 distances -
-//     finds how much of the horizontal sky is blocked. This is what makes a
-//     cave dark: a roof is the HIGHEST SOLID of the columns around the point,
-//     so it enters the scan as an extremely high horizon at short distance,
+//   * a horizon scan over the column heights - 6 azimuths x 5 distances
+//     (2..32 voxels), read BILINEARLY - finds how much of the horizontal sky
+//     is blocked. This is what makes a cave dark: a roof is the HIGHEST SOLID
+//     of the columns around the point, so it enters the scan as an extremely
+//     high horizon at short distance,
 //   * two short rays through the 3D SDF (when a field is live) resolve what a
 //     2.5D column scan cannot: the overhang/arch above the point (the 6
 //     azimuths miss a roof that only hangs over the sample), and the
@@ -1088,16 +1089,37 @@ float sunRayEscapesSdf(vec3 origin, vec3 sunV, float startT,
 // 3D-correct half for terrain that does grow a roof; the unit tests pin both,
 // with a synthetic cave under a live field.
 //
-// Cost, honestly: the scan is 36 column resolves (one chunk-table fetch + one
-// packed u16 height fetch each, both from buffers the marches already read),
-// and the two SDF rays are coarse marches (step max(1.5h, 4 voxels) over 32
-// voxels, <= 8 samples each, ~8 gathers per sample) - roughly one extra shadow
-// ray's worth of work per shaded pixel, paid once per pixel instead of per ray.
-// scene.ambient.x = 0 restores the pre-62 formula verbatim (--no-ambient).
+// Pass 63, the moire. Sampling the atlas at the NEAREST column made the term a
+// step function of position: at distance, where one pixel covers several
+// voxels of ground, a sub-voxel camera move flips the sampled texel and the
+// horizon estimate jumps with it. Measured on a long shaded view (the ambient
+// term alone, the dark half of the frame, a 0.05-voxel camera move): 3.5% of
+// the value moved per frame - the sparkling/wavy pattern the owner reported.
+// The pre-62 formula measured 0.9% on the same pixels, so this was a
+// regression the pass introduced, not a pre-existing property.
+//
+// The fix, two parts: read the atlas BILINEARLY (4 taps, each a chunk-table
+// fetch + a packed u16 fetch from buffers the marches already read), and drop
+// the d = 1 sample - at one voxel, interpolation across a vertical wall is at
+// its least valid and the sample contributes the largest jumps. 30 bilinear
+// samples per pixel, and the same measurement drops to 0.4%, below the old
+// formula's 0.9%, while the level barely moves. (A continuous-max
+// accumulation and 8 azimuths were both measured and rejected: no gain and a
+// real look change respectively.)
+//
+// The two SDF rays are coarse marches (step max(1.5h, 4 voxels) over 32
+// voxels, <= 8 samples each, ~8 gathers per sample) - together with the scan,
+// roughly two shadow rays' worth of work per shaded pixel, paid once per
+// pixel instead of per ray. scene.ambient.x = 0 restores the pre-62 formula
+// verbatim (--no-ambient).
 const int kAmbientAzimuths = 6;
-const int kAmbientDistances = 6;
+const int kAmbientDistances = 5;
+// The ladder starts at 2 voxels, not 1 (pass 63): at d = 1 the sample sits on
+// the neighbour column and the bilinear tap spans a vertical wall, so the
+// horizon it reports is dominated by interpolation error - and it is the
+// sample that moves most for a sub-voxel camera step.
 const float kAmbientDistancesVox[kAmbientDistances] =
-    float[6](1.0, 2.0, 4.0, 8.0, 16.0, 32.0);
+    float[5](2.0, 4.0, 8.0, 16.0, 32.0);
 // The height atlas stores "highest solid + 1" per column, so a column flush
 // with the surface still reads one voxel high; subtracting it is what makes a
 // flat plain report a horizon of exactly 0 instead of a spurious 0.5/1 voxel
@@ -1127,6 +1149,60 @@ float ambientFloor()
     return (scene.ambient.y >= 0.0) ? scene.ambient.y : kAmbientFloorDefault;
 }
 
+// Bilinear read of the height atlas at one world column position, in voxels
+// (the column CENTRE convention: integer + 0.5 sits on a column, integers sit
+// on the boundary between two). Returns the "highest solid + 1" height, or a
+// negative value when no corner of the tap could be resolved (outside the
+// loaded region or in an empty slot) - the caller then has no obstruction
+// information for that sample, exactly like the marches treating it as open
+// sky. Partially loaded taps are renormalized over the corners that exist, so
+// a sample near the region edge fades in instead of stepping.
+float ambientColumnTop(vec2 column)
+{
+    const ivec2 cell = ivec2(floor(column - 0.5));  // the tap's low corner
+    const vec2 t = clamp(column - vec2(cell) - 0.5, 0.0, 1.0);
+    // Fast path: all four corners inside one chunk (the common case, and the
+    // reason this stays one chunk-table fetch per sample) - resolve the low
+    // corner once and read the other three from the same slot. The corner at
+    // +1 belongs to the NEXT chunk when the low corner is the chunk's last
+    // column, so that case falls through to the per-corner path below.
+    uint baseSlot = 0u;
+    ivec2 baseLocal = ivec2(0);
+    if (resolveColumn(cell.x, cell.y, baseSlot, baseLocal) &&
+        baseLocal.x + 1 < int(pc.chunkSize.x) &&
+        baseLocal.y + 1 < int(pc.chunkSize.z)) {
+        const float h00 = float(columnHeightAt(baseSlot, baseLocal));
+        const float h10 = float(columnHeightAt(baseSlot, baseLocal + ivec2(1, 0)));
+        const float h01 = float(columnHeightAt(baseSlot, baseLocal + ivec2(0, 1)));
+        const float h11 = float(columnHeightAt(baseSlot, baseLocal + ivec2(1, 1)));
+        const float a = h00 + (h10 - h00) * t.x;
+        const float b = h01 + (h11 - h01) * t.x;
+        return a + (b - a) * t.y;
+    }
+    // Chunk boundary or unloaded neighbourhood: resolve each corner it can and
+    // renormalize over the ones that exist, so a sample near the region edge
+    // fades in instead of stepping. No corner at all = no information (-1).
+    float total = 0.0;
+    float weight = 0.0;
+    for (int dz = 0; dz <= 1; ++dz) {
+        for (int dx = 0; dx <= 1; ++dx) {
+            uint slot = 0u;
+            ivec2 local = ivec2(0);
+            if (!resolveColumn(cell.x + dx, cell.y + dz, slot, local)) {
+                continue;
+            }
+            const float w = ((dx == 0) ? 1.0 - t.x : t.x) *
+                            ((dz == 0) ? 1.0 - t.y : t.y);
+            total += float(columnHeightAt(slot, local)) * w;
+            weight += w;
+        }
+    }
+    if (weight <= 0.0) {
+        return -1.0;
+    }
+    return total / weight;
+}
+
 // Sky visibility from the height field alone: the SUM over the six azimuths of
 // (1 - sin(horizon elevation)) - the caller adds the two SDF rays and divides
 // by 8, so these are six of its eight terms - plus the worst azimuth (the
@@ -1148,13 +1224,10 @@ float ambientHorizonVisibility(vec3 p, out float worstAzimuth, out float worstSi
         float tMax = 0.0;
         for (int i = 0; i < kAmbientDistances; ++i) {
             const float d = kAmbientDistancesVox[i];
-            const ivec2 cell = ivec2(floor(p.xz + dirXZ * d));
-            uint slot = 0u;
-            ivec2 local = ivec2(0);
-            if (!resolveColumn(cell.x, cell.y, slot, local)) {
+            const float top = ambientColumnTop(p.xz + dirXZ * d);
+            if (top < 0.0) {
                 continue;  // unloaded / outside the region: no obstruction
             }
-            const float top = float(columnHeightAt(slot, local));
             tMax = max(tMax, max(top - p.y - kAmbientHorizonBias, 0.0) / d);
         }
         const float sinTheta = tMax / sqrt(1.0 + tMax * tMax);

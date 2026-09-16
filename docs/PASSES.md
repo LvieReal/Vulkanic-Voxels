@@ -2353,3 +2353,105 @@ scan that reached into them would pop as the region moves. The ambient *gain*
 (the overall level) is not a lever yet: `--ambient-floor` moves the cave end, and
 `--no-ambient` is the control. If the field reads too dark, the next pass adds
 `--ambient-gain` rather than re-tuning the shipped numbers.
+
+## Pass 63: the ambient's atlas reads are interpolated (they were nearest)
+
+OWNER, on pass 62, three days of looking: "i'm seeing something weird from
+distance now, looks like moire patterns, specifically in darkened areas. i also
+see that occupancy check (sky visibility?) is just straight down, which does not
+make sense for current sun angle."
+
+**The first half is a real regression, and it was measured, not guessed.** The
+horizon scan read the height atlas at the NEAREST column. That makes the sky
+visibility a step function of position: at distance, where one pixel covers
+several voxels of ground, a sub-voxel camera move flips which column the sample
+lands on and the horizon estimate jumps with it. The eye reads the per-frame
+flip as sparkle/waves over the shaded ground - "moire in darkened areas".
+
+How it was pinned down, since the sandbox has no GPU: a small CPU renderer
+(`probes/probe_ambient_crawl.cpp`, committed this pass - `--shimmer` prints the
+table below) that marches the real terrain with a voxel DDA, does
+the binary sun march, and shades with the shader's own terms - sky ambient (old
+formula against pass 62's), direct sun, rim, and the shader's interpolated
+per-vertex voxel AO. It renders the same view twice, 0.05 voxel apart, and
+reports the mean absolute difference in the dark half of the frame - the
+signature the eye reads as crawl:
+
+| variant (ambient term alone, dark half of the frame) | crawl per 0.05-voxel move |
+| --- | --- |
+| pre-62 view-ray formula | 0.9% |
+| pass 62 as shipped (nearest sampling) | **3.5%** |
+| bilinear atlas reads | 0.5% |
+| bilinear + the d = 1 sample dropped | **0.4%** |
+
+The difference images (two frames, amplified 8x) show the same thing: nearest
+sampling lights up the whole shaded slope and the terrain silhouette, bilinear
+is nearly black - the structure that moved is gone. Two other candidates were
+measured and **not** taken: a continuous-max accumulation (0.5%, no gain over
+plain bilinear) and 8 azimuths + a wider ladder (0.2%, but it lifts the levels
+measurably - a look change, not a sampling fix).
+
+**What shipped** (`resources/shaders/voxels.comp`):
+
+- `ambientColumnTop(vec2)` reads the atlas bilinearly: the tap's low corner,
+  four height fetches, and the standard lerp. The ladder now starts at **d = 2
+  voxels** (1, 2, 4, 8, 16, 32 -> 2, 4, 8, 16, 32): at d = 1 the tap sits on the
+  neighbouring column and interpolation spans a vertical wall, where it is least
+  valid and moves most for a sub-voxel camera step. 30 bilinear samples per
+  pixel instead of 36 nearest ones.
+- **Same-chunk fast path**: resolve the low corner once and read the other three
+  from that slot when the tap does not cross a chunk boundary (the common case),
+  so this stays *one* chunk-table fetch per sample - cheaper than pass 62's 36
+  individual resolves. At a chunk or region edge it falls back to per-corner
+  resolves and renormalizes over the corners that exist, so the region edge
+  fades in instead of stepping; no corner at all = no obstruction information
+  (the same failure semantic as before).
+- The mirrored CPU reference (`tests/ambient_mirror.hpp`) mirrors the bilinear
+  read and the sentinel, and the tests pin the shader's text.
+
+**Look neutrality** (the same scenes as the pass-62 report, the real terrain,
+scratch scene probe; p62 sampling against p63):
+
+| scene | scan mean p62 -> p63 | sky visibility p62 -> p63 |
+| --- | --- | --- |
+| noon open field | 0.953 -> 0.955 | 0.965 -> 0.966 |
+| valley floor | 0.530 -> 0.514 | 0.647 -> 0.636 |
+| mountain ridge | 1.000 -> 1.000 | 1.000 -> 1.000 |
+| hillside | 0.501 -> 0.501 | 0.625 -> 0.626 |
+| darkest surface point | 0.164 -> 0.119 | 0.373 -> 0.339 |
+
+A sampling fix, not a look pass: the open field and the ridge are unchanged to
+three decimals, and the only visible movement is at the darkest notch, which
+gets a little darker (bilinear averages across the cliff that shelters it).
+
+**Tests** (`testAmbientVisibility`, extended): the table is 6 x 5 now and the
+pin follows; the spire's expected value is `5 + (1 - sin(9.5/2))` (the first
+sample sits at d = 2); the flat-plain/one-voxel-below checks are exact against
+the ladder's first distance; the cave case's ceiling horizon is `(24 - 5.5 - 1)
+/ 2`; a fully unresolved neighbourhood reports open sky. New for this pass:
+`columnTopBilinear` interpolates (halfway between a 61 column and a 67 one reads
+64), reproduces the column exactly at its centre, renormalizes a partially
+loaded tap, reports the sentinel when nothing resolves - and a **continuity
+walk**: stepping across a column boundary in 0.02-voxel steps must never move
+the visibility by more than 0.05 (nearest sampling jumped by the whole horizon
+term), with the plateau-at-the-foot and out-of-reach checks proving the
+threshold is not vacuous. The shader pin covers `ambientColumnTop`, both of its
+paths and the new ladder.
+
+**The second half of the report - "occupancy check is just straight down" - is
+not the ambient, and it is not new.** The pass-62 sky-visibility term reads the
+2.5D height atlas in a 6-azimuth horizon scan plus two SDF rays (up the normal,
+and above the worst horizon). It has no notion of the sun's azimuth and never
+did: it is *sky visibility*, not shadowing, and it is supposed to be
+sun-independent - the sun's own term is the `ndl * shadow` product next to it,
+which is the one that follows `lightDir = normalize(0.5, 1, 0.5)` (up and to the
++ x/+ z side, so shadows fall against -x/-z). With the shipped terrain measured
+to have no roofs or overhangs (pass 62), the term is sky-openness-over-the-
+horizon; on a flat noon field it sits at ~0.96 and cannot lock to the sun. If a
+surface still looks "lit from the wrong side" after this pass, the thing to
+compare is `--no-ambient`: if the pattern survives that, the ambient is not
+producing it.
+
+**Verified in the sandbox.** Release + debug configured and built warning-free,
+`ctest` 100% (1/1) on both; the standalone g++ suite green; the shader compiles
+through the build's own step. No GPU here, so the on-device look is the owner's.

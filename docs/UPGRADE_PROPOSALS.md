@@ -8,7 +8,8 @@ the C++ tree as of `7063297`.
 
 ---
 
-> **Status: shipped as pass 62** (see `docs/PASSES.md`). Implemented as
+> **Status: shipped as passes 62-63** (see `docs/PASSES.md`; 63 is the sampling
+> fix for the distance shimmer the nearest-column read produced). Implemented as
 > recommended below (B1 + 2 SDF rays) with three additions found while building
 > it: the silhouette ray aims just *above* the horizon the scan reported (aimed
 > at it the ray grazes the caster and escapes), the scan reads the near region's

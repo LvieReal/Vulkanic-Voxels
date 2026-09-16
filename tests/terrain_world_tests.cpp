@@ -4951,26 +4951,42 @@ void testCommandLine() {
 // hand-derived values, the SDF rays on a real field, and the floor.
 
 namespace {
-constexpr float kTestTop = 61.0f;  // flat terrain: highest solid 60, +1
+constexpr float kTestTop = 61.0f;         // flat terrain: highest solid 60, +1
+constexpr float kTestUnresolved = -1.0f;  // the shader's "no corner resolved"
 
-std::uint32_t flatColumnTop(int, int, void*) { return 61u; }
+float flatColumnTop(int, int, void*) { return kTestTop; }
 
-// The tall column at cell (1, 0) only: with the sample at (0.5, y, 0.5), that
-// is exactly where the FIRST azimuth (a = 0, d = 1) lands, and no other
-// azimuth/distance pair of the scan reaches it - so exactly one of the six
-// azimuths reports a horizon and the expected mean is exact.
-std::uint32_t singleSpire(int x, int z, void*) {
-	return (x == 1 && z == 0) ? 71u : 61u;
+// The tall column at cell (2, 0) only: with the sample at (0.5, y, 0.5) that is
+// exactly where the FIRST azimuth (a = 0) and its FIRST distance (d = 2) land,
+// and no other azimuth/distance pair of the scan reaches it - so exactly one of
+// the six azimuths reports a horizon and the expected sum is exact.
+float singleSpire(int x, int z, void*) {
+	return (x == 2 && z == 0) ? 71.0f : kTestTop;
 }
 
 // The roof of a cave: the highest solid is 16 voxels above the sample, so all
 // six azimuths report the same horizon (the ceiling's own column).
-std::uint32_t caveRoof(int, int, void*) { return 77u; }
+float caveRoof(int, int, void*) { return 77.0f; }
 
-std::uint32_t allAir(int, int, void*) { return 0u; }
+// Every column 6 voxels above the flat terrain: the immediate step the near
+// samples see.
+float steppedPlateau(int x, int, void*) {
+	return (x >= 4) ? kTestTop + 6.0f : kTestTop;
+}
+
+float allAir(int, int, void*) { return 0.0f; }
+
+float allUnresolved(int, int, void*) { return kTestUnresolved; }
+
+// A partially loaded neighbourhood: the two corners at x = 4 and beyond are
+// unresolved, the rest is the flat top - the shader renormalizes over what is
+// left instead of treating the sample as open sky.
+float flatThenUnloaded(int x, int, void*) {
+	return (x >= 4) ? kTestUnresolved : kTestTop;
+}
 
 // Matches an open SDF field whose solid slab ends at y = 6 (highest solid 5).
-std::uint32_t openGroundTop(int, int, void*) { return 6u; }
+float openGroundTop(int, int, void*) { return 6.0f; }
 } // namespace
 
 void testAmbientVisibility() {
@@ -4998,8 +5014,8 @@ void testAmbientVisibility() {
 			};
 			// The constants, spelled the way the mirror spells them.
 			check(has("const int kAmbientAzimuths = 6;") &&
-					has("const int kAmbientDistances = 6;") &&
-					has("float[6](1.0, 2.0, 4.0, 8.0, 16.0, 32.0)") &&
+					has("const int kAmbientDistances = 5;") &&
+					has("float[5](2.0, 4.0, 8.0, 16.0, 32.0)") &&
 					has("const float kAmbientHorizonBias = 1.0;") &&
 					has("const float kAmbientSdfRange = 32.0;") &&
 					has("const float kAmbientSdfLift = 1.0;") &&
@@ -5012,13 +5028,26 @@ void testAmbientVisibility() {
 				"ambient: the shader constants match the mirror");
 			check(has("const vec3 kAmbientGroundTint = vec3(0.45, 0.40, 0.32);"),
 				"ambient: the ground bounce tint is what the mirror mirrors");
-			// The scan: the height atlas, the exact sine, the mean.
-			check(has("resolveColumn(cell.x, cell.y, slot, local)") &&
+			// The scan: the height atlas, read BILINEARLY (pass 63 - sampled at
+			// the nearest column the estimate was a step function of position
+			// and crawled at distance), the exact sine, the sum.
+			check(has("float ambientColumnTop(vec2 column)") &&
+					has("const ivec2 cell = ivec2(floor(column - 0.5));") &&
+					// the same-chunk fast path: one resolve, four height reads
+					has("resolveColumn(cell.x, cell.y, baseSlot, baseLocal)") &&
+					has("baseLocal.x + 1 < int(pc.chunkSize.x)") &&
+					has("baseLocal.y + 1 < int(pc.chunkSize.z)") &&
+					has("columnHeightAt(baseSlot, baseLocal + ivec2(1, 1))") &&
+					// ... and the renormalizing fallback at chunk/region edges
+					has("resolveColumn(cell.x + dx, cell.y + dz, slot, local)") &&
 					has("columnHeightAt(slot, local)") &&
+					has("return total / weight;") &&
+					has("const float top = ambientColumnTop(p.xz + dirXZ * d);") &&
 					has("max(top - p.y - kAmbientHorizonBias, 0.0) / d") &&
 					has("const float sinTheta = tMax / sqrt(1.0 + tMax * tMax);") &&
 					has("total += 1.0 - sinTheta;"),
-				"ambient: the horizon scan is the height atlas, exact sine, mean");
+				"ambient: the horizon scan reads the height atlas bilinearly, exact "
+				"sine, sum");
 			// The two SDF rays and the mean of eight.
 			check(has("float ambientSdfRay(vec3 p, vec3 dir)") &&
 					has("if (scene.misc.w <= 0.5 || sdfBox.box.w < 0)") &&
@@ -5146,22 +5175,32 @@ void testAmbientVisibility() {
 		check(horizonVisibility(8.5f, 61.5f, 8.5f, flatColumnTop, nullptr,
 						nullptr, nullptr) == static_cast<float>(kAmbientAzimuths),
 			"ambient: one voxel of terrain quantisation does not darken the sky");
+		const float stepTan =
+			(kTestTop - 59.5f - kAmbientHorizonBias) /
+			vv::ambient::kAmbientDistancesVox[0];
 		const float oneBelow = horizonVisibility(8.5f, 59.5f, 8.5f, flatColumnTop,
 			nullptr, nullptr, nullptr);
-		check(oneBelow < 6.0f * 0.7f,
-			"ambient: ... while a sample below the flat top does see the step");
+		check(std::fabs(oneBelow -
+						static_cast<float>(kAmbientAzimuths) *
+							(1.0f - stepTan / std::sqrt(1.0f + stepTan * stepTan))) < 1e-5f,
+			"ambient: ... while a sample below the flat top sees the step at the "
+			"nearest ladder distance");
 
 		// All-air columns (nothing loaded): no obstruction either.
 		check(horizonVisibility(8.5f, 60.5f, 8.5f, allAir, nullptr, nullptr,
 						nullptr) == static_cast<float>(kAmbientAzimuths),
 			"ambient: unloaded columns are open sky, not a wall");
+		// ... and a neighbourhood where NOTHING resolves is the same thing.
+		check(horizonVisibility(8.5f, 60.5f, 8.5f, allUnresolved, nullptr, nullptr,
+						nullptr) == static_cast<float>(kAmbientAzimuths),
+			"ambient: a fully unresolved neighbourhood reports open sky");
 
-		// One 9.5-voxel-high column at cell (1, 0), i.e. exactly the first
-		// azimuth's d = 1 sample: tan = 9.5, sin = 9.5 / sqrt(1 + 9.5^2), so
-		// that azimuth reports 1 - sin and the other five report 1.
+		// One 9.5-voxel-high column at cell (2, 0), i.e. exactly the first
+		// azimuth's first sample (d = 2): tan = 9.5 / 2, sin = tan/sqrt(1+tan^2),
+		// so that azimuth reports 1 - sin and the other five report 1.
 		const float spire = horizonVisibility(0.5f, 60.5f, 0.5f, singleSpire,
 			nullptr, nullptr, nullptr);
-		const float spireTan = 71.0f - 60.5f - kAmbientHorizonBias;
+		const float spireTan = (71.0f - 60.5f - kAmbientHorizonBias) / 2.0f;
 		const float spireExpected =
 			5.0f + (1.0f - spireTan / std::sqrt(1.0f + spireTan * spireTan));
 		check(std::fabs(spire - spireExpected) < 1e-6f,
@@ -5180,6 +5219,59 @@ void testAmbientVisibility() {
 			horizonVisibility(0.5f, 20.5f, 0.5f, caveRoof, nullptr, nullptr, nullptr);
 		check(higherRoof <= caveScan,
 			"ambient: a sample further below the ceiling is never brighter");
+	}
+
+	// --- pass 63: the sampling is continuous ---------------------------------
+	{
+		// The bilinear read itself: halfway between a column whose top is 61 and
+		// one whose top is 67, the read is the average - not either column.
+		check(std::fabs(vv::ambient::columnTopBilinear(4.0f, 0.5f, steppedPlateau,
+																									 nullptr) -
+										64.0f) < 1e-5f,
+			"ambient: the height read interpolates between columns (4 vs 67 -> 64)");
+		// On a column centre it is exactly that column's height.
+		check(std::fabs(vv::ambient::columnTopBilinear(3.5f, 0.5f, steppedPlateau,
+																									 nullptr) -
+										61.0f) < 1e-6f &&
+					std::fabs(vv::ambient::columnTopBilinear(4.5f, 0.5f,
+																									 steppedPlateau, nullptr) -
+										67.0f) < 1e-6f,
+			"ambient: ... and reproduces the column exactly at its centre");
+		// A partially resolved tap renormalizes over the corners that exist: at
+		// x = 3.5 (unresolved from x = 4 on) the read is the resolved average.
+		const float partial = vv::ambient::columnTopBilinear(3.5f, 0.5f,
+																											 flatThenUnloaded, nullptr);
+		check(std::fabs(partial - kTestTop) < 1e-6f,
+			"ambient: a partially loaded tap averages over its resolved corners");
+		check(vv::ambient::columnTopBilinear(4.5f, 0.5f, flatThenUnloaded, nullptr) <
+					0.0f,
+			"ambient: a fully unresolved tap reports the sentinel");
+		// The property the pass exists for: the estimate is CONTINUOUS in the
+		// surface position. A step function (the pre-63 nearest sampling) jumps
+		// by the whole horizon term at a column boundary; this walks across one
+		// and requires every step to stay small.
+		float maxStep = 0.0f;
+		float previous = horizonVisibility(3.5f, 60.5f, 0.5f, steppedPlateau,
+																			 nullptr, nullptr, nullptr);
+		for (float x = 3.52f; x <= 4.5f; x += 0.02f) {
+			const float value = horizonVisibility(x, 60.5f, 0.5f, steppedPlateau,
+																					 nullptr, nullptr, nullptr);
+			maxStep = std::max(maxStep, std::fabs(value - previous));
+			previous = value;
+		}
+		check(maxStep < 0.05f,
+			"ambient: the visibility is continuous across a column boundary "
+			"(the pass-63 fix; nearest sampling jumped by the whole term)");
+		// The threshold above is not vacuous: the plateau really is what the
+		// walk sees. At the foot (x = 3.5) the +x samples reach it, so the sum
+		// drops well below a full six; 40 voxels away the ladder (32) no longer
+		// reaches it, and the plain is exactly unobstructed.
+		check(horizonVisibility(3.5f, 60.5f, 0.5f, steppedPlateau, nullptr, nullptr,
+						nullptr) < 5.5f,
+			"ambient: the plateau darkens the sample at its foot");
+		check(horizonVisibility(-40.5f, 60.5f, 0.5f, steppedPlateau, nullptr,
+						nullptr, nullptr) == static_cast<float>(kAmbientAzimuths),
+			"ambient: ... and out of the ladder's reach the plain is unobstructed");
 	}
 
 	// --- the two SDF rays, on a real field ----------------------------------
@@ -5207,8 +5299,9 @@ void testAmbientVisibility() {
 		caveField.build(24, 24, 24, [](int, int y, int) {
 			return y < 3 || y >= 8;
 		});
-		const auto surfaceTop = [](int, int, void*) -> std::uint32_t { return 24u; };
-		const float ceilingTan = 24.0f - 5.5f - kAmbientHorizonBias;
+		const auto surfaceTop = [](int, int, void*) -> float { return 24.0f; };
+		const float ceilingTan = (24.0f - 5.5f - kAmbientHorizonBias) /
+														 vv::ambient::kAmbientDistancesVox[0];
 		const float ceilingSin =
 			ceilingTan / std::sqrt(1.0f + ceilingTan * ceilingTan);
 		const float scanOnly = 6.0f * (1.0f - ceilingSin);  // the sum over azimuths
@@ -5250,10 +5343,12 @@ void testAmbientVisibility() {
 			"ambient: a cave keeps the floor and nothing else");
 	}
 
-	std::printf("ambient: %d azimuths x 6 distances (36 column samples), "
+	std::printf("ambient: %d azimuths x %d distances (%d column samples), "
 							"bias %.1f vox, SDF rays %.0f vox range, floor %.2f; "
 							"scan mean flat %.3f spire %.4f cave %.4f\n",
-		kAmbientAzimuths, static_cast<double>(kAmbientHorizonBias),
+		kAmbientAzimuths, vv::ambient::kAmbientDistances,
+		kAmbientAzimuths * vv::ambient::kAmbientDistances,
+		static_cast<double>(kAmbientHorizonBias),
 		static_cast<double>(kAmbientSdfRange),
 		static_cast<double>(kAmbientFloorDefault),
 		static_cast<double>(horizonVisibility(8.5f, 60.5f, 8.5f, flatColumnTop,

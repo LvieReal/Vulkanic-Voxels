@@ -1,6 +1,7 @@
 #pragma once
 
-// CPU mirror of the pass-62 ambient sky visibility (resources/shaders/voxels.comp).
+// CPU mirror of the pass-62 ambient sky visibility, pass-63 sampling
+// (resources/shaders/voxels.comp).
 //
 // The shader is the shipping implementation; this is the reference the tests
 // march against, and the probe harness includes it. It mirrors the shader's
@@ -24,9 +25,11 @@ namespace vv::ambient {
 
 // --- constants (mirror of voxels.comp) -------------------------------------
 inline constexpr int kAmbientAzimuths = 6;
-inline constexpr int kAmbientDistances = 6;
+inline constexpr int kAmbientDistances = 5;
+// The ladder starts at 2 voxels (pass 63): at d = 1 the bilinear tap spans a
+// vertical wall and the sample moves most for a sub-voxel camera step.
 inline constexpr float kAmbientDistancesVox[kAmbientDistances] = {
-    1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f};
+    2.0f, 4.0f, 8.0f, 16.0f, 32.0f};
 inline constexpr float kAmbientHorizonBias = 1.0f;
 inline constexpr float kAmbientSdfRange = 32.0f;
 inline constexpr float kAmbientSdfLift = 1.0f;
@@ -38,9 +41,40 @@ inline constexpr float kAmbientSdfMaxTan = 3.732f;
 inline constexpr float kAmbientFloorDefault = 0.12f;
 inline constexpr float kAmbientGroundTint[3] = {0.45f, 0.40f, 0.32f};
 
-// Highest solid voxel + 1 at a world column, 0 = all air. Returning 0 for an
-// unloaded column is the shader's resolveColumn returning false.
-using ColumnTop = std::uint32_t (*)(int x, int z, void* user);
+// Highest solid voxel + 1 at a world column, 0 = all air, NEGATIVE = the
+// column could not be resolved (outside the loaded region / empty slot) - the
+// shader's resolveColumn returning false. Mirrors the shader's
+// ambientColumnTop, which skips unresolved corners of the bilinear tap and
+// reports a negative value when none of them could be read.
+using ColumnTop = float (*)(int x, int z, void* user);
+
+// Mirror of ambientColumnTop: the bilinear read at a world column position
+// (integer + 0.5 sits on a column centre), renormalized over the corners that
+// resolved. Samples at the nearest column made the estimate a step function of
+// position, which crawled at distance (the pass-63 moire).
+inline float columnTopBilinear(float fx, float fz, ColumnTop top, void* user) {
+  const float bx = std::floor(fx - 0.5f) + 0.5f;
+  const float bz = std::floor(fz - 0.5f) + 0.5f;
+  const float tx = std::min(std::max(fx - bx, 0.0f), 1.0f);
+  const float tz = std::min(std::max(fz - bz, 0.0f), 1.0f);
+  const int x0 = static_cast<int>(bx);
+  const int z0 = static_cast<int>(bz);
+  float total = 0.0f;
+  float weight = 0.0f;
+  for (int dz = 0; dz <= 1; ++dz) {
+    for (int dx = 0; dx <= 1; ++dx) {
+      const float value = top(x0 + dx, z0 + dz, user);
+      if (value < 0.0f) {
+        continue;  // unresolved: the shader skips this corner
+      }
+      const float w = ((dx == 0) ? 1.0f - tx : tx) *
+                      ((dz == 0) ? 1.0f - tz : tz);
+      total += value * w;
+      weight += w;
+    }
+  }
+  return (weight <= 0.0f) ? -1.0f : total / weight;
+}
 
 inline float floorVox(float v) { return std::floor(v); }
 
@@ -61,15 +95,12 @@ inline float horizonVisibility(float px, float py, float pz, ColumnTop top,
     float tMax = 0.0f;
     for (int i = 0; i < kAmbientDistances; ++i) {
       const float d = kAmbientDistancesVox[i];
-      const int cellX = static_cast<int>(floorVox(px + dirX * d));
-      const int cellZ = static_cast<int>(floorVox(pz + dirZ * d));
-      const std::uint32_t topValue = top(cellX, cellZ, user);
-      if (topValue == 0u) {
-        continue;  // unloaded column: no obstruction (the shader: no slot)
+      const float topValue =
+          columnTopBilinear(px + dirX * d, pz + dirZ * d, top, user);
+      if (topValue < 0.0f) {
+        continue;  // nothing resolved here: no obstruction information
       }
-      const float dy = std::max(static_cast<float>(topValue) - py -
-                                    kAmbientHorizonBias,
-                                0.0f);
+      const float dy = std::max(topValue - py - kAmbientHorizonBias, 0.0f);
       tMax = std::max(tMax, dy / d);
     }
     const float sinTheta = tMax / std::sqrt(1.0f + tMax * tMax);

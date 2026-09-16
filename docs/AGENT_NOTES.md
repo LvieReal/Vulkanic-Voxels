@@ -83,7 +83,7 @@ it is the canonical look.
   `tests/ambient_mirror.hpp`; the tests pin the shader's text AND the mirror's
   numbers, so a change on one side without the other fails.
 
-## Switches (command line, passes 61-62)
+## Switches (command line, passes 61-63)
 
 Parsed once in `main()` from `argv` by `src/core/CommandLine.cpp` into one
 `vv::core::GameOptions` (`src/core/CommandLine.hpp`), read by the consumers
@@ -157,7 +157,7 @@ session restore the toolchain is gone - rebuild it with
 `scripts/build-linux-toolchain.sh`, or use the recipe above, which needs nothing
 but `g++`.
 
-## Where the tree stands (pass 62)
+## Where the tree stands (pass 63)
 
 - Passes 39-58 are verified on-device. Pass 54 (one-voxel march step cap) and
   pass 55 (direction jitter) were rejected and are not in the tree; pass 56's
@@ -165,13 +165,23 @@ but `g++`.
   shadow work, with the default at the owner's own pick (`--shadow-jitter
   0.002`).
   Waiting for their on-device check: pass 59 (the shader rename), pass 61 (the
-  command line) and pass 62 (the ambient).
-- **Ambient (pass 62)**: on by default; `--no-ambient` is the pre-62 control, and
-  the ambient is view-independent - the pass-62 branch of the shader never reads
-  the view ray (a test pins that). Sky visibility = (6-azimuth horizon scan over
-  the near column heights + 2 SDF rays) / 8, plus `--ambient-floor`. The mirror
-  the tests march against is `tests/ambient_mirror.hpp` - change the shader and
-  the mirror together (the suite pins both).
+  command line), pass 62 (the ambient) and pass 63 (its sampling fix).
+- **Ambient (passes 62-63)**: on by default; `--no-ambient` is the pre-62
+  control, and the ambient is view-independent - the pass-62 branch of the
+  shader never reads the view ray (a test pins that). Sky visibility =
+  (6-azimuth horizon scan over the near column heights + 2 SDF rays) / 8, plus
+  `--ambient-floor`. It has NO notion of the sun's azimuth: it is sky openness,
+  not shadowing (the sun term is the `ndl * shadow` beside it). The mirror the
+  tests march against is `tests/ambient_mirror.hpp` - change the shader and the
+  mirror together (the suite pins both).
+- **Do not read the height atlas at the nearest column** (pass 63): it makes the
+  term a step function of position, and at distance a sub-voxel camera move
+  flips the sample - measured as 3.5% of the value moving per 0.05-voxel step
+  against 0.4% with bilinear reads and the d = 1 sample dropped (the pre-62
+  view-ray formula measured 0.9%). `probes/probe_ambient_crawl.cpp` (new in
+  pass 63: `--shimmer` prints that table, `--diff` renders the crawl amplified,
+  `--term` isolates one lighting term) is the tool for any future "it shimmers"
+  report.
 - **The shipped terrain has no caves, overhangs or tunnels** (measured, pass 62:
   56k+ columns in six regions plus a 17-voxel sweep over +/-1200 voxels, zero air
   cells under a solid top - the density warp folds the surface, it does not put
