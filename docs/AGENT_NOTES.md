@@ -1614,6 +1614,23 @@ quality is the acceptance bar" rule the 8-corner gather dominates it: the same
 
 ## Pass 53: the bake's sweeps, merged (P4, re-aimed by measurement)
 
+### Follow-up: the boundary column is relaxed in the reference's own order
+
+The merged sweeps split the boundary column (x = 0 forward, x = nx-1 backward)
+onto the generic seven-candidate path, and the first cut ran that column LAST in
+the backward pass (after the row's fast loop) where the pre-pass-53 sweep ran it
+FIRST. Everything measured said the two orders agree - the parity test against
+the frozen sequential form was green on all shapes, and an independent
+end-to-end probe (the pre-53 `SdfField.hpp` from `e58bc8f` against the current
+one, shipping banded box, 4 055 040 cells) produced the same seed fingerprint
+`8e6aa0319555dd00` - because a diagonal candidate covers the one route the late
+column would have opened. It is still the wrong thing to leave resting on an
+observation: the backward pass now relaxes x = nx-1 before the row's fast loop,
+so the sweep order and the candidate order are LITERALLY the reference's, and
+"the uploaded array is bit-identical" is a property of the code instead of a
+measurement. Same fingerprint, same 52-57 ms bake, with the forward column
+already first.
+
 The owner picked P4 (the sliding rebuild) after verifying pass 52. Before any
 engine code, the probe `/tmp/probe_slide.cpp` (not committed) answered P4's two
 questions on the shipping 192 x 110 x 192 banded box (4 055 040 cells):

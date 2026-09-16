@@ -217,6 +217,12 @@ public:
         // because the candidates all have a positive x component.
         for (int z = nz - 1; z >= 0; --z)
             for (int y = ny - 1; y >= 0; --y) {
+                // The boundary column is relaxed FIRST, exactly the order the
+                // pre-pass-53 sweep used (x descending from nx-1): its own
+                // candidates all have a positive x component, so it reads only
+                // the already-final y+1/z+1 rows - and the cell below it in the
+                // row must be able to read the value this produces.
+                stepGeneric(nx - 1, y, z, kBackwardSteps);
                 const std::size_t rowBase = I(0, y, z);
                 for (int x = nx - 2; x >= 0; --x) {
                     const std::size_t i = rowBase + static_cast<std::size_t>(x);
@@ -273,7 +279,6 @@ public:
                         seed_[i] = bestSeed;
                     }
                 }
-                stepGeneric(nx - 1, y, z, kBackwardSteps);
             }
     }
 
