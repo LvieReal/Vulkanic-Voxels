@@ -2147,3 +2147,68 @@ carried a stale "Project" header (a toolkit shell that had been gone since pass
 43) and the shipped-feature reports lived inside the notes file; pass 60 split
 those apart - this file is the feature-report home now, and `docs/AGENT_NOTES.md`
 keeps only the working notes.
+
+## Pass 61: the switches are command-line options (they were environment variables)
+
+OWNER: "someone complained about environment variables. they want commands to be
+parsed instead."
+
+**What shipped.** One parser, one struct, one place that touches the environment:
+
+- `src/core/CommandLine.hpp/.cpp` (new, dependency-free, pure): `parseCommandLine`
+  turns `argv` into `vv::core::GameOptions`, `optionsFromEnvironment` fills the
+  same struct from the historical `VV_*` variables, `commandLineUsage` is the
+  `--help` text, `describeOptions` is the one-line startup summary. `main()`
+  parses before anything else, prints the usage and exits 0 for `--help`, and
+  reports a bad option on stderr with exit 2 instead of starting the game with
+  settings the user did not ask for.
+- Every `getenv` outside `CommandLine.cpp` is gone: the renderer
+  (`--sdf-shadows`, `--shadow-sharp`, `--shadow-jitter`, `--sdf-margin`,
+  `--far-lod`, `--validation`, `--perf`, `--debug-term`, `--debug-hole`), the
+  swapchain's present mode (`--present`), and the window platform
+  (`--platform`) now read the parsed struct through `vv::core::options()`.
+- `--platform` is a superset of the old `VV_PLATFORM`: it takes
+  `auto|x11|wayland|null|cocoa|win32` (the old variable only understood `null`)
+  and goes through `glfwInitHint(GLFW_PLATFORM, …)` - no environment mutation.
+  A platform the GLFW build does not have fails at `glfwInit` with GLFW's own
+  message (verified here: `--platform x11` on a null-only build prints "This
+  binary only supports the Null platform" and exits non-zero).
+- `--present` accepts `immediate|mailbox|fifo` and also `uncapped` as a spelling
+  of `immediate` (the default), so describing the default in a command line is
+  not an error.
+- Boolean flags take a `--no-` prefix (`--no-far-lod`), and the last one on the
+  command line wins. The environment still seeds the struct and a flag overrides
+  the variable with the same meaning - the owner sweeps `VV_SHADOW_JITTER` on the
+  device without a rebuild, and CI and `run_debug.bat` set `VV_VALIDATION`, so
+  removing the variables would have broken workflows for no gain.
+- `run.bat` forwards its arguments, `run_debug.bat` passes `--validation` instead
+  of setting a variable, and the toolchain script's headless hint is
+  `--platform null`.
+
+**Startup log.** `[vv] options: sdf-shadows, shadow-jitter 0.050, sdf-margin 2,
+perf, platform null` - only the switches that differ from the defaults, which is
+the line a bug report should quote.
+
+**Tests** (`testCommandLine`, in the pure-logic suite): the empty command line,
+every flag at once, the value forms, the `--no-` forms, "last one wins",
+`--help`/`-h` and that the usage names every flag, the failure modes (unknown
+flag, missing value, non-numeric slope, fractional chunk count, unknown present
+mode, unknown platform, unreadable chunk coordinates), the precedence rule
+(a flag beats its variable, an unrelated variable survives), the startup
+summary, and the `setOptions`/`options` round trip. The environment is cleared
+and set explicitly by the test, so the suite behaves the same in any shell.
+
+The pass-57 pin in `testSdfShaderMirrorConstants` (the renderer must be the one
+that reads the jitter lever - pass 51's lesson) now checks the new plumbing: the
+renderer consumes `options().shadowJitter*`, and `CommandLine.cpp` is the file
+that reads `VV_SHADOW_JITTER` and defines `--shadow-jitter`. The failure mode
+just moved one indirection out; it did not go away.
+
+**Verified in the sandbox.** Release + debug configured and built warning-free,
+`ctest` 100% on both. `--help` prints the usage on stdout and exits 0; `--nope`
+and `--shadow-jitter loud` print `[vv] fatal: …` on stderr and exit 2. A headless
+run (`--platform null`) prints `[vv] options: platform null` and then the
+documented windowless failure, `VV_PLATFORM=null` alone still does the same, and
+`VV_FAR_LOD=1 game --no-far-lod` reports only `platform null` - the flag won.
+This box has no window, so the renderer's own `[vulkan] …` lines are not
+reachable here; the renderer wiring is covered by the suite's source pins.

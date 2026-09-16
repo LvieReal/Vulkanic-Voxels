@@ -69,7 +69,7 @@ vec3 ambient = mix(groundBounce, skyIrradiance, hemi) * kAmbientScale;
   prerequisite, because with the view-dependence gone the visibility term below
   is the only thing left modulating the ambient.
 - Divergence from the WGSL reference: the reference uses the view-ray form, so
-  this needs the owner's eye (and ideally a lever, `VV_AMBIENT_NORMAL=1`).
+  this needs the owner's eye (and ideally a lever, `--ambient-normal`).
 
 ### 1.4 Proposal B - sky visibility, the actual cave fix
 
@@ -110,8 +110,9 @@ reach for only if B1's misses are visible.
 
 Practical recommendation: **B1 + 2 SDF rays** (one up-ish along the normal, one
 along the dominant horizontal silhouette) or B1 alone first, with the lever
-`VV_AMBIENT=0/1` and `VV_AMBIENT_FLOOR` for the look. Everything is per-pixel and
-A/B-able without a rebuild, like `VV_SHADOW_JITTER`.
+`--ambient`/`--no-ambient` and `--ambient-floor` for the look. Everything is
+per-pixel and A/B-able without a rebuild, like `--shadow-jitter` (switches are
+command-line flags since pass 61).
 
 ### 1.5 Proposal C - bake the visibility channel (if B costs too much on screen)
 
@@ -156,7 +157,7 @@ voxels, and a bigger cavern), a tunnel mouth (the transition), a valley between
 hills, an overhang/arch, and open ground at noon. Then turn the camera 360°
 without moving: the ambient on a *given* surface must not change (that is
 proposal A's acceptance test). Perf: the same Nsight capture as pass 50 - if the
-ambient addition shows up, `VV_AMBIENT=0` isolates it, and B1's 40 fetches should
+ambient addition shows up, `--no-ambient` isolates it, and B1's 40 fetches should
 be noise next to the existing march.
 
 ---
@@ -174,7 +175,7 @@ be noise next to the existing march.
   solid cell, bit-packed, `kSdfEmptySeed` for "no solid in view"); the array the
   worker builds *is* the array that is uploaded (pass 49 fused the packing in).
 - **Upload**: render-thread staging copy of **16.2 MB** per bake into a
-  double-buffered device buffer (binding 12; box geometry binding 13). `VV_PERF`
+  double-buffered device buffer (binding 12; box geometry binding 13). `--perf`
   already logs the split: `worker: band + build ms | render: snapshot + upload ms`.
 - **Consumer**: the shader gathers the 8 neighbouring cells' seeds
   (`sampleSdf3d`, pass 52) and takes the min cube distance; the sphere trace
@@ -203,7 +204,7 @@ Two things to be honest about up front:
 2. **JFA is not bit-identical to the chamfer.** It yields the true nearest seed
    (which is arguably *better* than the W1/W2/W3 weighted walk) but the field
    differs slightly, so the picture differs slightly: it needs an A/B and a
-   `VV_SDF_GPU=1` fallback with the CPU bake kept as the reference - exactly the
+   `--sdf-gpu` fallback with the CPU bake kept as the reference - exactly the
    pattern the shadow work already uses.
 
 ### 2.3 What it buys
@@ -244,7 +245,7 @@ Two things to be honest about up front:
    a *different* field than the chamfer's, so any picture comparison has to be
    per-config, and the pass-53 contract ("bit-identical to the CPU sweeps") does
    not survive by construction.
-5. **The exact path is unaffected** either way: `VV_SDF_SHADOWS=0` never touches
+5. **The exact path is unaffected** either way: `--shadow-sharp` (or no `--sdf-shadows`) never touches
    this code.
 
 ### 2.5 Where it belongs in the tree
@@ -263,7 +264,7 @@ Two things to be honest about up front:
 
 ### 2.6 Recommended order
 
-1. **Measure first, in this order**: `VV_PERF=1` already prints
+1. **Measure first, in this order**: `--perf` already prints
    `worker: band + build | render: snapshot + upload`, so the first question is
    how much of the current cost is the *upload*, not the bake. If 16.2 MB of
    staging per recenter is a real share, the cheap win is to stop re-uploading
@@ -273,7 +274,7 @@ Two things to be honest about up front:
    safe change with no new shader, and it answers "how often does the field
    really need to be recomputed" before committing to a GPU builder.
 2. If the goal is a bigger/fresher box rather than the upload, prototype the
-   **JFA bake behind `VV_SDF_GPU=1`** with the CPU path as the reference, a
+   **JFA bake behind `--sdf-gpu`** with the CPU path as the reference, a
    readback diff, and a frame-amortised schedule (one pass per frame). Compare
    worker ms, upload ms, frame ms and the picture against the current field on
    the owner's terrain.

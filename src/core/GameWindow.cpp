@@ -1,10 +1,13 @@
 #include "core/GameWindow.hpp"
 
+#include "core/CommandLine.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace vv::core {
 
@@ -55,18 +58,32 @@ bool GameWindow::init(const Hooks& hooks, std::string& outError) {
 	glfwSetErrorCallback(glfwErrorCallback);
 
 	if (!g_glfwInitialized) {
-		// Headless escape hatch (CI, sandboxes): VV_PLATFORM=null selects
-		// GLFW's null platform explicitly. It is the only way to get one when
-		// the GLFW library has no real backend compiled in, and it needs the
-		// hint because auto-selection never picks "null".
-		if (const char* requested = std::getenv("VV_PLATFORM")) {
-			if (std::strcmp(requested, "null") == 0) {
-				glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_NULL);
-			} else {
-				std::fprintf(stderr,
-										 "[vv] warning: VV_PLATFORM=%s is not a known value "
-										 "(only 'null' is understood)\n",
-										 requested);
+		// --platform <name> forces the window platform (the parser has already
+		// rejected anything that is not one of the names). "null" is the
+		// headless escape hatch for CI and sandboxes - it is the only way to get
+		// GLFW's null platform, because auto-selection never picks it - and the
+		// other names are the explicit override for a session where the wrong
+		// backend was chosen. The hint must be set before glfwInit(); a platform
+		// this GLFW was not built with fails right there with GLFW's own
+		// message.
+		const std::string& requested = options().platform;
+		if (!requested.empty() && requested != "auto") {
+			// 0 = nothing to hint: the parser only lets the six names through,
+			// so this is an exhaustive table, not a fallback.
+			int platform = 0;
+			if (requested == "null") {
+				platform = GLFW_PLATFORM_NULL;
+			} else if (requested == "x11") {
+				platform = GLFW_PLATFORM_X11;
+			} else if (requested == "wayland") {
+				platform = GLFW_PLATFORM_WAYLAND;
+			} else if (requested == "cocoa") {
+				platform = GLFW_PLATFORM_COCOA;
+			} else if (requested == "win32") {
+				platform = GLFW_PLATFORM_WIN32;
+			}
+			if (platform != 0) {
+				glfwInitHint(GLFW_PLATFORM, platform);
 			}
 		}
 		if (glfwInit() != GLFW_TRUE) {

@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/CommandLine.hpp"
 #include "core/InputBindings.hpp"
 #include "render/ImageDecode.hpp"
 #include "terrain/FarField.hpp"
@@ -2912,11 +2913,29 @@ void testSdfShaderMirrorConstants() {
 			if (renderer.good()) {
 				const std::string rsrc((std::istreambuf_iterator<char>(renderer)),
 					std::istreambuf_iterator<char>());
-				check(rsrc.find("getenv(\"VV_SHADOW_JITTER\")") !=
-						std::string::npos,
-					"shader mirror: the renderer reads VV_SHADOW_JITTER");
+				// Pass 61: the lever is a command-line option now, parsed in
+				// core/CommandLine.cpp (which is also where VV_SHADOW_JITTER,
+				// its environment fallback, is read); the renderer consumes the
+				// parsed value. Both halves are pinned, because "the shader
+				// input nobody writes" is still the pass-51 failure mode - just
+				// one indirection further out.
+				check(rsrc.find("options().shadowJitterSet") != std::string::npos &&
+						rsrc.find("options().shadowJitter") != std::string::npos,
+					"shader mirror: the renderer reads the parsed shadow-jitter "
+					"option (core/CommandLine.hpp)");
 				check(rsrc.find("m_shadowJitter);") != std::string::npos,
 					"shader mirror: the renderer pushes it (pc.camera.w)");
+				std::ifstream cli(std::string(VV_SRC_DIR) + "/core/CommandLine.cpp");
+				check(cli.good(), "shader mirror: CommandLine.cpp is readable");
+				if (cli.good()) {
+					const std::string csrc((std::istreambuf_iterator<char>(cli)),
+						std::istreambuf_iterator<char>());
+					check(csrc.find("\"VV_SHADOW_JITTER\"") != std::string::npos,
+						"shader mirror: the option's environment fallback is "
+						"still read");
+					check(csrc.find("\"--shadow-jitter\"") != std::string::npos,
+						"shader mirror: ... and the flag that drives it exists");
+				}
 			}
 #endif
 		}
@@ -4658,6 +4677,215 @@ void testStreamPriority() {
 	}
 }
 
+// --- pass 61: the command line ---------------------------------------------
+//
+// The switches used to be read straight out of the environment, in five
+// different files. They are parsed once now (core/CommandLine.hpp) and the
+// consumers read the parsed struct, so the parser is the one place that can get
+// the semantics wrong - hence the tests: every flag, the value forms, the
+// precedence rule (a flag beats its variable, the last flag wins), and the
+// failure modes that must NOT be silent (an unknown flag or a malformed value
+// stops the run instead of starting it with different settings).
+
+void testCommandLine() {
+	using vv::core::GameOptions;
+	using vv::core::optionsFromEnvironment;
+	using vv::core::parseCommandLine;
+
+	// The environment is part of the contract (scripts, CI and the owner's
+	// on-device sweeps still set VV_*), so the tests drive it explicitly: this
+	// suite must behave the same whether or not the invoking shell has any of
+	// them set.
+	const auto setEnv = [](const char* name, const char* value) {
+#ifdef _WIN32
+		_putenv_s(name, value);
+#else
+		setenv(name, value, 1);
+#endif
+	};
+	// "unset" has to mean unset, not empty: VV_VALIDATION and VV_DEBUG_TERM are
+	// read as "is it there at all", so an empty value is still a value.
+	const auto clearEnv = [] {
+		for (const char* name :
+				 {"VV_SDF_SHADOWS", "VV_SHADOW_SHARP", "VV_FAR_LOD",
+					"VV_SHADOW_JITTER", "VV_SDF_MARGIN", "VV_VALIDATION", "VV_PERF",
+					"VV_DEBUG_TERM", "VV_DEBUG_HOLE", "VV_PRESENT", "VV_PLATFORM"}) {
+#ifdef _WIN32
+			_putenv_s(name, "");
+#else
+			unsetenv(name);
+#endif
+		}
+	};
+
+	clearEnv();
+	{
+		const vv::core::CommandLineResult r = parseCommandLine({});
+		check(r.ok(), "command line: an empty command line is valid");
+		const GameOptions& o = r.options;
+		check(!o.help && !o.sdfShadows && !o.shadowSharp && !o.farLod &&
+					!o.validation && !o.perf && !o.debugTerm,
+				"command line: everything is off by default");
+		check(!o.shadowJitterSet && !o.sdfMarginSet && o.present.empty() &&
+					o.platform.empty() && o.debugHole.empty(),
+				"command line: the valued options stay unset by default");
+	}
+
+	// Every flag, one call, in one place - a new flag that is not covered here
+	// is a new flag whose parsing nobody checked.
+	{
+		const vv::core::CommandLineResult r = parseCommandLine(
+				{"--sdf-shadows", "--shadow-jitter", "0.02", "--sdf-margin", "2",
+				 "--far-lod", "--validation", "--perf", "--present", "fifo",
+				 "--platform", "wayland", "--debug-term", "--debug-hole", "7,-3"});
+		check(r.ok(), "command line: the full option set parses");
+		const GameOptions& o = r.options;
+		check(o.sdfShadows && o.farLod && o.validation && o.perf && o.debugTerm,
+				"command line: a flag sets its field");
+		check(o.shadowJitterSet && o.shadowJitter == 0.02f,
+				"command line: --shadow-jitter takes a slope");
+		check(o.sdfMarginSet && o.sdfMargin == 2,
+				"command line: --sdf-margin takes whole chunks");
+		check(o.present == "fifo", "command line: --present takes a mode");
+		check(o.platform == "wayland", "command line: --platform takes a name");
+		check(o.debugHole == "7,-3",
+				"command line: --debug-hole takes chunk coordinates");
+	}
+
+	// The --no- forms, and "the last one wins".
+	{
+		const vv::core::CommandLineResult r = parseCommandLine(
+				{"--far-lod", "--no-far-lod", "--sdf-shadows", "--sdf-shadows",
+				 "--no-validation"});
+		check(r.ok(), "command line: the --no- forms parse");
+		check(!r.options.farLod,
+				"command line: --no-far-lod clears what --far-lod set");
+		check(r.options.sdfShadows,
+				"command line: repeating a flag is harmless");
+		check(!r.options.validation,
+				"command line: --no-validation is the default, explicitly");
+	}
+
+	// --help and the usage text: the flag names a user needs are in it, and
+	// the parser never needs a window to answer it.
+	{
+		const vv::core::CommandLineResult r = parseCommandLine({"--help"});
+		check(r.ok() && r.options.help, "command line: --help is recognized");
+		check(parseCommandLine({"-h"}).options.help,
+				"command line: -h is --help");
+		const std::string usage = vv::core::commandLineUsage();
+		bool complete = true;
+		for (const char* name :
+				 {"--sdf-shadows", "--shadow-jitter", "--sdf-margin", "--far-lod",
+					"--validation", "--perf", "--present", "--platform",
+					"--debug-term", "--debug-hole", "--help"}) {
+			complete = complete && usage.find(name) != std::string::npos;
+		}
+		check(complete, "command line: the usage lists every flag");
+	}
+
+	// Failures are loud: an unknown flag, a missing value, a malformed value.
+	{
+		const vv::core::CommandLineResult unknown =
+				parseCommandLine({"--far-lod", "--nope"});
+		check(!unknown.ok() && unknown.error.find("--nope") != std::string::npos,
+				"command line: an unknown flag is an error that names it");
+
+		const vv::core::CommandLineResult missing =
+				parseCommandLine({"--shadow-jitter"});
+		check(!missing.ok() &&
+					missing.error.find("--shadow-jitter") != std::string::npos,
+				"command line: a missing value is an error");
+
+		const vv::core::CommandLineResult badNumber =
+				parseCommandLine({"--shadow-jitter", "loud"});
+		check(!badNumber.ok(),
+				"command line: --shadow-jitter rejects a non-number");
+		const vv::core::CommandLineResult badMargin =
+				parseCommandLine({"--sdf-margin", "1.5"});
+		check(!badMargin.ok(),
+				"command line: --sdf-margin rejects a fractional chunk count");
+		const vv::core::CommandLineResult badMode =
+				parseCommandLine({"--present", "sometimes"});
+		check(!badMode.ok(), "command line: --present rejects an unknown mode");
+		const vv::core::CommandLineResult badPlatform =
+				parseCommandLine({"--platform", "quantum"});
+		check(!badPlatform.ok(),
+				"command line: --platform rejects an unknown name");
+		const vv::core::CommandLineResult badHole =
+				parseCommandLine({"--debug-hole", "somewhere"});
+		check(!badHole.ok(),
+				"command line: --debug-hole rejects coordinates it cannot read");
+
+		// "uncapped" is what the default already is, so it is accepted as a
+		// spelling of "immediate" rather than becoming an error message.
+		const vv::core::CommandLineResult uncapped =
+				parseCommandLine({"--present", "uncapped"});
+		check(uncapped.ok() && uncapped.options.present == "immediate",
+				"command line: --present uncapped means immediate");
+	}
+
+	// The environment seeds the struct, a flag overrides the variable with the
+	// same meaning, and an unrelated flag leaves the variable alone.
+	{
+		setEnv("VV_FAR_LOD", "1");
+		setEnv("VV_SHADOW_JITTER", "0.05");
+		setEnv("VV_VALIDATION", "1");
+		setEnv("VV_PERF", "0");
+		{
+			const vv::core::GameOptions env = optionsFromEnvironment();
+			check(env.farLod && env.validation && !env.perf,
+					"command line: the environment fills the switches");
+			check(env.shadowJitterSet && env.shadowJitter == 0.05f,
+					"command line: the environment fills a valued switch");
+		}
+		{
+			const vv::core::CommandLineResult r =
+					parseCommandLine({"--no-far-lod", "--shadow-jitter", "0.01"});
+			check(r.ok() && !r.options.farLod,
+					"command line: a flag overrides the variable it replaces");
+			check(r.options.shadowJitter == 0.01f,
+					"command line: a flag overrides the valued variable");
+			check(r.options.validation,
+					"command line: an unrelated variable survives the flags");
+		}
+		clearEnv();
+	}
+
+	// The startup line names what is not at its default, and stays empty when
+	// nothing is - this is the line a bug report quotes.
+	{
+		const vv::core::GameOptions plain;
+		check(vv::core::describeOptions(plain).empty(),
+				"command line: nothing to report at the defaults");
+		GameOptions custom;
+		custom.sdfShadows = true;
+		custom.shadowJitterSet = true;
+		custom.shadowJitter = 0.002f;
+		custom.platform = "x11";
+		const std::string line = vv::core::describeOptions(custom);
+		check(line.find("sdf-shadows") != std::string::npos &&
+					line.find("0.002") != std::string::npos &&
+					line.find("x11") != std::string::npos,
+				"command line: the startup line names the active switches");
+	}
+
+	// setOptions/options is how the consumers (the window and the renderer,
+	// which are constructed far below main) see the parsed switches.
+	{
+		GameOptions forwarded;
+		forwarded.sdfShadows = true;
+		forwarded.sdfMargin = 2;
+		const GameOptions before = vv::core::options();
+		vv::core::setOptions(forwarded);
+		check(vv::core::options().sdfShadows &&
+					vv::core::options().sdfMargin == 2,
+				"command line: the parsed options are readable where they are used");
+		vv::core::setOptions(before);
+	}
+}
+
+
 int main() {
 	testVertexAO();
 	testNoiseDeterministic();
@@ -4690,6 +4918,7 @@ int main() {
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();
+	testCommandLine();
 	testVoxelTextures();
 	testKeyBindings();
 	testImageDecode();

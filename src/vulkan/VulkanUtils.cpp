@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "core/CommandLine.hpp"
+
 #include <optional>
 #include <set>
 #include <string>
@@ -229,11 +231,11 @@ VkPresentModeKHR choosePresentMode(
     return std::find(modes.begin(), modes.end(), m) != modes.end();
   };
 
-  // VV_PRESENT=immediate|mailbox|fifo overrides the preference (must still
-  // be supported by the surface; otherwise ignored). "fifo" restores
-  // vsync.
-  if (const char* env = std::getenv("VV_PRESENT")) {
-    const std::string requested = env;
+  // --present immediate|mailbox|fifo overrides the preference (must still be
+  // supported by the surface; otherwise ignored - a missing mode must not stop
+  // the game). "fifo" restores vsync.
+  const std::string requested = vv::core::options().present;
+  if (!requested.empty()) {
     VkPresentModeKHR mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
     if (requested == "immediate") {
       mode = VK_PRESENT_MODE_IMMEDIATE_KHR;

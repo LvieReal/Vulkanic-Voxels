@@ -51,9 +51,9 @@ cmake --build build
 ./build/release/bin/game.exe
 ```
 
-`run.bat` does the same from Explorer (it adds MSYS2's `mingw64\bin` to `PATH`);
-`run_debug.bat` builds nothing but starts the debug binary with the validation
-layer on.
+`run.bat` does the same from Explorer (it adds MSYS2's `mingw64\bin` to `PATH`)
+and forwards any additional options; `run_debug.bat` builds nothing but starts
+the debug binary with `--validation`.
 
 ### Linux
 
@@ -86,10 +86,10 @@ the title bar usable) and un-maximizes to half the monitor; the first frame is
 already the size the window really has, and minimizing is handled without
 touching the swapchain. Both sizes are printed at startup (`[vv] window: ...`).
 
-Debug runs enable the Khronos **validation layer**: `run_debug.bat` sets
-`VV_VALIDATION=1`, and `VV_VALIDATION=1 ./build/release/bin/game` does the same
-for any other binary. Messages arrive on stderr; when the layer is not installed
-the app says so and continues.
+Debug runs enable the Khronos **validation layer**: `run_debug.bat` passes
+`--validation`, and `./build/release/bin/game --validation` does the same for any
+other binary. Messages arrive on stderr; when the layer is not installed the app
+says so and continues.
 
 A small pure-logic test suite (noise, terrain layering, chunked world, key
 bindings, the PNG decoder) builds alongside by default: `ctest --test-dir build`
@@ -113,24 +113,31 @@ cmake --build build
 in `build/dist/<config>`: the executable, the SPIR-V shaders and the optional
 `resources/textures` tree are the whole package.
 
-## Options
+## Command line
 
-Read once at startup. (A command-line equivalent is planned; the switches are
-environment variables today.)
+`game --help` prints the list. Every switch also accepts a `--no-` prefix where
+that makes sense (`--no-far-lod`), and the last one on the command line wins.
 
-| Variable | Effect |
+| Option | Effect |
 | --- | --- |
-| `VV_SDF_SHADOWS=1` | try the SDF soft-shadow marcher instead of the exact binary sun shadows (the default reference) |
-| `VV_SHADOW_JITTER=<slope>` | strength of the per-pixel shadow-ray jitter, `0` = off (default `0.002`) |
-| `VV_SDF_MARGIN=0\|1\|2` | how far the camera may drift before the SDF field is rebuilt (default 1) |
-| `VV_SHADOW_SHARP=1` | force the exact binary sun shadows |
-| `VV_FAR_LOD=1` | enable the coarse far-terrain LOD field (off by default) |
-| `VV_VALIDATION=1` | enable the Khronos validation layer |
-| `VV_PERF=1` | log slow frames and the SDF bake's cost split |
-| `VV_PRESENT=fifo` | vsync (uncapped by default) |
-| `VV_PLATFORM=null` | headless smoke run: create the window object and report cleanly instead of rendering |
-| `VV_DEBUG_TERM` | colour pixels by why the ray ended |
-| `VV_DEBUG_HOLE=X,Z` | diagnostics for a far-LOD hole over chunk (X,Z) |
+| `--sdf-shadows` | try the SDF soft-shadow marcher instead of the exact binary sun shadows (the default reference) |
+| `--shadow-jitter <slope>` | strength of the per-pixel shadow-ray jitter, `0` = off (default `0.002`) |
+| `--sdf-margin <chunks>` | how far the camera may drift before the SDF field is rebuilt (default 1) |
+| `--shadow-sharp` | force the exact binary sun shadows |
+| `--far-lod` | enable the coarse far-terrain LOD field (off by default) |
+| `--validation` | enable the Khronos validation layer |
+| `--perf` | log slow frames and the SDF bake's cost split |
+| `--present <mode>` | `immediate` (uncapped, the default), `mailbox` or `fifo` (vsync) |
+| `--platform <name>` | `auto` (default), `x11`, `wayland`, `null`, `cocoa` or `win32` — force the window platform |
+| `--debug-term` | colour pixels by why the ray ended |
+| `--debug-hole <x,z>` | diagnostics for a far-LOD hole over chunk (`x`,`z`) |
+
+The start-up log prints the switches that are not at their defaults
+(`[vv] options: sdf-shadows, shadow-jitter 0.050, ...`), which is what a bug
+report should quote. The `VV_*` environment variables of the same names still
+work as a fallback for scripts and CI (a flag overrides its variable), and an
+unknown flag or a malformed value stops the run with a message instead of
+starting with settings you did not ask for.
 
 ## Troubleshooting
 

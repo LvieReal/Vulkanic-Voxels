@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <set>
 
+#include "core/CommandLine.hpp"
 #include "core/RuntimePaths.hpp"
 #include "core/ShaderLoader.hpp"
 #include "platform/VulkanSurfaceFactory.hpp"
@@ -91,15 +92,6 @@ bool extensionSupported(const char* name,
                      });
 }
 
-bool envFlagEnabled(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr) {
-    return false;
-  }
-  return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-         std::strcmp(value, "on") == 0 || std::strcmp(value, "yes") == 0;
-}
-
 constexpr std::uint32_t kDefaultFarLodRadiusChunks = 64;
 
 }  // namespace
@@ -120,18 +112,20 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
 
   // Terrain LOD is an explicit experiment, not a hidden default. Keep this
   // guard here as well as in setWorldConfig() so a renderer that uses the
-  // built-in config follows the same contract.
-  const bool farLodRequested = envFlagEnabled("VV_FAR_LOD");
+  // built-in config follows the same contract. Pass 61: the switches come from
+  // the parsed command line (see core/CommandLine.hpp), which the environment
+  // seeds - there is no getenv in this file any more.
+  const bool farLodRequested = vv::core::options().farLod;
   if (farLodRequested && m_voxelConfig.farLodRadiusChunks == 0) {
     m_voxelConfig.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
   } else if (!farLodRequested) {
     m_voxelConfig.farLodRadiusChunks = 0;
   }
-  m_sdfShadows = envFlagEnabled("VV_SDF_SHADOWS");
-  if (envFlagEnabled("VV_SHADOW_SHARP")) {
+  m_sdfShadows = vv::core::options().sdfShadows;
+  if (vv::core::options().shadowSharp) {
     m_sdfShadows = false;
   }
-  std::fprintf(stderr, "[vulkan] far LOD: %s (VV_FAR_LOD=1), shadows: %s\n",
+  std::fprintf(stderr, "[vulkan] far LOD: %s (--far-lod), shadows: %s\n",
                farLodRequested ? "on" : "off",
                m_sdfShadows ? "SDF experiment" : "exact binary");
   if (m_sdfShadows) {
@@ -142,12 +136,12 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     // the old "every completed region move" cadence (the A/B lever), and 2 is
     // the most the coverage allows.
     m_sdfMarginChunks = 1;
-    if (const char* marginEnv = std::getenv("VV_SDF_MARGIN")) {
-      const int parsed = std::atoi(marginEnv);
+    if (vv::core::options().sdfMarginSet) {
       m_sdfMarginChunks = static_cast<std::uint32_t>(
-          std::clamp(parsed, 0, static_cast<int>(
-                                   vv::vulkan::VoxelResources::kSdfHalfChunks) -
-                                   1));
+          std::clamp(vv::core::options().sdfMargin, 0,
+                     static_cast<int>(
+                         vv::vulkan::VoxelResources::kSdfHalfChunks) -
+                         1));
     }
     std::fprintf(stderr,
                  "[vulkan] SDF rebuild margin: %u chunk(s) of drift (box "
@@ -157,14 +151,14 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     // Pass 57: the soft shadow ray is jittered per pixel as a CONE plus a
     // fixed world displacement at the origin, which turns the discrete march's
     // coherent sampling error (bands across a penumbra, stepped contacts) into
-    // noise at one pixel's scale. The lever is the CONE SLOPE
-    // (kShadowJitterDefault = 0.07 when unset, 0 for the un-jittered estimate,
-    // up to 0.5 = a 27-degree cone to overshoot on purpose; the contact
-    // displacement scales with it linearly). It rides pc.camera.w to the
-    // shader.
-    if (const char* jitterEnv = std::getenv("VV_SHADOW_JITTER")) {
-      const float parsed = std::strtof(jitterEnv, nullptr);
-      m_shadowJitter = std::clamp(parsed, 0.0f, 0.5f);
+    // noise at one pixel's scale. The lever is the CONE SLOPE (unset = the
+    // shader's kShadowJitterDefault, 0.002 since pass 57's follow-up commit and
+    // the owner's on-device pick; 0 for the un-jittered estimate, up to 0.5 =
+    // a 27-degree cone to overshoot on purpose; the contact displacement scales
+    // with it linearly). It rides pc.camera.w to the shader.
+    if (vv::core::options().shadowJitterSet) {
+      m_shadowJitter =
+          std::clamp(vv::core::options().shadowJitter, 0.0f, 0.5f);
     }
     if (m_shadowJitter < 0.0f) {
       std::fprintf(stderr,
@@ -182,15 +176,14 @@ bool VulkanRenderer::init(const InitInfo& info, std::string& outError) {
     }
   }
 
-  // Debug visualization (see docs/AGENT_NOTES.md): VV_DEBUG_TERM false-
-  // colors each pixel by ray-termination cause.
-  m_debugTerminators = std::getenv("VV_DEBUG_TERM") != nullptr;
-  if (const char* perfEnv = std::getenv("VV_PERF")) {
-    m_perfEnabled = std::strcmp(perfEnv, "0") != 0;
-  }
-  if (const char* holeEnv = std::getenv("VV_DEBUG_HOLE")) {
+  // Debug visualization (see docs/AGENT_NOTES.md): --debug-term false-colors
+  // each pixel by ray-termination cause.
+  m_debugTerminators = vv::core::options().debugTerm;
+  m_perfEnabled = vv::core::options().perf;
+  if (!vv::core::options().debugHole.empty()) {
     int hx = 0, hz = 0;
-    if (std::sscanf(holeEnv, "%d,%d", &hx, &hz) == 2) {
+    if (std::sscanf(vv::core::options().debugHole.c_str(), "%d,%d", &hx, &hz) ==
+        2) {
       m_holeDebugX = hx;
       m_holeDebugZ = hz;
       std::fprintf(stderr,
@@ -511,7 +504,7 @@ void VulkanRenderer::setWorldConfig(const vv::voxel::VoxelConfig& config) {
   }
 
   vv::voxel::VoxelConfig adjusted = config;
-  const bool farLodRequested = envFlagEnabled("VV_FAR_LOD");
+  const bool farLodRequested = vv::core::options().farLod;
   if (farLodRequested && adjusted.farLodRadiusChunks == 0) {
     adjusted.farLodRadiusChunks = kDefaultFarLodRadiusChunks;
   } else if (!farLodRequested) {
@@ -1841,13 +1834,13 @@ bool VulkanRenderer::createInstance(const InitInfo& info,
 
   // Optional diagnostics: a debug messenger (validation-layer messages on
   // stderr when layers are present). The Khronos validation layer is only
-  // enabled when the VV_VALIDATION environment variable is set, since it
+  // enabled with --validation (or VV_VALIDATION in the environment), since it
   // carries a noticeable performance cost.
   std::vector<const char*> layers;
   if (extensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, available)) {
     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
   }
-  if (std::getenv("VV_VALIDATION") != nullptr) {
+  if (vv::core::options().validation) {
     uint32_t layerCount = 0;
     vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
     std::vector<VkLayerProperties> availableLayers(layerCount);

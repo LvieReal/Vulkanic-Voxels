@@ -145,6 +145,6 @@ Headless smoke test (no GPU/display in restricted sandboxes - the game must
 create its window, resolve the platform and fail with a clear message
 instead of crashing):
 
-  VV_PLATFORM=null LD_LIBRARY_PATH="$PREFIX/prefix/lib" \\
-      timeout 5 ./build/release/bin/game
+  LD_LIBRARY_PATH="$PREFIX/prefix/lib" \\
+      timeout 5 ./build/release/bin/game --platform null
 EOF

@@ -14,6 +14,7 @@ function(vv_add_tests)
         src/voxel/VoxelTextures.cpp
         src/voxel/World.cpp
         src/render/ImageDecode.cpp
+        src/core/CommandLine.cpp
         src/core/InputBindings.cpp
     )
 
