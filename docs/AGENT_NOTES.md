@@ -1611,3 +1611,79 @@ quality is the acceptance bar" rule the 8-corner gather dominates it: the same
   per ray. Same rule: it changes which rays keep marching.
 - P4 (incremental sliding rebuild, ~30 ms bakes) is still open; it needs the P2
   region plumbing and a CPU parity test.
+
+## Pass 53: the bake's sweeps, merged (P4, re-aimed by measurement)
+
+The owner picked P4 (the sliding rebuild) after verifying pass 52. Before any
+engine code, the probe `/tmp/probe_slide.cpp` (not committed) answered P4's two
+questions on the shipping 192 x 110 x 192 banded box (4 055 040 cells):
+
+**Where does the bake go?** clear 14, source scan 20, forward sweep 71, backward
+sweep 62 = 167 ms of worker time in the probe (the engine's own number in the
+pass-49 logs was 96-113 ms on the owner's machine, same box shape) - the two
+chamfer sweeps are 76-79% of it.
+
+**Can a shifted copy of the live field be repaired locally into the field a full
+rebuild produces?** Measured no, twice:
+
+- Shifted copy + both reference passes: 154.7 ms against 152.6 ms for a full
+  build (the copy costs what the initialization it replaces costs), and the two
+  fields are **not** bit-identical at shipping size - 52 of 4 055 040 seed words
+  differ, because a fixed number of min-plus sweeps depends on the state it
+  starts from. That is an approximation of the picture, not a rewrite.
+- Shifted copy + a worklist repair iterated to convergence: 537-1177 ms and
+  2.4-5.5% of seed words different, distances off by up to 16 voxels. The
+  converged fixed point is not the reference field either: the shipped two-pass
+  chamfer is NOT converged (it spends two sweeps, not a Bellman-Ford closure),
+  so iterating its 14 local rules to convergence finds strictly shorter paths
+  than the two passes ever do - a *better* field, and a different picture.
+
+So P4's premise (the interesting work is local and repairable) does not hold for
+this operator: the sweeps are inherently sequential, they have to run over the
+whole array to reproduce the shipped field, and they are the cost. The pass
+shipped the one exact win the measurement did leave open - the sweeps
+themselves.
+
+### What changed
+
+`SdfField::build`: a cell's seven candidates are scanned in one go and the cell
+is written once, instead of seven `relax()` calls that each loaded, compared and
+stored `dist_[i]`/`seed_[i]`. Same candidates, same order, same strict `<`
+against the running value (so a tie still keeps the earliest candidate) - a
+rewrite, not a new algorithm. The x bounds tests are hoisted out of the innermost
+loop by splitting the first (forward) / last (backward) column onto a generic
+path, and the row base is computed once per row instead of per cell. The
+candidate lists (`kForwardSteps`/`kBackwardSteps`) and the weights (`kW1/W2/W3`)
+are now named constants, so the order that decides ties is visible in one place.
+
+Measured in the probe, three runs each, interleaved, same field:
+
+| build | run 0 | run 1 | run 2 | parity |
+| --- | --- | --- | --- | --- |
+| old sequential form | 161.9 ms | 184.7 ms | 185.6 ms | - |
+| shipped merged form | 60.0 ms | 66.2 ms | 68.1 ms | 0 seed diffs, 0 exact-float distance diffs of 4 055 040 |
+
+The uploaded seed array is bit-identical, so the picture cannot move - and no
+shader, uniform, upload or cadence code was touched.
+
+Left on the table, measured and exact (the next pass if the owner wants it): the
+clear (14 ms of the remaining ~62) and the source scan (20 ms - `sdfBoxCellSolid`
+does two integer divisions and a per-cell size check, all hoistable by walking
+the chunks instead of the cells).
+
+### Verification
+
+- `testSdfChamferParity` (new) freezes the pre-pass-53 sequential form in the
+  test file and requires bit-for-bit agreement, every seed word and every
+  distance: a 33x17x40 shape with a floor, pillars, a floating slab (overhang),
+  a hill, an isolated tower and a hollow box; degenerate spans (1x9x5, 9x1x9,
+  2x2x2); an all-air box (every seed must stay `kSdfEmptySeed`); and the REAL
+  banded terrain through `buildSdfBoxField` (64x107x64 = 438 272 cells, 438 272
+  seeds identical, 0 distance diffs).
+- Mutation check: replacing the interior corner weight `kW3` with `kW2` (one
+  live constant) fails 3 checks and shows 79 529 distance diffs on the real box;
+  restored, the suite is green. (A first attempt mutated a `Step` array entry
+  that the x=0 column can never consult - x-negative candidates are always out
+  of range there - which is why the mutation was invisible; the live path is
+  what the check has to hit.)
+- Release + debug builds warning-free, `ctest` 100% in both.

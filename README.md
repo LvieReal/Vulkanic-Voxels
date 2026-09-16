@@ -176,6 +176,20 @@ out: its trilinear read lightens the soft shadows (mean visibility 0.695 ->
 0.858, ~1.4% of rays changing verdict) because the 3x3x3 min's over-report near
 corners is what keeps the current penumbra dark, and no bias brings that back.
 
+The rebake's own arithmetic got cheaper in pass 53: the two chamfer sweeps now
+scan a cell's seven candidates in one go and write the cell once, instead of
+seven relaxation calls that each loaded, compared and stored the cell - the same
+candidates in the same order with the same strict comparison, so the field is
+bit-identical (a test freezes the old sequential form and requires every seed
+word and every distance to match, on a shape set and on real banded terrain).
+Measured on the shipping box: the two sweeps 121 -> 29 ms, the worker's whole
+bake ~62 ms instead of ~165 ms on the same machine, with the uploaded array
+unchanged. The sliding rebuild that was planned for this pass was measured first
+and dropped: shifting the live field and repairing it locally cannot reproduce
+the two-pass field (52 of 4 055 040 cells at shipping size, and worse if the
+repair is iterated to convergence - the shipped two-pass chamfer is not
+converged), and it saved only 12% anyway.
+
 Two things keep the rebake cheap (pass 49). The box's empty sky is cropped: the
 build keeps the highest solid cell of its footprint plus 16 voxels of penumbra
 margin, so a bake is 110 of the 128 rows on the default terrain (14% fewer

@@ -3266,6 +3266,233 @@ void testSdfCornerGather() {
 							visDeltaSum / double(std::max<std::size_t>(rays, 1)), visDeltaMax);
 }
 
+// ---------------------------------------------------------------------------
+// Pass 53: the chamfer passes, merged (SdfField::build).
+//
+// The two sweeps now scan a cell's seven candidates in one go and write the
+// cell once, instead of the seven relax() calls that each loaded, compared and
+// stored dist_[i]/seed_[i]. That is only allowed to be a rewrite - the same
+// candidates, in the same order, with the same strict '<' against the running
+// value (so a tie still keeps the earliest candidate) - and this test is what
+// enforces it: the ORIGINAL sequential form is frozen here, and the shipped
+// build has to agree with it bit for bit, every seed word and every distance,
+// on shapes with faces, edges, corners, overhangs, isolated towers and
+// degenerate spans where ties and long chamfer paths are the norm.
+// ---------------------------------------------------------------------------
+void testSdfChamferParity() {
+	using vv::voxel::SdfField;
+
+	const auto reference = [](int nx, int ny, int nz, const auto& solid,
+												 std::vector<std::uint32_t>& seeds,
+												 std::vector<float>& dist) {
+		const std::size_t n = std::size_t(nx) * ny * nz;
+		dist.assign(n, 1e30f);
+		seeds.assign(n, vv::voxel::kSdfEmptySeed);
+		const SdfField::SeedBits bits = SdfField::seedBitsFor(nx, ny, nz);
+		const auto enc = [&](int x, int y, int z) {
+			return std::uint32_t(x) | (std::uint32_t(y) << bits.x) |
+						 (std::uint32_t(z) << (bits.x + bits.y));
+		};
+		const auto I = [&](int x, int y, int z) {
+			return std::size_t(x) + std::size_t(y) * std::size_t(nx) +
+						 std::size_t(z) * std::size_t(nx) * std::size_t(ny);
+		};
+		for (int z = 0; z < nz; ++z)
+			for (int y = 0; y < ny; ++y)
+				for (int x = 0; x < nx; ++x) {
+					if (solid(x, y, z)) {
+						dist[I(x, y, z)] = 0.0f;
+						seeds[I(x, y, z)] = enc(x, y, z);
+					}
+				}
+		const float w1 = 1.0f, w2 = 1.41421356f, w3 = 1.73205081f;
+		const auto relax = [&](int x, int y, int z, int ox, int oy, int oz,
+										 float w) {
+			const int jx = x + ox, jy = y + oy, jz = z + oz;
+			if (jx < 0 || jx >= nx || jy < 0 || jy >= ny || jz < 0 || jz >= nz) {
+				return;
+			}
+			const std::size_t i = I(x, y, z), j = I(jx, jy, jz);
+			const float nd = dist[j] + w;
+			if (nd < dist[i]) {
+				dist[i] = nd;
+				seeds[i] = seeds[j];
+			}
+		};
+		for (int z = 0; z < nz; ++z)
+			for (int y = 0; y < ny; ++y)
+				for (int x = 0; x < nx; ++x) {
+					relax(x, y, z, -1, 0, 0, w1);
+					relax(x, y, z, 0, -1, 0, w1);
+					relax(x, y, z, 0, 0, -1, w1);
+					relax(x, y, z, -1, -1, 0, w2);
+					relax(x, y, z, -1, 0, -1, w2);
+					relax(x, y, z, 0, -1, -1, w2);
+					relax(x, y, z, -1, -1, -1, w3);
+				}
+		for (int z = nz - 1; z >= 0; --z)
+			for (int y = ny - 1; y >= 0; --y)
+				for (int x = nx - 1; x >= 0; --x) {
+					relax(x, y, z, 1, 0, 0, w1);
+					relax(x, y, z, 0, 1, 0, w1);
+					relax(x, y, z, 0, 0, 1, w1);
+					relax(x, y, z, 1, 1, 0, w2);
+					relax(x, y, z, 1, 0, 1, w2);
+					relax(x, y, z, 0, 1, 1, w2);
+					relax(x, y, z, 1, 1, 1, w3);
+				}
+	};
+
+	// Everything the chamfer has to get right: a floor, pillars, a floating
+	// slab (overhang), a hill, an isolated tower and a hollow box (inside
+	// distances, which only the propagation can reach).
+	const auto shape = [](int x, int y, int z) {
+		if (y == 0) return true;
+		if (y < 5 && x % 7 == 0) return true;
+		if (y >= 9 && y <= 11 && x >= 5 && x <= 20 && z >= 5 && z <= 25) return true;
+		if (y <= 6 - std::abs(x - 16) / 3 - std::abs(z - 20) / 4) return true;
+		if (x == 30 && z == 30 && y < 12) return true;
+		if (x >= 24 && x <= 27 && z >= 2 && z <= 6 && y >= 3 && y <= 8 &&
+				!(x >= 25 && x <= 26 && z >= 3 && z <= 5 && y >= 4 && y <= 7)) {
+			return true;
+		}
+		return false;
+	};
+
+	struct Shape {
+		int nx, ny, nz;
+		const char* name;
+	};
+	const Shape shapes[] = {{33, 17, 40, "terrain + overhang + hollow box"},
+										{1, 9, 5, "single column"}, {9, 1, 9, "single layer"},
+										{2, 2, 2, "2x2x2"}};
+	for (const Shape& sh : shapes) {
+		std::vector<std::uint32_t> refSeeds;
+		std::vector<float> refDist;
+		reference(sh.nx, sh.ny, sh.nz, shape, refSeeds, refDist);
+		SdfField field;
+		field.build(sh.nx, sh.ny, sh.nz, shape);
+		check(field.seeds().size() == refSeeds.size(),
+					"sdf chamfer parity: the field has the reference's size");
+		std::size_t seedDiffs = 0, distDiffs = 0, solid = 0, far = 0;
+		for (int z = 0; z < sh.nz; ++z) {
+			for (int y = 0; y < sh.ny; ++y) {
+				for (int x = 0; x < sh.nx; ++x) {
+					const std::size_t i = std::size_t(x) + std::size_t(y) * sh.nx +
+													 std::size_t(z) * std::size_t(sh.nx) * sh.ny;
+					if (field.seeds()[i] != refSeeds[i]) {
+						++seedDiffs;
+					}
+					// cellDistance() is dist - 0.5 clamped at 0, so it loses nothing
+					// for the cells a picture is made of; comparing it exactly is
+					// comparing the two chamfer fields.
+					const float expect =
+							std::max(0.0f, refDist[i] - 0.5f);
+					if (field.cellDistance(x, y, z) != expect) {
+						++distDiffs;
+					}
+					if (refDist[i] == 0.0f) {
+						++solid;
+					}
+					if (refDist[i] == 1e30f) {
+						++far;
+					}
+				}
+			}
+		}
+		check(seedDiffs == 0,
+					"sdf chamfer parity: every seed word matches the sequential form");
+		check(distDiffs == 0,
+					"sdf chamfer parity: every distance matches the sequential form");
+		check(solid > 0,
+					"sdf chamfer parity: the shape exercised solids");
+		std::printf("sdf chamfer parity: %-28s %5d x %3d x %3d cells, %5zu seeds and "
+								"%5zu distances identical, %zu solid\n",
+								sh.name, sh.nx, sh.ny, sh.nz, refSeeds.size() - seedDiffs,
+								refSeeds.size() - distDiffs, solid);
+	}
+
+	// A box with no solid at all: the chamfer must leave every cell empty (the
+	// value the shader reads as "nothing to block the sun").
+	{
+		SdfField empty;
+		empty.build(3, 3, 3, [](int, int, int) { return false; });
+		std::size_t filled = 0;
+		for (std::uint32_t seed : empty.seeds()) {
+			if (seed != vv::voxel::kSdfEmptySeed) {
+				++filled;
+			}
+		}
+		check(filled == 0, "sdf chamfer parity: an all-air box stays empty");
+	}
+
+	// And the real thing: a banded box over real chunks (non-uniform heights,
+	// caves, the box's own seed encoding), built through the renderer's own
+	// entry point and compared to the frozen sequential form through the same
+	// predicate.
+	{
+		using vv::voxel::Chunk;
+		using vv::voxel::ChunkCoord;
+		using vv::voxel::SdfBoxGeometry;
+		const int cx = 32, cz = 32, wh = 128;
+		vv::terrain::TerrainConfig tcfg = testTerrainConfig();
+		vv::voxel::World world(tcfg, cx, wh, cz);
+		std::vector<const Chunk*> added;
+		std::vector<ChunkCoord> evicted;
+		world.ensureRegion(0, 0, 3, added, evicted);
+		const std::uint32_t half = 1;
+		const std::uint32_t side = 2u * half;
+		std::vector<std::vector<std::uint8_t>> snapshots(std::size_t(side) * side);
+		for (std::uint32_t z = 0; z < side; ++z) {
+			for (std::uint32_t x = 0; x < side; ++x) {
+				if (const Chunk* c = world.findChunk(
+								ChunkCoord{-int(half) + int(x), -int(half) + int(z)})) {
+					snapshots[std::size_t(z) * side + x] = c->voxelTypes();
+				}
+			}
+		}
+		const SdfBoxGeometry box = SdfBoxGeometry::centeredOn(0, 0, half, cx, cz, wh);
+		const std::uint32_t bandNy =
+				vv::voxel::sdfBoxBandHeight(box, snapshots, 16u);
+		SdfBoxGeometry banded = box;
+		banded.cropToBand(bandNy);
+		SdfField shipped;
+		vv::voxel::buildSdfBoxField(banded, snapshots, shipped);
+		std::vector<std::uint32_t> refSeeds;
+		std::vector<float> refDist;
+		const auto solid = [&banded, &snapshots](int x, int y, int z) {
+			return vv::voxel::sdfBoxCellSolid(banded, snapshots,
+																		std::uint32_t(x), std::uint32_t(y),
+																		std::uint32_t(z));
+		};
+		reference(int(banded.nx), int(banded.ny), int(banded.nz), solid, refSeeds,
+							refDist);
+		std::size_t seedDiffs = 0, distDiffs = 0;
+		for (std::size_t i = 0; i < refSeeds.size(); ++i) {
+			if (shipped.seeds()[i] != refSeeds[i]) {
+				++seedDiffs;
+			}
+		}
+		for (int z = 0; z < int(banded.nz); ++z) {
+			for (int y = 0; y < int(banded.ny); ++y) {
+				for (int x = 0; x < int(banded.nx); ++x) {
+					const std::size_t i = std::size_t(x) + std::size_t(y) * banded.nx +
+													 std::size_t(z) * std::size_t(banded.nx) * banded.ny;
+					if (shipped.cellDistance(x, y, z) != std::max(0.0f, refDist[i] - 0.5f)) {
+						++distDiffs;
+					}
+				}
+			}
+		}
+		check(seedDiffs == 0 && distDiffs == 0,
+					"sdf chamfer parity: the real banded terrain matches bit for bit");
+		std::printf("sdf chamfer parity: real banded box %u x %u x %u, %zu seeds "
+								"identical, %zu distance diffs\n",
+								banded.nx, banded.ny, banded.nz, refSeeds.size() - seedDiffs,
+								distDiffs);
+	}
+}
+
 void testSdfBoxBuild() {
 	using vv::voxel::Chunk;
 	using vv::voxel::ChunkCoord;
@@ -4104,6 +4331,7 @@ int main() {
 	testSdfSeedEncoding();
 	testSdfBoxUniform();
 	testSdfCornerGather();
+	testSdfChamferParity();
 	testSdfBoxHandoff();
 	testSdfHandoverPolicy();
 	testStreamPriority();
